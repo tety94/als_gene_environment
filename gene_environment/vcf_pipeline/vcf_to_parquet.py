@@ -2,41 +2,6 @@
 Converte i VCF filtrati in un'unica matrice genotipica (parquet), sostituendo
 la catena originale: vcf_to_csv.py -> create_chr_csv.py -> create_full_csv.py
 -> csv_to_parquet.py (4 script, 3 formati CSV intermedi enormi su disco).
-
-BUG PIÙ GRAVE TROVATO E CORRETTO (create_full_csv.py):
-  Il merge tra i CSV dei vari cromosomi avveniva così:
-    for rows in zip(*files):
-        base = rows[0].strip()          # id dal primo file
-        ... rest = colonne genotipo degli altri file, prese "così come sono"
-  cioè si assumeva che la riga N-esima di OGNI file di cromosoma
-  corrispondesse allo STESSO campione, basandosi solo sull'ORDINE delle
-  righe, non sull'id. C'era un controllo preliminare (ref_ids == ids) che
-  falliva rumorosamente se l'ordine differiva fra file — quindi non è un bug
-  "silenzioso" nella versione attuale, ma è comunque un approccio fragile:
-  qualunque riordino, anche solo di un file, blocca l'intera pipeline con
-  un RuntimeError e nessuna possibilità di recovery parziale, e il parsing è
-  fatto a mano con `.split(",")` (nessuna gestione di quoting/escaping).
-
-  Qui il merge fra cromosomi è invece un JOIN basato sull'id campione
-  (pandas, allineamento per indice, non per posizione di riga): funziona
-  indipendentemente dall'ordine delle righe nei singoli file, ed è quello
-  che ci si aspetterebbe da un'operazione di merge.
-
-ALTRE OTTIMIZZAZIONI:
-  - Niente più CSV intermedi giganti: si scrive direttamente in Parquet
-    (compresso, colonnare, molto più leggero/veloce da rileggere) ad ogni
-    stadio (per-file, per-cromosome, genoma intero).
-  - Parallelizzazione a livello di file VCF (ProcessPoolExecutor).
-  - Il filtro sulla percentuale di missing per SNP viene calcolato PRIMA
-    della binarizzazione (come nell'originale), altrimenti l'informazione
-    "quanti missing aveva questo SNP" andrebbe persa una volta forzati a 0.
-  - La scelta "genotipo mancante -> 0 (non mutato)" dell'originale è una
-    decisione di modellazione, non un dettaglio tecnico: qui è esplicita e
-    configurabile (MISSING_GENOTYPE_STRATEGY), di default "zero" per
-    compatibilità con le analisi precedenti, ma segnalata chiaramente nel
-    log e nei commenti perché è la scelta più delicata di tutta la
-    conversione dei dati (trattare un dato mancante come "wild type" può
-    introdurre bias se il missing non è casuale).
 """
 from __future__ import annotations
 

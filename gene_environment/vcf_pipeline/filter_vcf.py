@@ -1,27 +1,6 @@
 """
 Filtraggio VCF -> PLINK binario -> MAF filter -> LD pruning -> VCF filtrato.
 (ex gene_reduction.py)
-
-Fix rispetto all'originale:
-  - Il loop sui file VCF era completamente SEQUENZIALE (un file dopo l'altro),
-    nonostante MAX_WORKERS fosse già configurato e usato altrove nella
-    pipeline. Con decine/centinaia di file VCF per cromosoma questo è lo
-    step più lento di tutta la pipeline "a monte". Ora è parallelizzato con
-    ProcessPoolExecutor, un processo per file VCF (ogni chiamata plink2 è
-    già mono-processo pesante in I/O+CPU, quindi parallelizzare a livello di
-    file ha senso ed è sicuro).
-  - Idempotenza: se l'output finale (_filtered.vcf) esiste già, il file
-    viene saltato invece di essere ricalcolato da capo ad ogni rilancio
-    (utile perché lo step precedente può fallire a metà su centinaia di
-    file, e senza skip si ripartirebbe sempre da zero).
-  - Il prefisso "ACH" usato per escludere campioni dal .fam era hardcoded
-    senza alcun commento sul perché. Ora è un parametro di configurazione
-    esplicito (EXCLUDE_ID_PREFIXES), documentato, con default vuoto: se non
-    configurato non viene rimosso silenziosamente nessun campione.
-  - Ogni subprocess.run(..., check=True) ora logga comando ed esito; un
-    fallimento di plink2 su UN file non blocca più necessariamente l'intero
-    batch (l'errore viene loggato e si passa al file successivo, il
-    riepilogo finale elenca i falliti).
 """
 from __future__ import annotations
 

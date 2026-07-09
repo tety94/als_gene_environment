@@ -1,19 +1,5 @@
 """
 Prepara il dataset finale (merge genetica + ambientale) usato dal modeling.
-
-Fix rispetto all'originale (data_loader.py):
-  - RIMOSSA la riga `df_env['id'] = df_env['id'] + '_' + df_env['id']`.
-    Era un workaround per far combaciare gli id del file ambientale con
-    quelli (duplicati) del file genetico. Ora la normalizzazione avviene con
-    `clean_sample_id` (utils/id_utils.py) applicata al file genetico, quindi
-    il file ambientale resta con i suoi id originali, senza trasformazioni
-    "magiche" difficili da ricordare/motivare a distanza di mesi.
-  - Log invece di print(), con gli stessi checkpoint temporali dell'originale.
-  - Validazione esplicita: se dopo il merge il numero di righe è 0, o la
-    percentuale di id non matchati è alta, viene loggato un WARNING chiaro
-    (prima si andava avanti in silenzio con un dataframe vuoto o quasi).
-  - `SettingWithCopyWarning` potenziale su `df_gen.rename` risolto passando
-    sempre per assegnazione esplicita.
 """
 from __future__ import annotations
 
