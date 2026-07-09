@@ -1,18 +1,5 @@
 """
 Orchestratore del run di analisi per-variante (ex main.py).
-
-Fix rispetto all'originale:
-  - Il buffer di risultati veniva scritto a DB con un `for` che chiamava
-    `save_variant_result` riga per riga dentro la stessa connessione: ora usa
-    `save_variant_results_bulk` (executemany, una sola transazione per batch).
-  - Path di `temp_df.pkl` ora configurabile (TEMP_DF_PATH) invece di hardcoded
-    relativo alla cwd (rompeva se lo script veniva lanciato da un'altra
-    directory).
-  - Le statistiche onset_age calcolate in modeling.py vengono salvate nello
-    stesso batch, colonna per colonna (vedi db/repository.py).
-  - Logging al posto di print(), incluso un riepilogo finale con conteggio
-    errori per variante (prima un'eccezione su una variante veniva solo
-    stampata e "persa").
 """
 from __future__ import annotations
 

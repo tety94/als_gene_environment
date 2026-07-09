@@ -1,17 +1,5 @@
 """
 Logging centralizzato.
-
-PRIMA: quasi ogni script usava `print()` per lo stato di avanzamento. Questo
-significa: nessun timestamp uniforme, nessun livello (info/warning/error),
-niente file di log persistente, e output completamente mischiato/perso nei
-worker paralleli (ProcessPoolExecutor).
-
-ORA: un solo punto di configurazione. Ogni modulo fa
-    from gene_environment.logging_utils import get_logger
-    log = get_logger(__name__)
-e ottiene un logger che scrive sia su console sia su file (con rotazione),
-con timestamp, livello, nome modulo e (nei worker) il PID, cosi' i log dei
-processi paralleli restano distinguibili.
 """
 from __future__ import annotations
 

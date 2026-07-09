@@ -1,35 +1,5 @@
 """
 Core del test per singola variante: matching + regressione + permutation test
-+ (NOVITÀ) statistiche di differenza onset_age, tutto salvato insieme.
-
-BUG CRITICO trovato e corretto:
-  `rng = np.random.RandomState(RANDOM_STATE + (abs(hash(variant_col)) % 2_000_000))`
-  `hash()` su una stringa in Python NON è stabile fra esecuzioni diverse del
-  processo (randomizzazione dell'hash attivata di default dal 2012, PEP 456)
-  a meno di impostare esplicitamente PYTHONHASHSEED=0. Questo significa che
-  gli stessi identici dati, con lo stesso RANDOM_STATE, potevano produrre
-  permutazioni (e quindi p-value empirici) leggermente diversi ad ogni
-  rilancio della pipeline: risultati non riproducibili, un problema serio
-  per un'analisi statistica. Corretto usando hashlib.md5 (hash stabile,
-  deterministico, indipendente da PYTHONHASHSEED).
-
-ALTRE MODIFICHE:
-  - tqdm dentro ai worker di ProcessPoolExecutor produceva output confuso
-    (decine di processi che scrivono barre di progresso sullo stesso
-    terminale). Sostituito con log periodici (ogni N permutazioni) tramite
-    il logger centralizzato.
-  - "Adaptive early stopping" per le permutazioni LIGHT: se dopo
-    `adaptive_perm_check_every` permutazioni il numero di permutazioni con
-    |beta_perm| >= |beta_oss| è già chiaramente troppo alto (futility check),
-    ci si ferma prima di sprecare le permutazioni rimanenti su una variante
-    che non risulterà comunque significativa. Ottimizzazione importante dato
-    che il matching+OLS per permutazione è l'operazione più costosa della
-    pipeline e viene ripetuta N_PERM (fino a N_PERM_HIGH) volte per
-    variante.
-  - Le statistiche di differenza onset_age (mutati vs non mutati, sullo
-    stesso identico dataset usato per il modello) vengono calcolate qui,
-    SUBITO, e restituite insieme al resto -> salvate a DB nella stessa riga,
-    niente più script separato da rilanciare a posteriori.
 """
 from __future__ import annotations
 

@@ -1,21 +1,5 @@
 """
 Configurazione centralizzata della pipeline.
-
-PRIMA (problema): tutte le credenziali del database (utente, password, host)
-erano scritte in chiaro dentro config.py e venivano importate ovunque.
-Chiunque avesse accesso al repo/allo script aveva la password del DB, e la
-password finiva facilmente in chat, log, screenshot, git history ecc.
-
-ORA: tutti i valori sensibili/ambiente-specifici vengono letti da variabili
-d'ambiente (eventualmente caricate da un file .env locale, MAI committato).
-Vedi ".env.example" per il template. In produzione le variabili vanno settate
-a livello di sistema/servizio (systemd EnvironmentFile, docker secrets, ecc.),
-non in un file .env sul disco.
-
-Se una variabile obbligatoria manca, la pipeline si rifiuta di partire con un
-errore chiaro invece di fallire più avanti con un errore MySQL criptico o,
-peggio, di partire silenziosamente con valori vuoti (com'era prima: DB_USER =
-'' nel config_example, che se usato per sbaglio avrebbe dato errori confusi).
 """
 from __future__ import annotations
 

@@ -1,22 +1,5 @@
 """
 Funzioni condivise per la gestione degli ID campione e dei nomi variante.
-
-PROBLEMA TROVATO nel codice originale:
-  - `data_loader.py` faceva:  df_env['id'] = df_env['id'] + '_' + df_env['id']
-    cioè duplicava artificialmente l'id (es. "RES02977" -> "RES02977_RES02977")
-    SOLO per farlo combaciare con gli id del file genetico (che evidentemente
-    arrivavano già in quel formato duplicato per qualche ragione a monte, mai
-    spiegata nei commenti).
-  - Poi, chilometri di codice più avanti, `analyze_variant_onset_age.py`
-    doveva fare l'operazione INVERSA (`clean_id`) per togliere la
-    duplicazione e recuperare l'id "pulito".
-  Risultato: la stessa logica di trasformazione duplicata in due punti
-  lontani del codice, con il rischio concreto che uno dei due venga
-  aggiornato e l'altro no (bug silenzioso: join che non matcha più nulla).
-
-SOLUZIONE: un'unica funzione, usata ovunque serva normalizzare un id
-campione, con la logica esplicitata e documentata. Se in futuro il formato
-degli id a monte cambia, si aggiorna in un solo posto.
 """
 from __future__ import annotations
 

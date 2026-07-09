@@ -2,18 +2,6 @@
 """
 Genera boxplot e forest plot per la differenza di età d'esordio (onset_age)
 delle varianti significative. (ex analyze_variant_onset_age.py)
-
-DIFFERENZA PRINCIPALE rispetto all'originale: le statistiche (mediana,
-delta, IC bootstrap, p-value, FDR) NON vengono più ricalcolate qui — sono
-già state calcolate una volta sola in modeling.py e salvate a DB per ogni
-variante (vedi analysis/modeling.py e db/repository.py). Questo script si
-limita a: (1) leggere quelle statistiche dal DB, (2) leggere i dati grezzi
-paziente-per-paziente (genotipo + onset_age) solo per disegnare i boxplot,
-(3) produrre i grafici. Avere un'unica fonte di verità per i numeri evita
-che report e DB possano andare fuori sincrono.
-
-Usa la stessa `clean_sample_id` di build_dataset.py (utils/id_utils.py) per
-la pulizia degli id, invece di una funzione locale duplicata.
 """
 from __future__ import annotations
 
