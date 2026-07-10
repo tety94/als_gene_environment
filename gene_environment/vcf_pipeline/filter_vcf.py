@@ -55,6 +55,31 @@ FIX (10 luglio 2026 - VCF filtrati enormi e corruzione a valle):
     anche su file (<log_dir>/filter_vcf.log), non solo su console, sia nel
     processo principale sia in ogni worker (processi separati non
     ereditano gli handler di logging del padre).
+
+FIX (10 luglio 2026 - pulizia automatica degli intermedi):
+  - Ogni file VCF di input produce, oltre al risultato finale
+    *_filtered.vcf.gz (poche decine di MB), una catena di file intermedi
+    plink2 (*_plink.bed/.bim/.fam, *_maf.bed/.bim/.fam, *_pruned.*,
+    *_plink_remove.txt) che NON servono a nessuno step successivo della
+    pipeline: vcf_to_parquet.py legge esclusivamente *_filtered.vcf.gz
+    (vedi glob "*_filtered.vcf.gz" in convert_filtered_vcfs_to_parquet).
+    Questi intermedi sono anche di gran lunga i file più pesanti prodotti
+    da questo script (il *_plink.bed di un cromosoma può superare i 2GB),
+    quindi lasciarli su disco moltiplica inutilmente lo spazio occupato
+    per ogni cromosoma processato.
+    Ora, subito dopo che il *_filtered.vcf.gz finale è stato scritto E
+    VALIDATO (quindi mai prima, e mai se la validazione fallisce), tutti
+    gli intermedi relativi a quel singolo file vengono rimossi con
+    _cleanup_intermediates(). Questo è sicuro perché l'idempotenza dello
+    script si basa SOLO sull'esistenza/validità del .vcf.gz finale (vedi
+    _is_valid_bgzip più sotto): se il file finale manca o è invalido, lo
+    script riparte comunque da zero da plink2 --vcf <input originale>,
+    MAI dagli intermedi. La pulizia viene fatta anche nel path di "skip"
+    (output già presente e valido), per ripulire retroattivamente run
+    precedenti a questa fix in cui gli intermedi erano rimasti sul disco.
+    Comportamento disattivabile impostando cfg.keep_intermediate_files
+    (se il campo non esiste nella config del progetto, il default è
+    "pulisci", tramite getattr per non rompere config esistenti).
 """
 from __future__ import annotations
 
@@ -76,12 +101,25 @@ OUTPUT_SUBFOLDER = "vcf_filtered"
 LOG_FILENAME = "filter_vcf.log"
 STATS_FILENAME = "filter_vcf_stats.csv"
 
+# Pattern (relativi a <output_vcf_folder>/<base_name>) dei file intermedi da
+# rimuovere una volta che *_filtered.vcf.gz è confermato valido. Elencati
+# esplicitamente (invece di un catch-all tipo "tutto tranne *_filtered.*")
+# per non rischiare di cancellare per errore qualcosa che non ci si aspetta,
+# se in futuro lo script produce altri file con naming diverso.
+_INTERMEDIATE_SUFFIXES = [
+    "_plink.bed", "_plink.bim", "_plink.fam", "_plink.log",
+    "_maf.bed", "_maf.bim", "_maf.fam", "_maf.log",
+    "_pruned.log", "_pruned.prune.in", "_pruned.prune.out",
+    "_plink_remove.txt",
+    "_filtered_tmp.log",
+]
+
 
 def _add_file_logging(log_dir: str) -> None:
     """Aggiunge (una sola volta per processo) un FileHandler al root logger,
     così i log finiscono sia su console sia su <log_dir>/filter_vcf.log.
     Va richiamata sia nel processo principale sia in ogni worker (sono
-    processi separati e non ereditano gli handler del padre)."""
+    processi separati e non ereditano gli handler di logging del padre)."""
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.abspath(os.path.join(log_dir, LOG_FILENAME))
 
@@ -118,6 +156,27 @@ def _is_valid_bgzip(path: str) -> bool:
         return False
 
 
+def _cleanup_intermediates(output_vcf_folder: str, base_name: str, vcf_file: str) -> int:
+    """Rimuove i file intermedi plink2 (plink/maf/pruned/remove-list/log tmp)
+    relativi a <base_name>, DOPO che *_filtered.vcf.gz è stato validato.
+    Non tocca mai *_filtered.vcf.gz né altri file non elencati in
+    _INTERMEDIATE_SUFFIXES. Ritorna il numero di file effettivamente
+    rimossi (0 se non c'era nulla da pulire, es. già pulito in run
+    precedente)."""
+    n_removed = 0
+    for suffix in _INTERMEDIATE_SUFFIXES:
+        path = os.path.join(output_vcf_folder, base_name + suffix)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                n_removed += 1
+            except OSError as e:
+                log.warning("[%s] impossibile rimuovere intermedio %s: %s", vcf_file, path, e)
+    if n_removed:
+        log.info("[%s] puliti %d file intermedi (plink/maf/pruned)", vcf_file, n_removed)
+    return n_removed
+
+
 def _run(cmd: list[str], log_prefix: str) -> None:
     log.debug("%s: eseguo: %s", log_prefix, " ".join(cmd))
     subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -138,6 +197,7 @@ class FilterStats:
     n_variants_after_pruning: int = 0
     elapsed_seconds: float = 0.0
     skipped: bool = False
+    intermediates_cleaned: int = 0
 
 
 def filter_single_vcf(
@@ -154,11 +214,17 @@ def filter_single_vcf(
     vcf_file = os.path.basename(input_path)
     base_name = os.path.splitext(os.path.splitext(vcf_file)[0])[0]  # rimuove .vcf.gz
     stats = FilterStats(vcf_file=vcf_file)
+    keep_intermediates = cfg_dict["keep_intermediate_files"]
 
     final_vcf_path = os.path.join(output_vcf_folder, base_name + "_filtered.vcf.gz")
     if _is_valid_bgzip(final_vcf_path):
         log.info("[%s] output già presente e valido, salto: %s", vcf_file, final_vcf_path)
         stats.skipped = True
+        # Anche in caso di skip, ripulisco eventuali intermedi rimasti da
+        # run precedenti a questa fix (idempotente: se non c'è nulla da
+        # rimuovere, _cleanup_intermediates ritorna semplicemente 0).
+        if not keep_intermediates:
+            stats.intermediates_cleaned = _cleanup_intermediates(output_vcf_folder, base_name, vcf_file)
         stats.elapsed_seconds = time.monotonic() - t0
         return vcf_file, True, None, stats
 
@@ -237,6 +303,15 @@ def filter_single_vcf(
             vcf_file, final_vcf_path, stats.n_samples_total - stats.n_samples_removed,
             stats.n_samples_removed, stats.n_variants_after_pruning,
         )
+
+        # Pulizia intermedi: SOLO ora, dopo che il .vcf.gz finale è stato
+        # scritto atomicamente e validato dal controllo bgzip sopra. Se
+        # qualsiasi step precedente fallisce, si finisce nel blocco except
+        # e gli intermedi restano sul disco (utili per debug del run
+        # fallito).
+        if not keep_intermediates:
+            stats.intermediates_cleaned = _cleanup_intermediates(output_vcf_folder, base_name, vcf_file)
+
         stats.elapsed_seconds = time.monotonic() - t0
         return vcf_file, True, None, stats
 
@@ -263,6 +338,7 @@ def _write_stats_csv(all_stats: list[FilterStats], log_dir: str) -> str:
     fieldnames = list(asdict(all_stats[0]).keys()) if all_stats else [
         "vcf_file", "n_samples_total", "n_samples_removed", "n_variants_raw",
         "n_variants_after_maf", "n_variants_after_pruning", "elapsed_seconds", "skipped",
+        "intermediates_cleaned",
     ]
     with open(tmp_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -289,6 +365,17 @@ def run_filter_vcf(exclude_id_prefixes: list[str] | None = None) -> None:
             "se è ancora il comportamento voluto, imposta EXCLUDE_ID_PREFIXES=ACH nel .env."
         )
 
+    # keep_intermediate_files: campo opzionale della config del progetto.
+    # Se non esiste (config non ancora aggiornata), il default è False,
+    # cioè "pulisci gli intermedi" — è il comportamento desiderato dato
+    # che pesano ordini di grandezza più del risultato finale e non sono
+    # letti da nessun altro step della pipeline.
+    keep_intermediates = getattr(cfg, "keep_intermediate_files", False)
+    if keep_intermediates:
+        log.info("keep_intermediate_files=True: i file intermedi plink/maf/pruned NON verranno rimossi.")
+    else:
+        log.info("I file intermedi plink/maf/pruned verranno rimossi automaticamente dopo ogni file completato con successo.")
+
     cfg_dict = {
         "maf_threshold": cfg.maf_threshold,
         "ld_window_size": cfg.ld_window_size,
@@ -296,6 +383,7 @@ def run_filter_vcf(exclude_id_prefixes: list[str] | None = None) -> None:
         "ld_r2_threshold": cfg.ld_r2_threshold,
         "exclude_id_prefixes": exclude_id_prefixes,
         "log_dir": cfg.log_dir,
+        "keep_intermediate_files": keep_intermediates,
     }
 
     jobs = []
@@ -332,15 +420,17 @@ def run_filter_vcf(exclude_id_prefixes: list[str] | None = None) -> None:
     tot_variants_after_maf = sum(s.n_variants_after_maf for s in all_stats)
     tot_variants_final = sum(s.n_variants_after_pruning for s in all_stats)
     tot_samples_removed = sum(s.n_samples_removed for s in all_stats)
+    tot_intermediates_cleaned = sum(s.intermediates_cleaned for s in all_stats)
 
     log.info(
         "Riepilogo filtraggio VCF: %d file totali, %d ok (%d saltati perché già presenti), "
         "%d falliti, tempo totale %.1fs. Varianti (somma su tutti i file processati in questo "
         "run, esclusi gli skip): %d raw -> %d dopo MAF -> %d finali dopo LD pruning. "
-        "Campioni esclusi per prefisso id (somma): %d. Statistiche per-file salvate in %s",
+        "Campioni esclusi per prefisso id (somma): %d. File intermedi rimossi (somma): %d. "
+        "Statistiche per-file salvate in %s",
         len(jobs), n_ok, n_skipped, len(failed), elapsed_total,
         tot_variants_raw, tot_variants_after_maf, tot_variants_final,
-        tot_samples_removed, stats_path,
+        tot_samples_removed, tot_intermediates_cleaned, stats_path,
     )
 
     if failed:
