@@ -442,7 +442,10 @@ def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, 
     merged = merged[~merged.index.duplicated(keep="first")]
 
     n_variants_total = merged.shape[1]
-    missing_frac = (merged < 0).mean()
+    # Stesso motivo del fix più sotto: il -1 non è l'unico modo in cui una
+    # variante può risultare "mancante" per un campione, dopo il concat con
+    # join="outer" fra batch con set di varianti leggermente diversi.
+    missing_frac = ((merged < 0) | merged.isna()).mean()
     keep_cols = missing_frac[missing_frac < null_percentage].index
     dropped = merged.shape[1] - len(keep_cols)
     if dropped:
@@ -454,10 +457,22 @@ def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, 
         return None, None
 
     arr = merged.to_numpy(dtype=np.float32, copy=True)
+    # Oltre al -1 (missing esplicito da _genotype_to_dosage), il concat con
+    # join="outer" qui sopra introduce NaN "genuini" ogni volta che una
+    # variante è presente nel raw parquet di un batch ma assente in un
+    # altro: ogni batch fa MAF+LD pruning indipendentemente in
+    # filter_vcf.py, quindi il set di varianti superstiti per lo stesso
+    # cromosoma può differire leggermente da batch a batch. Va trattato
+    # come dato mancante alla pari del -1: se si usasse solo `arr < 0`, il
+    # NaN passerebbe indenne (in numpy un confronto con NaN è sempre False,
+    # quindi né `arr < 0` né `arr > 0` lo intercettano) e sopravvivrebbe
+    # fino all'astype(int) finale, che esplode con IntCastingNaNError - è
+    # esattamente il crash su chr21 di questo run.
+    missing_mask = (arr < 0) | np.isnan(arr)
     if missing_strategy == "zero":
-        arr[arr < 0] = 0
+        arr[missing_mask] = 0
     else:  # "nan": missing esplicito, NON silenziosamente trattato come wild-type
-        arr[arr < 0] = np.nan
+        arr[missing_mask] = np.nan
     arr[arr > 0] = 1
     merged[:] = arr
 
