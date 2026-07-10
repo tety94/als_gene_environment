@@ -1,3 +1,15 @@
+"""
+Utility statistiche generiche (ex utils.py).
+
+Fix rispetto all'originale:
+  - volcano_plot: `-np.log10(df[p_col])` esplodeva a +inf quando un p-value
+    empirico era esattamente 0 (capita spesso con permutation test quando
+    l'effetto osservato supera tutte le permutazioni, es. p=0/10000). Un
+    +inf nel plot rompe la scala dell'asse y silenziosamente. Ora i p-value
+    vengono clippati a un minimo > 0 prima del log.
+  - save_path ora obbligatorio (evita che in un job non interattivo lo
+    script si blocchi su plt.show()).
+"""
 from __future__ import annotations
 
 import numpy as np

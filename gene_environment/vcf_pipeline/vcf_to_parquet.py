@@ -2,6 +2,41 @@
 Converte i VCF filtrati in un'unica matrice genotipica (parquet), sostituendo
 la catena originale: vcf_to_csv.py -> create_chr_csv.py -> create_full_csv.py
 -> csv_to_parquet.py (4 script, 3 formati CSV intermedi enormi su disco).
+
+BUG PIÙ GRAVE TROVATO E CORRETTO (create_full_csv.py):
+  Il merge tra i CSV dei vari cromosomi avveniva così:
+    for rows in zip(*files):
+        base = rows[0].strip()          # id dal primo file
+        ... rest = colonne genotipo degli altri file, prese "così come sono"
+  cioè si assumeva che la riga N-esima di OGNI file di cromosoma
+  corrispondesse allo STESSO campione, basandosi solo sull'ORDINE delle
+  righe, non sull'id. C'era un controllo preliminare (ref_ids == ids) che
+  falliva rumorosamente se l'ordine differiva fra file — quindi non è un bug
+  "silenzioso" nella versione attuale, ma è comunque un approccio fragile:
+  qualunque riordino, anche solo di un file, blocca l'intera pipeline con
+  un RuntimeError e nessuna possibilità di recovery parziale, e il parsing è
+  fatto a mano con `.split(",")` (nessuna gestione di quoting/escaping).
+
+  Qui il merge fra cromosomi è invece un JOIN basato sull'id campione
+  (pandas, allineamento per indice, non per posizione di riga): funziona
+  indipendentemente dall'ordine delle righe nei singoli file, ed è quello
+  che ci si aspetterebbe da un'operazione di merge.
+
+ALTRE OTTIMIZZAZIONI:
+  - Niente più CSV intermedi giganti: si scrive direttamente in Parquet
+    (compresso, colonnare, molto più leggero/veloce da rileggere) ad ogni
+    stadio (per-file, per-cromosome, genoma intero).
+  - Parallelizzazione a livello di file VCF (ProcessPoolExecutor).
+  - Il filtro sulla percentuale di missing per SNP viene calcolato PRIMA
+    della binarizzazione (come nell'originale), altrimenti l'informazione
+    "quanti missing aveva questo SNP" andrebbe persa una volta forzati a 0.
+  - La scelta "genotipo mancante -> 0 (non mutato)" dell'originale è una
+    decisione di modellazione, non un dettaglio tecnico: qui è esplicita e
+    configurabile (MISSING_GENOTYPE_STRATEGY), di default "zero" per
+    compatibilità con le analisi precedenti, ma segnalata chiaramente nel
+    log e nei commenti perché è la scelta più delicata di tutta la
+    conversione dei dati (trattare un dato mancante come "wild type" può
+    introdurre bias se il missing non è casuale).
 """
 from __future__ import annotations
 
@@ -12,8 +47,9 @@ from glob import glob
 import numpy as np
 import pandas as pd
 
-from gene_environment.config import get_config
+from gene_environment.config import get_config, get_generation_vcf_folders
 from gene_environment.logging_utils import configure_logging, get_logger
+from gene_environment.utils.id_utils import clean_sample_id
 
 log = get_logger(__name__)
 
@@ -56,37 +92,69 @@ def vcf_file_to_dosage_df(vcf_path: str) -> pd.DataFrame:
     return pd.DataFrame(arr, index=samples, columns=variant_ids)
 
 
-def _process_single_vcf_worker(args) -> str:
-    vcf_path, out_parquet, log_dir = args
+def _process_single_vcf_worker(args) -> tuple[str, int, list[str]]:
+    vcf_path, out_parquet, log_dir, generation = args
     configure_logging(log_dir)
     if os.path.exists(out_parquet):
         log.info("Skip (già convertito): %s", out_parquet)
-        return out_parquet
+        samples = pd.read_parquet(out_parquet, columns=[]).index.tolist()
+        return out_parquet, generation, samples
 
-    log.info("Converto VCF -> parquet: %s", vcf_path)
+    log.info("Converto VCF -> parquet (generazione %d): %s", generation, vcf_path)
     df = vcf_file_to_dosage_df(vcf_path)
     df.to_parquet(out_parquet, engine="pyarrow", compression="zstd")
     log.info("Scritto %s (%d campioni, %d varianti)", out_parquet, df.shape[0], df.shape[1])
-    return out_parquet
+    return out_parquet, generation, df.index.tolist()
 
 
-def convert_filtered_vcfs_to_parquet() -> list[str]:
-    """Step 1: ogni *_filtered.vcf -> un parquet grezzo (dosaggi 0/1/2/-1)."""
+def convert_filtered_vcfs_to_parquet() -> tuple[list[str], dict[str, int]]:
+    """Step 1: ogni *_filtered.vcf -> un parquet grezzo (dosaggi 0/1/2/-1).
+
+    Ritorna anche la mappa id_campione -> generazione, costruita in base a
+    QUALE cartella (VCF_DIR_GENn) proviene ogni file VCF: è l'unica fonte
+    affidabile della coorte di un paziente quando il file ambientale non
+    contiene alcuna informazione di generazione (il join fra ambiente e
+    genetica avviene solo per id)."""
     cfg = get_config()
     jobs = []
-    for folder in cfg.vcf_folders:
+    for generation, folder in get_generation_vcf_folders(cfg).items():
         vcf_filtered_dir = os.path.join(folder, "vcf_filtered")
         for vcf_path in glob(os.path.join(vcf_filtered_dir, "*_filtered.vcf")):
             out_parquet = vcf_path + ".raw.parquet"
-            jobs.append((vcf_path, out_parquet, cfg.log_dir))
+            jobs.append((vcf_path, out_parquet, cfg.log_dir, generation))
 
     log.info("Conversione VCF filtrati -> parquet grezzo: %d file, %d worker", len(jobs), cfg.max_workers)
     out_paths = []
+    sample_generation: dict[str, int] = {}
+    conflicts = []
+
     with ProcessPoolExecutor(max_workers=cfg.max_workers) as ex:
         futures = [ex.submit(_process_single_vcf_worker, job) for job in jobs]
         for fut in as_completed(futures):
-            out_paths.append(fut.result())
-    return out_paths
+            out_path, generation, samples = fut.result()
+            out_paths.append(out_path)
+            for raw_sample in samples:
+                sid = clean_sample_id(str(raw_sample))
+                prev = sample_generation.get(sid)
+                if prev is not None and prev != generation:
+                    conflicts.append((sid, prev, generation))
+                sample_generation[sid] = generation
+
+    if conflicts:
+        log.warning(
+            "%d id campione risultano presenti in PIÙ di una generazione (tenuta l'ultima "
+            "vista): %s%s",
+            len(conflicts), conflicts[:10], " ..." if len(conflicts) > 10 else "",
+        )
+
+    return out_paths, sample_generation
+
+
+def save_sample_generation_map(sample_generation: dict[str, int], out_path: str) -> None:
+    df = pd.DataFrame({"id": list(sample_generation.keys()), "generation": list(sample_generation.values())})
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    df.to_csv(out_path, index=False)
+    log.info("Mappa id->generazione salvata in %s (%d campioni)", out_path, len(df))
 
 
 def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, null_percentage: float,
@@ -149,7 +217,10 @@ def run_vcf_to_parquet_pipeline(missing_strategy: str = "zero") -> str:
     cfg = get_config()
     configure_logging(cfg.log_dir)
 
-    raw_paths = convert_filtered_vcfs_to_parquet()
+    raw_paths, sample_generation = convert_filtered_vcfs_to_parquet()
+
+    map_path = cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv")
+    save_sample_generation_map(sample_generation, map_path)
 
     chrom_paths = []
     for chrom in CHROMOSOMES:

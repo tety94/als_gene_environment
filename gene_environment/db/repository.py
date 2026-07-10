@@ -1,5 +1,22 @@
 """
 Repository per la tabella variant_results (e affini).
+
+Novità principali rispetto all'originale (db.py):
+  1) Le colonne onset_* (differenza di età d'esordio) sono ora salvate
+     INSIEME al resto del risultato variante, nella stessa riga/stessa
+     transazione, appena calcolate in modeling.py. Non serve più uno script
+     a parte che ricalcola tutto in un secondo momento da un CSV.
+     Vedi schema_migration.sql per le colonne da aggiungere alla tabella.
+  2) `save_variant_results_bulk`: insert/update in batch con `executemany`
+     invece di una query singola per ogni variante dentro un loop Python
+     (l'originale lo faceva già in parte in main.py, qui è spostato/centrato
+     nel repository e reso esplicito).
+  3) Tutte le funzioni usano il pool di connessioni (db/connection.py)
+     invece di aprire una connessione nuova ad ogni chiamata.
+  4) `get_significant_results`: mantenuto l'approccio a cursore posizionale
+     (la stored procedure ha colonne duplicate come nome), ma ora si valida
+     il numero di colonne ricevute e si logga un errore chiaro se la stored
+     procedure cambia struttura, invece di un mismatch silenzioso.
 """
 from __future__ import annotations
 

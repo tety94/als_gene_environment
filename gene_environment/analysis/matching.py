@@ -1,5 +1,16 @@
 """
 Matching (nearest-neighbor) fra pazienti mutati e non mutati sulle covariate.
+
+Fix rispetto all'originale (matching.py):
+  - Aggiunti type hints e logging (nessun comportamento cambia rispetto
+    all'originale: la logica del matching era corretta).
+  - `_prepare_matching_matrix`: se una colonna richiesta non esiste nel
+    dataframe veniva silenziosamente saltata (`continue`); ora viene
+    loggato un warning esplicito, così un typo nei nomi delle covariate
+    (facile con EXPOSURE + "_std" costruito a runtime) non passa
+    inosservato.
+  - `check_balance`: se `matched_df` è None l'originale ritornava {} in
+    silenzio; mantenuto per compatibilità ma ora con un log di debug.
 """
 from __future__ import annotations
 

@@ -1,5 +1,21 @@
 """
 Configurazione centralizzata della pipeline.
+
+PRIMA (problema): tutte le credenziali del database (utente, password, host)
+erano scritte in chiaro dentro config.py e venivano importate ovunque.
+Chiunque avesse accesso al repo/allo script aveva la password del DB, e la
+password finiva facilmente in chat, log, screenshot, git history ecc.
+
+ORA: tutti i valori sensibili/ambiente-specifici vengono letti da variabili
+d'ambiente (eventualmente caricate da un file .env locale, MAI committato).
+Vedi ".env.example" per il template. In produzione le variabili vanno settate
+a livello di sistema/servizio (systemd EnvironmentFile, docker secrets, ecc.),
+non in un file .env sul disco.
+
+Se una variabile obbligatoria manca, la pipeline si rifiuta di partire con un
+errore chiaro invece di fallire più avanti con un errore MySQL criptico o,
+peggio, di partire silenziosamente con valori vuoti (com'era prima: DB_USER =
+'' nel config_example, che se usato per sbaglio avrebbe dato errori confusi).
 """
 from __future__ import annotations
 
@@ -85,6 +101,21 @@ class Config:
     exposure: str = field(default_factory=lambda: _env("EXPOSURE", ""))
     covariates: list[str] = field(default_factory=lambda: _env_list("COVARIATES", "sex"))
     sample_id_col: str = field(default_factory=lambda: _env("SAMPLE_ID_COL", "id"))
+    # Path del CSV id->generazione prodotto da build-matrix (vcf_to_parquet.py) a
+    # partire da quale cartella/VCF_DIR_GENn proviene ogni campione. Usato da
+    # build_dataset.py per tenere i run per gen1/gen2/gen3 indipendenti anche quando
+    # il file ambientale (ENV_FILE) non contiene alcuna colonna di generazione, e il
+    # join fra ambiente e genetica avviene solo per "id" (come nel dato reale: l'unica
+    # fonte affidabile della coorte di un paziente è il VCF da cui proviene il suo
+    # genotipo, non il file ambientale). Se vuoto, viene usato
+    # "<OUTPUT_FOLDER>/sample_generation_map.csv" di default.
+    sample_generation_map: str = field(default_factory=lambda: _env("SAMPLE_GENERATION_MAP", ""))
+    # Alternativa legacy: se il file ambientale HA una colonna che indica la
+    # generazione, indicane qui il nome (ha priorità più bassa della mappa sopra).
+    env_generation_col: str = field(default_factory=lambda: _env("ENV_GENERATION_COL", ""))
+    # Coorti incluse nel report onset_age (analysis/report_onset_age.py). Di default
+    # 1,2 come nell'originale (gen3 escluso); aggiungi 3 se vuoi includerla.
+    report_cohorts: list[int] = field(default_factory=lambda: [int(x) for x in _env_list("REPORT_COHORTS", "1,2")])
 
     # ---- MATCHING ----
     match_k: int = field(default_factory=lambda: _env_int("MATCH_K", 3))
@@ -122,6 +153,14 @@ class Config:
     ld_window_size: int = field(default_factory=lambda: _env_int("LD_WINDOW_SIZE", 50))
     ld_step: int = field(default_factory=lambda: _env_int("LD_STEP", 5))
     ld_r2_threshold: float = field(default_factory=lambda: _env_float("LD_R2_THRESHOLD", 0.8))
+    # Prefissi id campione da ESCLUDERE sempre dal filtraggio VCF (plink2 --remove).
+    # Nell'originale (gene_reduction.py) era hardcoded a "ACH" senza spiegazione nel
+    # codice. Reso configurabile: se in dubbio, imposta EXCLUDE_ID_PREFIXES=ACH per
+    # riprodurre esattamente il comportamento originale.
+    exclude_id_prefixes: list[str] = field(default_factory=lambda: _env_list("EXCLUDE_ID_PREFIXES", ""))
+    # Formato del file genetico letto da build_dataset.py: "auto" (deduce dall'estensione
+    # .parquet/.csv), "csv" o "parquet".
+    raw_file_format: str = field(default_factory=lambda: _env("RAW_FILE_FORMAT", "auto"))
 
     # ---- VCF sorgenti per generazione (extract_matrix) ----
     vcf_dir_gen1: str = field(default_factory=lambda: _env("VCF_DIR_GEN1", ""))
@@ -146,3 +185,28 @@ def get_config() -> Config:
     if _config_instance is None:
         _config_instance = Config()
     return _config_instance
+
+
+def get_generation_vcf_folders(cfg: "Config") -> dict[int, str]:
+    """Mappa {generazione: cartella VCF}, costruita da VCF_DIR_GEN1/2/3.
+
+    Usata sia da filter-vcf/build-matrix (per sapere quali cartelle processare
+    e a quale generazione appartiene ogni campione) sia da extract-significant.
+    Sostituisce l'uso ambiguo di VCF_FOLDERS (lista piatta senza indicazione di
+    quale elemento fosse quale generazione).
+    """
+    mapping = {}
+    if cfg.vcf_dir_gen1:
+        mapping[1] = cfg.vcf_dir_gen1
+    if cfg.vcf_dir_gen2:
+        mapping[2] = cfg.vcf_dir_gen2
+    if cfg.vcf_dir_gen3:
+        mapping[3] = cfg.vcf_dir_gen3
+    if not mapping and cfg.vcf_folders:
+        raise ConfigError(
+            "Nessuna VCF_DIR_GEN1/GEN2/GEN3 configurata. Imposta esplicitamente a quale "
+            "generazione appartiene ogni cartella VCF (VCF_FOLDERS da solo è ambiguo: non "
+            "dice quale cartella è quale generazione, e serve invece a costruire la mappa "
+            "id->generazione usata per tenere le analisi per coorte indipendenti)."
+        )
+    return mapping

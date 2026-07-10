@@ -1,5 +1,25 @@
 """
 Gestione delle connessioni MySQL.
+
+PROBLEMA nell'originale (db.py):
+  - `get_conn()` apriva una NUOVA connessione TCP al DB ogni volta che veniva
+    chiamata, e questo veniva fatto in moltissimi punti (spesso dentro
+    funzioni chiamate in loop, es. mark_variant_in_progress/reset per ogni
+    variante). Aprire/chiudere una connessione per ogni singola query è
+    lento e, sotto carico, può esaurire le connessioni disponibili sul
+    server MySQL.
+  - Nessun retry/backoff su errori transitori di connessione.
+  - Cursori aperti senza sempre garantire la chiusura in caso di eccezione
+    (niente context manager -> uso di try/finally sparso e incoerente).
+
+SOLUZIONE:
+  - Un connection pool (mysql.connector.pooling) condiviso, dimensionato da
+    config (DB_POOL_SIZE). Le connessioni vengono riutilizzate invece di
+    essere aperte/chiuse in continuazione.
+  - Un context manager `get_connection()` che restituisce la connessione al
+    pool automaticamente (commit se tutto ok, rollback se eccezione).
+  - Un context manager `cursor_scope()` per i cursori, che chiude sempre il
+    cursore anche in caso di errore.
 """
 from __future__ import annotations
 

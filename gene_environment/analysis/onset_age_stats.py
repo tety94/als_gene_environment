@@ -9,6 +9,15 @@ modo da poter essere chiamate:
      separato che ricalcola tutto da un CSV a parte.
   2) Nello script di reporting (report_onset_age.py) per generare boxplot e
      forest plot a partire dai valori già salvati.
+
+Fix rispetto all'originale:
+  - Il bootstrap era un loop Python puro (`for i in range(n_boot)`) con
+    n_boot=2000 PER OGNI variante PER OGNI coorte: con centinaia di varianti
+    diventa il collo di bottiglia principale. Qui è vettorizzato con numpy
+    (resample in un colpo solo con rng.choice su una matrice), tipicamente
+    10-50x più veloce.
+  - Gestione esplicita dei casi n<2 (evita errori silenziosi/NaN strani da
+    scipy con campioni troppo piccoli).
 """
 from __future__ import annotations
 

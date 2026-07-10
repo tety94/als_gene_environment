@@ -2,6 +2,18 @@
 """
 Genera boxplot e forest plot per la differenza di età d'esordio (onset_age)
 delle varianti significative. (ex analyze_variant_onset_age.py)
+
+DIFFERENZA PRINCIPALE rispetto all'originale: le statistiche (mediana,
+delta, IC bootstrap, p-value, FDR) NON vengono più ricalcolate qui — sono
+già state calcolate una volta sola in modeling.py e salvate a DB per ogni
+variante (vedi analysis/modeling.py e db/repository.py). Questo script si
+limita a: (1) leggere quelle statistiche dal DB, (2) leggere i dati grezzi
+paziente-per-paziente (genotipo + onset_age) solo per disegnare i boxplot,
+(3) produrre i grafici. Avere un'unica fonte di verità per i numeri evita
+che report e DB possano andare fuori sincrono.
+
+Usa la stessa `clean_sample_id` di build_dataset.py (utils/id_utils.py) per
+la pulizia degli id, invece di una funzione locale duplicata.
 """
 from __future__ import annotations
 
@@ -20,8 +32,6 @@ from gene_environment.logging_utils import configure_logging, get_logger
 from gene_environment.utils.id_utils import clean_sample_id
 
 log = get_logger(__name__)
-
-COHORTS = (1, 2)  # gen3 escluso di proposito, come nell'originale
 
 
 def load_onset_age(cfg) -> pd.DataFrame:
@@ -79,7 +89,8 @@ def make_forest_plot(stats_df: pd.DataFrame, out_path: str):
 
     xerr_low = stats_df["onset_delta_median"] - stats_df["onset_ci_low"]
     xerr_high = stats_df["onset_ci_high"] - stats_df["onset_delta_median"]
-    colors = stats_df["cohort"].map({1: "tab:blue", 2: "tab:orange"}).fillna("gray")
+    palette = {1: "tab:blue", 2: "tab:orange", 3: "tab:green"}
+    colors = stats_df["cohort"].map(palette).fillna("gray")
 
     fig, ax = plt.subplots(figsize=(7, max(4, 0.35 * len(stats_df))))
     ax.errorbar(stats_df["onset_delta_median"], y_pos, xerr=[xerr_low, xerr_high],
@@ -91,8 +102,8 @@ def make_forest_plot(stats_df: pd.DataFrame, out_path: str):
     ax.set_xlabel("Delta mediana onset_age (mutati - non mutati) [IC 95% bootstrap]")
 
     handles = [
-        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue", label="Coorte 1"),
-        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange", label="Coorte 2"),
+        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=palette.get(c, "gray"), label=f"Coorte {c}")
+        for c in sorted(stats_df["cohort"].unique())
     ]
     ax.legend(handles=handles, loc="best")
     fig.tight_layout()
@@ -112,7 +123,7 @@ def run_report_onset_age() -> None:
     df_onset = load_onset_age(cfg)
     all_stats = []
 
-    for cohort in COHORTS:
+    for cohort in cfg.report_cohorts:
         df_geno = load_genotype_matrix_for_cohort(cfg, cohort)
         db_stats = load_db_stats(cfg, cohort)
         if df_geno is None or db_stats.empty:

@@ -1,8 +1,23 @@
 """
 Prepara il dataset finale (merge genetica + ambientale) usato dal modeling.
+
+Fix rispetto all'originale (data_loader.py):
+  - RIMOSSA la riga `df_env['id'] = df_env['id'] + '_' + df_env['id']`.
+    Era un workaround per far combaciare gli id del file ambientale con
+    quelli (duplicati) del file genetico. Ora la normalizzazione avviene con
+    `clean_sample_id` (utils/id_utils.py) applicata al file genetico, quindi
+    il file ambientale resta con i suoi id originali, senza trasformazioni
+    "magiche" difficili da ricordare/motivare a distanza di mesi.
+  - Log invece di print(), con gli stessi checkpoint temporali dell'originale.
+  - Validazione esplicita: se dopo il merge il numero di righe è 0, o la
+    percentuale di id non matchati è alta, viene loggato un WARNING chiaro
+    (prima si andava avanti in silenzio con un dataframe vuoto o quasi).
+  - `SettingWithCopyWarning` potenziale su `df_gen.rename` risolto passando
+    sempre per assegnazione esplicita.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 import pandas as pd
@@ -20,17 +35,27 @@ NON_GEN_COLS = ["FID", "IID", "PAT", "MAT", "SEX", "PHENOTYPE", "id"]
 def load_and_prepare_data(cfg: Config | None = None):
     cfg = cfg or get_config()
 
-    log.info("Carico file genetica da %s", cfg.raw_file)
-    df_gen = pd.read_csv(cfg.raw_file, sep=cfg.sep, decimal=cfg.decimal, low_memory=False)
+    fmt = cfg.raw_file_format
+    if fmt == "auto":
+        fmt = "parquet" if cfg.raw_file.endswith(".parquet") else "csv"
+
+    log.info("Carico file genetica da %s (formato=%s)", cfg.raw_file, fmt)
+    if fmt == "parquet":
+        # Output diretto di build-matrix (vcf_to_parquet.py): l'id campione è
+        # già l'indice del DataFrame, non una colonna.
+        df_gen = pd.read_parquet(cfg.raw_file)
+        df_gen.index = df_gen.index.astype(str).map(clean_sample_id)
+        df_gen.index.name = "id"
+        df_gen = df_gen.reset_index()
+    else:
+        df_gen = pd.read_csv(cfg.raw_file, sep=cfg.sep, decimal=cfg.decimal, low_memory=False)
+        if "IID" in df_gen.columns:
+            df_gen = df_gen.rename(columns={"IID": "id"})
+        if "id" in df_gen.columns:
+            df_gen["id"] = df_gen["id"].astype(str).map(clean_sample_id)
 
     variant_cols = [c for c in df_gen.columns if c not in NON_GEN_COLS]
     log.info("Colonne varianti individuate: %d", len(variant_cols))
-
-    if "IID" in df_gen.columns:
-        df_gen = df_gen.rename(columns={"IID": "id"})
-
-    if "id" in df_gen.columns:
-        df_gen["id"] = df_gen["id"].astype(str).map(clean_sample_id)
 
     log.info("Carico file ambientale da %s", cfg.env_file)
     df_env = pd.read_csv(cfg.env_file, sep=cfg.sep, decimal=cfg.decimal)
@@ -56,7 +81,47 @@ def load_and_prepare_data(cfg: Config | None = None):
             "verifica la coerenza degli id fra i due file.", n_merged, n_env, n_gen
         )
 
-    log.info("Id unici post-merge: %d (righe totali: %d)", df["id"].nunique(), len(df))
+    # ---- Filtro per generazione, DOPO il join per id ----
+    # Il file ambientale può non avere alcuna colonna di generazione (caso comune:
+    # un unico ENV_FILE con tutti i pazienti, id come unica chiave di join). L'unica
+    # fonte affidabile della coorte di un paziente è allora il VCF da cui proviene il
+    # suo genotipo: build-matrix (vcf_to_parquet.py) produce una mappa id->generazione
+    # che qui viene usata per tenere i run per gen1/gen2/gen3 indipendenti.
+    map_path = cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv")
+    if os.path.exists(map_path):
+        gen_map = pd.read_csv(map_path, dtype={"id": str})
+        n_before = len(df)
+        df = df.merge(gen_map, on="id", how="left")
+        n_missing_map = df["generation"].isna().sum()
+        if n_missing_map:
+            log.warning(
+                "%d pazienti dopo il merge non sono presenti nella mappa id->generazione (%s): "
+                "verranno esclusi dal run (generazione sconosciuta).", n_missing_map, map_path,
+            )
+        df = df[df["generation"] == cfg.generation].drop(columns=["generation"])
+        log.info(
+            "Filtro per generazione=%s (mappa id->generazione da build-matrix): %d -> %d righe",
+            cfg.generation, n_before, len(df),
+        )
+    elif cfg.env_generation_col and cfg.env_generation_col in df_env.columns:
+        n_before = len(df)
+        df = df[df[cfg.env_generation_col].astype(str) == str(cfg.generation)]
+        log.info(
+            "Filtro per generazione=%s (colonna '%s' nel file ambientale): %d -> %d righe",
+            cfg.generation, cfg.env_generation_col, n_before, len(df),
+        )
+    else:
+        log.warning(
+            "Nessuna mappa id->generazione trovata (%s) e nessuna ENV_GENERATION_COL configurata: "
+            "uso TUTTE le righe senza filtro per generazione. Se stai processando più coorti nello "
+            "stesso pool genotipico, esegui prima 'build-matrix' (genera la mappa automaticamente) "
+            "o imposta ENV_GENERATION_COL.", map_path,
+        )
+
+    if df.empty:
+        log.warning("Dataset vuoto dopo il filtro per generazione=%s: controlla mappa/colonna generazione.", cfg.generation)
+
+    log.info("Id unici post-merge/filtro: %d (righe totali: %d)", df["id"].nunique(), len(df))
     df = df.drop_duplicates("id")
 
     df[cfg.target_col] = pd.to_numeric(df[cfg.target_col], errors="coerce")

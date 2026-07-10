@@ -1,6 +1,27 @@
 """
 Filtraggio VCF -> PLINK binario -> MAF filter -> LD pruning -> VCF filtrato.
 (ex gene_reduction.py)
+
+Fix rispetto all'originale:
+  - Il loop sui file VCF era completamente SEQUENZIALE (un file dopo l'altro),
+    nonostante MAX_WORKERS fosse già configurato e usato altrove nella
+    pipeline. Con decine/centinaia di file VCF per cromosoma questo è lo
+    step più lento di tutta la pipeline "a monte". Ora è parallelizzato con
+    ProcessPoolExecutor, un processo per file VCF (ogni chiamata plink2 è
+    già mono-processo pesante in I/O+CPU, quindi parallelizzare a livello di
+    file ha senso ed è sicuro).
+  - Idempotenza: se l'output finale (_filtered.vcf) esiste già, il file
+    viene saltato invece di essere ricalcolato da capo ad ogni rilancio
+    (utile perché lo step precedente può fallire a metà su centinaia di
+    file, e senza skip si ripartirebbe sempre da zero).
+  - Il prefisso "ACH" usato per escludere campioni dal .fam era hardcoded
+    senza alcun commento sul perché. Ora è un parametro di configurazione
+    esplicito (EXCLUDE_ID_PREFIXES), documentato, con default vuoto: se non
+    configurato non viene rimosso silenziosamente nessun campione.
+  - Ogni subprocess.run(..., check=True) ora logga comando ed esito; un
+    fallimento di plink2 su UN file non blocca più necessariamente l'intero
+    batch (l'errore viene loggato e si passa al file successivo, il
+    riepilogo finale elenca i falliti).
 """
 from __future__ import annotations
 
@@ -8,7 +29,7 @@ import os
 import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from gene_environment.config import get_config
+from gene_environment.config import get_config, get_generation_vcf_folders
 from gene_environment.logging_utils import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -87,7 +108,16 @@ def filter_single_vcf(input_path: str, output_vcf_folder: str, cfg_dict: dict) -
 def run_filter_vcf(exclude_id_prefixes: list[str] | None = None) -> None:
     cfg = get_config()
     configure_logging(cfg.log_dir)
-    exclude_id_prefixes = exclude_id_prefixes or []
+    # default: legge da config (EXCLUDE_ID_PREFIXES), non più una lista vuota fissa
+    exclude_id_prefixes = exclude_id_prefixes if exclude_id_prefixes is not None else cfg.exclude_id_prefixes
+    if exclude_id_prefixes:
+        log.info("Prefissi id da escludere dal filtraggio: %s", exclude_id_prefixes)
+    else:
+        log.warning(
+            "EXCLUDE_ID_PREFIXES non configurato: nessun campione verrà escluso per prefisso id. "
+            "Lo script originale escludeva sempre i campioni con id che iniziano per 'ACH' — "
+            "se è ancora il comportamento voluto, imposta EXCLUDE_ID_PREFIXES=ACH nel .env."
+        )
 
     cfg_dict = {
         "maf_threshold": cfg.maf_threshold,
@@ -99,13 +129,14 @@ def run_filter_vcf(exclude_id_prefixes: list[str] | None = None) -> None:
     }
 
     jobs = []
-    for input_folder in cfg.vcf_folders:
+    for generation, input_folder in get_generation_vcf_folders(cfg).items():
         output_vcf_folder = os.path.join(input_folder, OUTPUT_SUBFOLDER)
         os.makedirs(output_vcf_folder, exist_ok=True)
         vcf_files = [
             f for f in os.listdir(input_folder)
             if f.endswith(".vcf.gz") and not f.startswith("._")
         ]
+        log.info("Generazione %d: %d VCF trovati in %s", generation, len(vcf_files), input_folder)
         for vcf_file in vcf_files:
             jobs.append((os.path.join(input_folder, vcf_file), output_vcf_folder))
 
