@@ -249,7 +249,7 @@ def _process_single_vcf_worker(args) -> tuple[str, int, list[str], bool]:
         log.info("Skip (già convertito e valido): %s", out_parquet)
         samples = pq.ParquetFile(
             out_parquet, thrift_string_size_limit=2_000_000_000, thrift_container_size_limit=2_000_000_000,
-        ).read(columns=[]).to_pandas().index.tolist()
+        ).read(columns=[], use_pandas_metadata=True).to_pandas().index.tolist()
         return out_parquet, generation, samples, False
 
     if os.path.exists(out_parquet):
@@ -433,7 +433,7 @@ def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, 
             continue
         dfs.append(
             pq.ParquetFile(p, thrift_string_size_limit=2_000_000_000,
-                           thrift_container_size_limit=2_000_000_000).read().to_pandas()
+                           thrift_container_size_limit=2_000_000_000).read(use_pandas_metadata=True).to_pandas()
         )
 
     if corrupt_files:
@@ -532,7 +532,8 @@ def build_full_genome_parquet(chrom_parquet_paths: list[str], out_path: str, for
             f"Rilancia la pipeline per rigenerarli prima del merge finale."
         )
 
-    frames = [pq.ParquetFile(p, thrift_string_size_limit=2_000_000_000, thrift_container_size_limit=2_000_000_000).read().to_pandas()
+    frames = [pq.ParquetFile(p, thrift_string_size_limit=2_000_000_000, thrift_container_size_limit=2_000_000_000).read(
+        use_pandas_metadata=True).to_pandas()
               for p in chrom_parquet_paths]
     full = pd.concat(frames, axis=1, join="outer")
     full.index.name = "id"
