@@ -22,7 +22,8 @@ BUG PIÙ GRAVE TROVATO E CORRETTO (create_full_csv.py):
   indipendentemente dall'ordine delle righe nei singoli file, ed è quello
   che ci si aspetterebbe da un'operazione di merge.
 
-FIX SUCCESSIVI (10 luglio 2026 - crash "Exceeded size limit" su parquet):
+FIX (10 luglio 2026 - crash "Exceeded size limit" su parquet, VCF di input
+enormi e corruzione a catena):
   - L'errore veniva da un file .raw.parquet scritto PARZIALMENTE (worker
     ucciso / run interrotto): pyarrow non riesce a leggere il footer thrift
     di un parquet troncato e lancia un OSError poco chiaro. Ora:
@@ -49,6 +50,20 @@ FIX SUCCESSIVI (10 luglio 2026 - crash "Exceeded size limit" su parquet):
   - Il logging ora scrive anche su file (non solo su console), sia nel
     processo principale sia in ogni worker (i worker sono processi separati
     e non ereditano gli handler di logging del padre).
+  - NUOVO - VCF di input (.vcf.gz) corrotti/troncati: filter_vcf.py scrive
+    ora i propri output in bgzip (*_filtered.vcf.gz) invece di VCF testuale
+    enorme; il glob qui è stato aggiornato di conseguenza. Se uno di questi
+    .vcf.gz risulta troncato (run precedente interrotto), invece di far
+    fallire cyvcf2 con un errore criptico in mezzo alla conversione, il
+    file viene VALIDATO prima di essere letto (decompressione completa) e,
+    se non valido, viene ELIMINATO: al prossimo rilancio di filter_vcf.py
+    verrà rigenerato automaticamente (idempotenza), e questo script segnala
+    il file come "da rifare" invece di bloccare l'intero batch.
+  - NUOVO - statistiche numeriche: oltre ai log testuali già presenti
+    (varianti scartate per missing, shape di ogni output), viene ora
+    scritto anche un CSV riepilogativo per cromosoma in
+    <log_dir>/vcf_to_parquet_stats.csv (campioni, varianti totali, varianti
+    scartate per missing rate, varianti finali).
 
 ALTRE OTTIMIZZAZIONI (invariate):
   - Niente più CSV intermedi giganti: si scrive direttamente in Parquet
@@ -68,10 +83,14 @@ ALTRE OTTIMIZZAZIONI (invariate):
 """
 from __future__ import annotations
 
+import csv
+import gzip
 import logging
 import os
 import re
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
 from glob import glob
 
 import numpy as np
@@ -86,6 +105,7 @@ log = get_logger(__name__)
 CHROMOSOMES = [str(i) for i in range(1, 23)]
 
 LOG_FILENAME = "vcf_to_parquet.log"
+STATS_FILENAME = "vcf_to_parquet_stats.csv"
 
 
 class CorruptParquetError(Exception):
@@ -94,11 +114,18 @@ class CorruptParquetError(Exception):
     un semplice rilancio della pipeline lo rigenera."""
 
 
+class CorruptInputVCFError(Exception):
+    """Sollevata quando uno o più *_filtered.vcf.gz (output di filter_vcf.py)
+    risultano corrotti/troncati. Il file viene eliminato prima di sollevare
+    l'eccezione: al prossimo rilancio di filter_vcf.py verrà rigenerato
+    automaticamente grazie alla sua idempotenza."""
+
+
 def _add_file_logging(log_dir: str) -> None:
     """Aggiunge (una sola volta per processo) un FileHandler al root logger,
     così i log finiscono sia su console sia su <log_dir>/vcf_to_parquet.log.
     Va richiamata sia nel processo principale sia in ogni worker (sono
-    processi separati e non ereditano gli handler del padre)."""
+    processi separati e non ereditano gli handler di logging del padre)."""
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.abspath(os.path.join(log_dir, LOG_FILENAME))
 
@@ -133,6 +160,24 @@ def _is_valid_parquet(path: str) -> bool:
         return False
 
 
+def _is_valid_bgzip_vcf(path: str) -> bool:
+    """True se il *_filtered.vcf.gz è un bgzip/gzip leggibile per intero
+    (nessun blocco troncato). Simmetrico al controllo fatto lato
+    filter_vcf.py prima di scrivere il file: qui serve a distinguere un VCF
+    di input genuinamente corrotto da un errore diverso durante il parsing
+    con cyvcf2."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    try:
+        with gzip.open(path, "rb") as f:
+            while f.read(1024 * 1024):
+                pass
+        return True
+    except Exception as e:
+        log.warning("VCF di input non valido/troncato: %s (%s)", path, e)
+        return False
+
+
 def _write_parquet_atomic(df: pd.DataFrame, out_path: str, **to_parquet_kwargs) -> None:
     """Scrive su <out_path>.tmp e poi rinomina atomicamente su out_path.
     Garantisce che, se il processo viene ucciso a metà scrittura (OOM,
@@ -155,9 +200,11 @@ def _genotype_to_dosage(gt) -> int:
 
 
 def vcf_file_to_dosage_df(vcf_path: str) -> pd.DataFrame:
-    """Legge un VCF filtrato e ritorna un DataFrame (samples x varianti) di
-    dosaggi grezzi (0/1/2/-1=missing). Import di cyvcf2 fatto qui dentro per
-    non richiederlo come dipendenza hard di tutto il pacchetto."""
+    """Legge un VCF filtrato (bgzip) e ritorna un DataFrame (samples x
+    varianti) di dosaggi grezzi (0/1/2/-1=missing). Import di cyvcf2 fatto
+    qui dentro per non richiederlo come dipendenza hard di tutto il
+    pacchetto. cyvcf2 legge .vcf.gz bgzip nativamente, nessuna
+    decompressione manuale necessaria qui."""
     from cyvcf2 import VCF
 
     vcf = VCF(vcf_path)
@@ -180,7 +227,11 @@ def vcf_file_to_dosage_df(vcf_path: str) -> pd.DataFrame:
     return pd.DataFrame(arr, index=samples, columns=variant_ids)
 
 
-def _process_single_vcf_worker(args) -> tuple[str, int, list[str]]:
+def _process_single_vcf_worker(args) -> tuple[str, int, list[str], bool]:
+    """Ritorna (out_parquet, generation, samples, input_corrotto).
+    Se l'ultimo elemento è True, out_parquet/samples sono vuoti/non
+    validi: il file di input è stato eliminato e va segnalato al
+    chiamante."""
     vcf_path, out_parquet, log_dir, generation = args
     configure_logging(log_dir)
     _add_file_logging(log_dir)
@@ -188,24 +239,45 @@ def _process_single_vcf_worker(args) -> tuple[str, int, list[str]]:
     if _is_valid_parquet(out_parquet):
         log.info("Skip (già convertito e valido): %s", out_parquet)
         samples = pd.read_parquet(out_parquet, columns=[]).index.tolist()
-        return out_parquet, generation, samples
+        return out_parquet, generation, samples, False
 
     if os.path.exists(out_parquet):
         log.warning("File esistente ma corrotto/troncato, lo rigenero: %s", out_parquet)
         os.remove(out_parquet)
 
+    if not _is_valid_bgzip_vcf(vcf_path):
+        log.error(
+            "VCF di input corrotto/troncato, lo elimino per forzare la rigenerazione da "
+            "filter_vcf.py al prossimo run: %s", vcf_path,
+        )
+        os.remove(vcf_path)
+        return "", generation, [], True
+
     log.info("Converto VCF -> parquet (generazione %d): %s", generation, vcf_path)
-    df = vcf_file_to_dosage_df(vcf_path)
+    try:
+        df = vcf_file_to_dosage_df(vcf_path)
+    except Exception as e:
+        # cyvcf2 può fallire anche su un bgzip "valido" a livello di blocchi
+        # ma con contenuto VCF troncato/malformato a metà (es. riga tagliata
+        # a metà scrittura non intercettata dal controllo gzip). Trattato
+        # allo stesso modo: elimino e segnalo per rigenerazione.
+        log.error(
+            "Errore leggendo il VCF con cyvcf2, lo considero corrotto e lo elimino: %s (%s)",
+            vcf_path, e,
+        )
+        os.remove(vcf_path)
+        return "", generation, [], True
+
     _write_parquet_atomic(df, out_parquet, compression="zstd")
     log.info("Scritto %s (%d campioni, %d varianti)", out_parquet, df.shape[0], df.shape[1])
-    return out_parquet, generation, df.index.tolist()
+    return out_parquet, generation, df.index.tolist(), False
 
 
 def _detect_duplicate_chrom_sources(vcf_paths: list[str]) -> None:
     """Segnala (senza bloccare) se più di un VCF filtrato sembra riferirsi
     allo stesso cromosoma nella stessa cartella: capita quando restano in
     giro file di run precedenti con naming diverso (es.
-    'chr1_filtered.vcf' e 'chr1.vcf_filtered.vcf' insieme), e porta a
+    'chr1_filtered.vcf.gz' e 'chr1.vcf_filtered.vcf.gz' insieme), e porta a
     processare due volte lo stesso cromosoma inutilmente."""
     by_chrom: dict[str, list[str]] = {}
     for p in vcf_paths:
@@ -224,20 +296,25 @@ def _detect_duplicate_chrom_sources(vcf_paths: list[str]) -> None:
 
 
 def convert_filtered_vcfs_to_parquet() -> tuple[list[str], dict[str, int]]:
-    """Step 1: ogni *_filtered.vcf -> un parquet grezzo (dosaggi 0/1/2/-1).
+    """Step 1: ogni *_filtered.vcf.gz -> un parquet grezzo (dosaggi 0/1/2/-1).
 
     Ritorna anche la mappa id_campione -> generazione, costruita in base a
     QUALE cartella (VCF_DIR_GENn) proviene ogni file VCF: è l'unica fonte
     affidabile della coorte di un paziente quando il file ambientale non
     contiene alcuna informazione di generazione (il join fra ambiente e
-    genetica avviene solo per id)."""
+    genetica avviene solo per id).
+
+    Se uno o più VCF di input risultano corrotti vengono eliminati (così
+    che filter_vcf.py li rigeneri al prossimo run) e viene sollevata
+    CorruptInputVCFError alla fine, DOPO aver comunque processato tutti gli
+    altri file: un input corrotto non blocca più l'intero batch."""
     cfg = get_config()
     _add_file_logging(cfg.log_dir)
 
     jobs = []
     for generation, folder in get_generation_vcf_folders(cfg).items():
         vcf_filtered_dir = os.path.join(folder, "vcf_filtered")
-        vcf_files = glob(os.path.join(vcf_filtered_dir, "*_filtered.vcf"))
+        vcf_files = glob(os.path.join(vcf_filtered_dir, "*_filtered.vcf.gz"))
         _detect_duplicate_chrom_sources(vcf_files)
         for vcf_path in vcf_files:
             out_parquet = vcf_path + ".raw.parquet"
@@ -247,11 +324,15 @@ def convert_filtered_vcfs_to_parquet() -> tuple[list[str], dict[str, int]]:
     out_paths = []
     sample_generation: dict[str, int] = {}
     conflicts = []
+    corrupt_inputs = []
 
     with ProcessPoolExecutor(max_workers=cfg.max_workers) as ex:
         futures = [ex.submit(_process_single_vcf_worker, job) for job in jobs]
         for fut in as_completed(futures):
-            out_path, generation, samples = fut.result()
+            out_path, generation, samples, was_corrupt = fut.result()
+            if was_corrupt:
+                corrupt_inputs.append(out_path)
+                continue
             out_paths.append(out_path)
             for raw_sample in samples:
                 sid = clean_sample_id(str(raw_sample))
@@ -265,6 +346,14 @@ def convert_filtered_vcfs_to_parquet() -> tuple[list[str], dict[str, int]]:
             "%d id campione risultano presenti in PIÙ di una generazione (tenuta l'ultima "
             "vista): %s%s",
             len(conflicts), conflicts[:10], " ..." if len(conflicts) > 10 else "",
+        )
+
+    if corrupt_inputs:
+        raise CorruptInputVCFError(
+            f"{len(corrupt_inputs)} VCF di input erano corrotti/illeggibili e sono stati "
+            f"eliminati. Rilancia prima filter_vcf.py (li rigenererà grazie alla sua "
+            f"idempotenza), poi rilancia questa pipeline: i file già convertiti in questo "
+            f"run ({len(out_paths)}) non verranno ricalcolati."
         )
 
     return out_paths, sample_generation
@@ -286,21 +375,32 @@ def _files_for_chromosome(chrom: str, raw_parquet_paths: list[str]) -> list[str]
     return [p for p in raw_parquet_paths if pattern.search(os.path.basename(p))]
 
 
+@dataclass
+class ChromStats:
+    chrom: str
+    n_samples: int = 0
+    n_variants_total: int = 0
+    n_variants_dropped_missing: int = 0
+    n_variants_final: int = 0
+    elapsed_seconds: float = 0.0
+
+
 def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, null_percentage: float,
-                      missing_strategy: str = "zero", force: bool = False) -> str | None:
+                      missing_strategy: str = "zero", force: bool = False) -> tuple[str | None, ChromStats | None]:
     """Step 2: unisce (per id, non per posizione di riga) tutti i parquet
     grezzi relativi allo stesso cromosoma, filtra per missing rate e
-    binarizza. Ritorna il path del parquet di cromosoma, o None se non
-    c'era nulla da fare.
+    binarizza. Ritorna (path del parquet di cromosoma o None, statistiche
+    numeriche o None se non c'era nulla da fare).
 
     Se uno o più file raw sono corrotti/troncati: vengono cancellati (così
     che convert_filtered_vcfs_to_parquet li rigeneri al prossimo run) e
     viene sollevata CorruptParquetError, in modo che il chiamante possa
     saltare SOLO questo cromosoma senza far fallire tutta la pipeline."""
+    t0 = time.monotonic()
     out_path = os.path.join(out_folder, f"chr{chrom}_merged.parquet")
     if not force and _is_valid_parquet(out_path):
         log.info("chr%s: già presente e valido, salto (%s)", chrom, out_path)
-        return out_path
+        return out_path, None
 
     chrom_files = _files_for_chromosome(chrom, raw_parquet_paths)
     chrom_files = [
@@ -309,7 +409,7 @@ def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, 
     ]
     if not chrom_files:
         log.warning("Nessun file trovato per chr%s", chrom)
-        return None
+        return None, None
 
     dfs = []
     corrupt_files = []
@@ -334,13 +434,14 @@ def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, 
 
     if not dfs:
         log.warning("chr%s: nessun file valido trovato dopo la validazione", chrom)
-        return None
+        return None, None
 
     # concat verticale (nuovi campioni), allineamento sulle COLONNE (varianti)
     # per nome, non per posizione -> outer join implicito di pandas.
     merged = pd.concat(dfs, axis=0, join="outer")
     merged = merged[~merged.index.duplicated(keep="first")]
 
+    n_variants_total = merged.shape[1]
     missing_frac = (merged < 0).mean()
     keep_cols = missing_frac[missing_frac < null_percentage].index
     dropped = merged.shape[1] - len(keep_cols)
@@ -350,7 +451,7 @@ def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, 
 
     if merged.shape[1] == 0:
         log.warning("chr%s: nessuna variante superstite dopo il filtro missing", chrom)
-        return None
+        return None, None
 
     arr = merged.to_numpy(dtype=np.float32, copy=True)
     if missing_strategy == "zero":
@@ -366,7 +467,16 @@ def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, 
         out_path, compression="zstd",
     )
     log.info("chr%s: salvato %s (%d campioni, %d varianti)", chrom, out_path, *merged.shape)
-    return out_path
+
+    stats = ChromStats(
+        chrom=chrom,
+        n_samples=merged.shape[0],
+        n_variants_total=n_variants_total,
+        n_variants_dropped_missing=dropped,
+        n_variants_final=merged.shape[1],
+        elapsed_seconds=time.monotonic() - t0,
+    )
+    return out_path, stats
 
 
 def build_full_genome_parquet(chrom_parquet_paths: list[str], out_path: str, force: bool = False) -> None:
@@ -397,26 +507,62 @@ def build_full_genome_parquet(chrom_parquet_paths: list[str], out_path: str, for
     log.info("Genoma completo salvato in %s (%d campioni, %d varianti)", out_path, *full.shape)
 
 
+def _write_stats_csv(all_stats: list[ChromStats], log_dir: str) -> str:
+    """Scrive un CSV riepilogativo per cromosoma in
+    <log_dir>/vcf_to_parquet_stats.csv. Scrittura atomica (tmp + rename)."""
+    os.makedirs(log_dir, exist_ok=True)
+    out_path = os.path.join(log_dir, STATS_FILENAME)
+    tmp_path = out_path + ".tmp"
+
+    fieldnames = list(asdict(all_stats[0]).keys()) if all_stats else [
+        "chrom", "n_samples", "n_variants_total", "n_variants_dropped_missing",
+        "n_variants_final", "elapsed_seconds",
+    ]
+    with open(tmp_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for s in all_stats:
+            writer.writerow(asdict(s))
+    os.replace(tmp_path, out_path)
+    return out_path
+
+
 def run_vcf_to_parquet_pipeline(missing_strategy: str = "zero", force: bool = False) -> str:
     cfg = get_config()
     configure_logging(cfg.log_dir)
     _add_file_logging(cfg.log_dir)
 
+    t_start = time.monotonic()
     raw_paths, sample_generation = convert_filtered_vcfs_to_parquet()
 
     map_path = cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv")
     save_sample_generation_map(sample_generation, map_path)
 
     chrom_paths = []
+    chrom_stats: list[ChromStats] = []
     failed_chroms = []
     for chrom in CHROMOSOMES:
         try:
-            p = merge_chromosome(chrom, raw_paths, cfg.output_folder, cfg.null_percentage, missing_strategy, force=force)
+            p, stats = merge_chromosome(chrom, raw_paths, cfg.output_folder, cfg.null_percentage, missing_strategy, force=force)
             if p:
                 chrom_paths.append(p)
+            if stats:
+                chrom_stats.append(stats)
         except CorruptParquetError as e:
             log.error(str(e))
             failed_chroms.append(chrom)
+
+    if chrom_stats:
+        stats_path = _write_stats_csv(chrom_stats, cfg.log_dir)
+        tot_variants_total = sum(s.n_variants_total for s in chrom_stats)
+        tot_variants_dropped = sum(s.n_variants_dropped_missing for s in chrom_stats)
+        tot_variants_final = sum(s.n_variants_final for s in chrom_stats)
+        log.info(
+            "Riepilogo merge per cromosoma (%d cromosomi processati in questo run): "
+            "%d varianti totali -> %d scartate per missing -> %d finali. "
+            "Statistiche per-cromosoma salvate in %s",
+            len(chrom_stats), tot_variants_total, tot_variants_dropped, tot_variants_final, stats_path,
+        )
 
     if failed_chroms:
         raise RuntimeError(
@@ -429,6 +575,8 @@ def run_vcf_to_parquet_pipeline(missing_strategy: str = "zero", force: bool = Fa
 
     out_path = os.path.join(cfg.output_folder, "gen.parquet")
     build_full_genome_parquet(chrom_paths, out_path, force=force)
+
+    log.info("Pipeline vcf_to_parquet completata in %.1fs -> %s", time.monotonic() - t_start, out_path)
     return out_path
 
 
