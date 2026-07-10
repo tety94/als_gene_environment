@@ -303,6 +303,10 @@ def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, 
         return out_path
 
     chrom_files = _files_for_chromosome(chrom, raw_parquet_paths)
+    chrom_files = [
+        p for p in chrom_files
+        if "_selected" not in os.path.basename(p)
+    ]
     if not chrom_files:
         log.warning("Nessun file trovato per chr%s", chrom)
         return None
