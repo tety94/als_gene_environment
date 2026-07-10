@@ -179,15 +179,20 @@ def _is_valid_bgzip_vcf(path: str) -> bool:
 
 
 def _write_parquet_atomic(df: pd.DataFrame, out_path: str, **to_parquet_kwargs) -> None:
-    """Scrive su <out_path>.tmp e poi rinomina atomicamente su out_path.
+    """Scrive su <out_path>.<pid>.tmp e poi rinomina atomicamente su out_path.
     Garantisce che, se il processo viene ucciso a metà scrittura (OOM,
     kill, crash del worker, disco pieno...), il path finale non contenga
     MAI un parquet troncato: o non esiste, o è quello vecchio (valido), o
-    è quello nuovo completo."""
-    tmp_path = out_path + ".tmp"
-    df.to_parquet(tmp_path, engine="pyarrow", **to_parquet_kwargs)
-    os.replace(tmp_path, out_path)
-
+    è quello nuovo completo. Il pid nel nome evita che due processi/run
+    concorrenti si scrivano addosso lo stesso file temporaneo."""
+    tmp_path = f"{out_path}.{os.getpid()}.tmp"
+    try:
+        df.to_parquet(tmp_path, engine="pyarrow", **to_parquet_kwargs)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 def _genotype_to_dosage(gt) -> int:
     """gt: tupla cyvcf2 (allele1, allele2, phased). -1 = missing."""
@@ -320,13 +325,16 @@ def convert_filtered_vcfs_to_parquet() -> tuple[list[str], dict[str, int]]:
             out_parquet = vcf_path + ".raw.parquet"
             jobs.append((vcf_path, out_parquet, cfg.log_dir, generation))
 
+    jobs.sort(key=lambda j: os.path.getsize(j[0]), reverse=True)
     log.info("Conversione VCF filtrati -> parquet grezzo: %d file, %d worker", len(jobs), cfg.max_workers)
     out_paths = []
     sample_generation: dict[str, int] = {}
     conflicts = []
     corrupt_inputs = []
 
-    with ProcessPoolExecutor(max_workers=cfg.max_workers) as ex:
+    max_workers = min(cfg.max_workers, 6)
+    log.info("Uso %d worker (limitati da 16 a %d per evitare OOM su cromosomi grandi)", max_workers, max_workers)
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
         futures = [ex.submit(_process_single_vcf_worker, job) for job in jobs]
         for fut in as_completed(futures):
             out_path, generation, samples, was_corrupt = fut.result()
