@@ -95,6 +95,7 @@ from glob import glob
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from gene_environment.config import get_config, get_generation_vcf_folders
 from gene_environment.logging_utils import configure_logging, get_logger
@@ -150,9 +151,12 @@ def _is_valid_parquet(path: str) -> bool:
     if not os.path.exists(path):
         return False
     try:
-        import pyarrow.parquet as pq
 
-        pf = pq.ParquetFile(path)
+        pf = pq.ParquetFile(
+            path,
+            thrift_string_size_limit=2_000_000_000,
+            thrift_container_size_limit=2_000_000_000,
+        )
         _ = pf.metadata  # forza la lettura/validazione del footer
         return True
     except Exception as e:
@@ -243,7 +247,9 @@ def _process_single_vcf_worker(args) -> tuple[str, int, list[str], bool]:
 
     if _is_valid_parquet(out_parquet):
         log.info("Skip (già convertito e valido): %s", out_parquet)
-        samples = pd.read_parquet(out_parquet, columns=[]).index.tolist()
+        samples = pq.ParquetFile(
+            out_parquet, thrift_string_size_limit=2_000_000_000, thrift_container_size_limit=2_000_000_000,
+        ).read(columns=[]).to_pandas().index.tolist()
         return out_parquet, generation, samples, False
 
     if os.path.exists(out_parquet):
@@ -425,7 +431,10 @@ def merge_chromosome(chrom: str, raw_parquet_paths: list[str], out_folder: str, 
         if not _is_valid_parquet(p):
             corrupt_files.append(p)
             continue
-        dfs.append(pd.read_parquet(p))
+        dfs.append(
+            pq.ParquetFile(p, thrift_string_size_limit=2_000_000_000,
+                           thrift_container_size_limit=2_000_000_000).read().to_pandas()
+        )
 
     if corrupt_files:
         for p in corrupt_files:
@@ -523,7 +532,8 @@ def build_full_genome_parquet(chrom_parquet_paths: list[str], out_path: str, for
             f"Rilancia la pipeline per rigenerarli prima del merge finale."
         )
 
-    frames = [pd.read_parquet(p) for p in chrom_parquet_paths]
+    frames = [pq.ParquetFile(p, thrift_string_size_limit=2_000_000_000, thrift_container_size_limit=2_000_000_000).read().to_pandas()
+              for p in chrom_parquet_paths]
     full = pd.concat(frames, axis=1, join="outer")
     full.index.name = "id"
     _write_parquet_atomic(full, out_path, compression="zstd")
