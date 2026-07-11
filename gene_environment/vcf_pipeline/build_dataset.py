@@ -21,6 +21,7 @@ import os
 from datetime import datetime
 
 import pandas as pd
+import pyarrow.parquet as pq
 from sklearn.preprocessing import StandardScaler
 
 from gene_environment.config import Config, get_config
@@ -43,7 +44,11 @@ def load_and_prepare_data(cfg: Config | None = None):
     if fmt == "parquet":
         # Output diretto di build-matrix (vcf_to_parquet.py): l'id campione è
         # già l'indice del DataFrame, non una colonna.
-        df_gen = pd.read_parquet(cfg.raw_file)
+        df_gen = pq.ParquetFile(
+            cfg.raw_file,
+            thrift_string_size_limit=2_000_000_000,
+            thrift_container_size_limit=2_000_000_000,
+        ).read(use_pandas_metadata=True).to_pandas()
         df_gen.index = df_gen.index.astype(str).map(clean_sample_id)
         df_gen.index.name = "id"
         df_gen = df_gen.reset_index()
