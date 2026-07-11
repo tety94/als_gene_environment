@@ -62,6 +62,16 @@ def main(argv: list[str] | None = None) -> int:
     p_extract.add_argument("--force", action="store_true", help="Ignora il checkpoint e riparte da zero")
     p_export = sub.add_parser("export-significant-csv", help="Esporta uno snapshot CSV delle varianti significative")
     p_export.add_argument("--alpha", type=float, default=None, help="Soglia FDR (default: config.pvalue_threshold)")
+    p_repl = sub.add_parser(
+        "replicate-significant",
+        help="Ritesta su un'altra generazione SOLO le varianti significative di una generazione già completata",
+    )
+    p_repl.add_argument("--source-generation", type=int, required=True, help="Generazione già completata da cui prendere le varianti significative")
+    p_repl.add_argument("--target-generation", type=int, required=True, help="Generazione su cui ritestare quelle varianti")
+    p_repl.add_argument("--exposure", type=str, default=None, help="Default: config.exposure")
+    p_repl.add_argument("--alpha", type=float, default=None, help="Soglia FDR (default: config.pvalue_threshold)")
+    p_repl.add_argument("--test-label", type=str, default=None, help="Default: replication_of_gen{source}")
+    p_repl.add_argument("--force-rebuild-dataset", action="store_true", help="Ricostruisce il dataset della generazione target anche se già in cache")
     sub.add_parser("report-onset-age", help="Boxplot + forest plot onset_age")
     sub.add_parser("assign-genes", help="Assegna il gene Ensembl alle varianti significative")
     sub.add_parser("annotate-genes", help="Annotazioni neuro sui geni")
@@ -95,6 +105,17 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "export-significant-csv":
         from gene_environment.significant_variants.export_significant_csv import run_export
         run_export(alpha=args.alpha)
+
+    elif args.command == "replicate-significant":
+        from gene_environment.analysis.run_replication import run_replication_on_significant_variants
+        run_replication_on_significant_variants(
+            source_generation=args.source_generation,
+            target_generation=args.target_generation,
+            exposure=args.exposure,
+            alpha=args.alpha,
+            test_label=args.test_label,
+            force_rebuild_dataset=args.force_rebuild_dataset,
+        )
 
     elif args.command == "report-onset-age":
         from gene_environment.analysis.report_onset_age import run_report_onset_age

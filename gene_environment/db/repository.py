@@ -310,11 +310,16 @@ def get_gene_neuro_annotation(gene_id: str) -> dict | None:
             return cur.fetchone()
 
 
-def get_significant_results() -> pd.DataFrame:
+def get_significant_results(exposure: str | None = None) -> pd.DataFrame:
     """Chiama la stored procedure `get_significant_results()` (coorte 1 e 2
     affiancate). NB: colonne duplicate nel resultset -> cursore posizionale.
     Validiamo il numero di colonne per accorgerci subito se la stored
-    procedure cambia forma, invece di un disallineamento silenzioso."""
+    procedure cambia forma, invece di un disallineamento silenzioso.
+
+    `exposure`: se valorizzato, filtra la componente ambientale (richiede che
+    la stored procedure lato DB sia stata aggiornata per accettare il
+    parametro IN p_exposure — vedi nota nel modulo). Se None, comportamento
+    invariato (nessun filtro, come prima)."""
     expected_columns = [
         "gene_name", "variant",
         "empirical_p_g1", "obs_coef_g1",
@@ -324,7 +329,10 @@ def get_significant_results() -> pd.DataFrame:
     ]
     with get_connection() as conn:
         with cursor_scope(conn) as cur:
-            cur.callproc("get_significant_results")
+            if exposure is not None:
+                cur.callproc("get_significant_results", (exposure,))
+            else:
+                cur.callproc("get_significant_results")
             rows = []
             for result in cur.stored_results():
                 rows.extend(result.fetchall())

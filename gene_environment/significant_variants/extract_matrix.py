@@ -210,12 +210,12 @@ def _save_checkpoint(state_path: str, state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
-def run_extract_significant_matrices(force: bool = False) -> str | None:
+def run_extract_significant_matrices(force: bool = False, exposure: str | None = None) -> str | None:
     cfg = get_config()
     configure_logging(cfg.log_dir)
 
-    log.info("Recupero varianti significative dal DB")
-    sig = get_significant_results()
+    log.info("Recupero varianti significative dal DB%s", f" (exposure={exposure})" if exposure else "")
+    sig = get_significant_results(exposure=exposure)
     if sig.empty:
         log.info("Nessuna variante significativa trovata. Esco.")
         return None
