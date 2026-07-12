@@ -170,9 +170,15 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     if df_model.shape[0] < cfg.min_sample_size:
         return _empty()
 
-    # ---- Statistiche onset_age: calcolate qui, sullo stesso dataset usato
-    # per il modello, così sono coerenti col resto del risultato e vengono
-    # salvate a DB nella stessa riga/stessa transazione. ----
+    # ---- Statistiche onset_age POOLED (mutati vs non mutati, esposizione
+    # ignorata): calcolate qui, sullo stesso dataset usato per il modello,
+    # così sono coerenti col resto del risultato e vengono salvate a DB
+    # nella stessa riga/stessa transazione.
+    # NB: la versione STRATIFICATA per esposizione (mutati/non mutati x
+    # esposti/non esposti) NON viene calcolata qui — costerebbe lavoro su
+    # milioni di varianti che nella stragrande maggioranza non sono
+    # significative. Si calcola a valle, solo sulle varianti significative,
+    # con lo script dedicato (vedi significant_variants/). ----
     mutati_age = df_model.loc[df_model["_match_variant"] == 1, cfg.target_col]
     non_mutati_age = df_model.loc[df_model["_match_variant"] == 0, cfg.target_col]
     onset_result = compute_onset_age_result(
