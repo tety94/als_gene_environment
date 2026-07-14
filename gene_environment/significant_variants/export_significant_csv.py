@@ -76,13 +76,16 @@ def fetch_current_results(exposure: str, generation: int, iterations: int) -> pd
 
     return df
 
-def run_export(alpha: float | None = None) -> str | None:
+def run_export(alpha: float | None = None, from_export:bool | None = None) -> str | None:
     cfg = get_config()
     configure_logging(cfg.log_dir)
     alpha = alpha if alpha is not None else cfg.pvalue_threshold
 
-    df = get_significant_results()
-    # df = fetch_current_results(cfg.exposure, cfg.generation, cfg.n_perm_high)
+    if from_export:
+        df = get_significant_results()
+    else:
+        df = fetch_current_results(cfg.exposure, cfg.generation, cfg.n_perm_high)
+
     if df.empty:
         log.info("Nessun risultato completato con iterations=%d al momento. Nessun export prodotto.", cfg.n_perm_high)
         return None

@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
 
     elif args.command == "export-significant-csv":
         from gene_environment.significant_variants.export_significant_csv import run_export
-        run_export(alpha=args.alpha)
+        run_export(alpha=args.alpha, from_export=True)
 
     elif args.command == "replicate-significant":
         from gene_environment.analysis.run_replication import run_replication_on_significant_variants
