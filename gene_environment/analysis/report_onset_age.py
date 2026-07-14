@@ -3,21 +3,27 @@
 Genera boxplot e forest plot per la differenza di età d'esordio (onset_age)
 delle varianti significative. (ex analyze_variant_onset_age.py)
 
-DIFFERENZA PRINCIPALE rispetto all'originale: le statistiche (mediana,
-delta, IC bootstrap, p-value, FDR) NON vengono più ricalcolate qui — sono
-già state calcolate una volta sola in modeling.py e salvate a DB per ogni
-variante (vedi analysis/modeling.py e db/repository.py). Questo script si
-limita a: (1) leggere quelle statistiche dal DB, (2) leggere i dati grezzi
-paziente-per-paziente (genotipo + onset_age) solo per disegnare i boxplot,
-(3) produrre i grafici. Avere un'unica fonte di verità per i numeri evita
-che report e DB possano andare fuori sincrono.
+Le statistiche (mediana, delta, IC bootstrap, p-value, FDR) NON vengono
+ricalcolate qui: sono già state calcolate una volta sola in modeling.py e
+salvate a DB per ogni variante (vedi analysis/modeling.py e
+db/repository.py). Questo script si limita a: (1) leggere quelle
+statistiche dal DB, (2) leggere i dati grezzi paziente-per-paziente
+(genotipo + onset_age) solo per disegnare i boxplot, (3) produrre i grafici.
 
-Usa la stessa `clean_sample_id` di build_dataset.py (utils/id_utils.py) per
-la pulizia degli id, invece di una funzione locale duplicata.
+NOVITA' rispetto alla versione precedente:
+- Parallelizzazione a livello di exposure (ogni componente ambientale gira
+  in un processo separato, dato che le run sono indipendenti: query DB
+  diverse, output su directory diverse).
+- Parametro `single_exposure`:
+    * True  -> calcola solo per la exposure corrente (cfg.exposure)
+    * False -> recupera dal DB tutte le exposure distinte disponibili in
+               variant_results e le processa tutte, in parallelo.
 """
 from __future__ import annotations
 
+import argparse
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -33,6 +39,43 @@ from gene_environment.utils.id_utils import clean_sample_id
 
 log = get_logger(__name__)
 
+
+# --------------------------------------------------------------------------
+# Config helper
+# --------------------------------------------------------------------------
+
+def _get_config_for_exposure(exposure: str | None = None):
+    """Ritorna la config per una data exposure.
+
+    ASSUNZIONE DA VERIFICARE: get_config() qui viene chiamata con un
+    parametro `exposure` per ottenere directory di output/input specifiche
+    per quella componente ambientale. Se la firma reale di get_config() e'
+    diversa, adattare questa funzione (es. get_config(cfg_path, exposure)
+    oppure un metodo cfg.with_exposure(exposure)).
+    """
+    if exposure is None:
+        return get_config()
+    return get_config(exposure=exposure)
+
+
+# --------------------------------------------------------------------------
+# Discovery delle exposure disponibili
+# --------------------------------------------------------------------------
+
+def get_available_exposures(cfg) -> list[str]:
+    query = """
+        SELECT DISTINCT exposure
+        FROM variant_results
+        WHERE completed = 1 AND onset_p_value IS NOT NULL
+    """
+    with get_connection() as conn:
+        df = pd.read_sql(query, conn)
+    return sorted(df["exposure"].dropna().unique().tolist())
+
+
+# --------------------------------------------------------------------------
+# I/O
+# --------------------------------------------------------------------------
 
 def load_onset_age(cfg) -> pd.DataFrame:
     df = pd.read_csv(cfg.env_file, usecols=[cfg.sample_id_col, cfg.target_col] + cfg.covariates)
@@ -56,7 +99,7 @@ def load_genotype_matrix_for_cohort(cfg, cohort: int) -> pd.DataFrame | None:
     return df_cohort
 
 
-def load_db_stats(cfg, generation: int) -> pd.DataFrame:
+def load_db_stats(exposure: str, generation: int) -> pd.DataFrame:
     query = """
         SELECT variant, onset_n_mutati, onset_n_non_mutati, onset_median_mutati,
                onset_median_non_mutati, onset_delta_median, onset_ci_low, onset_ci_high,
@@ -65,8 +108,12 @@ def load_db_stats(cfg, generation: int) -> pd.DataFrame:
         WHERE exposure = %s AND generation = %s AND completed = 1 AND onset_p_value IS NOT NULL
     """
     with get_connection() as conn:
-        return pd.read_sql(query, conn, params=(cfg.exposure, generation))
+        return pd.read_sql(query, conn, params=(exposure, generation))
 
+
+# --------------------------------------------------------------------------
+# Plotting
+# --------------------------------------------------------------------------
 
 def make_boxplot(mutati, non_mutati, variant, cohort, out_dir):
     fig, ax = plt.subplots(figsize=(4, 5))
@@ -112,8 +159,13 @@ def make_forest_plot(stats_df: pd.DataFrame, out_path: str):
     log.info("Forest plot salvato in %s", out_path)
 
 
-def run_report_onset_age() -> None:
-    cfg = get_config()
+# --------------------------------------------------------------------------
+# Core: report per singola exposure (funzione top-level -> picklabile per
+# ProcessPoolExecutor)
+# --------------------------------------------------------------------------
+
+def _process_exposure(exposure: str) -> str:
+    cfg = _get_config_for_exposure(exposure)
     configure_logging(cfg.log_dir)
 
     os.makedirs(cfg.onset_age_out_dir, exist_ok=True)
@@ -125,13 +177,14 @@ def run_report_onset_age() -> None:
 
     for cohort in cfg.report_cohorts:
         df_geno = load_genotype_matrix_for_cohort(cfg, cohort)
-        db_stats = load_db_stats(cfg, cohort)
+        db_stats = load_db_stats(exposure, cohort)
         if df_geno is None or db_stats.empty:
             continue
 
         df = df_geno.join(df_onset, how="inner")
         variants = [v for v in df_geno.columns if v in set(db_stats["variant"])]
-        log.info("Coorte %d: %d pazienti, %d varianti con statistiche in DB", cohort, len(df), len(variants))
+        log.info("[%s] Coorte %d: %d pazienti, %d varianti con statistiche in DB",
+                  exposure, cohort, len(df), len(variants))
 
         for variant in variants:
             row = db_stats.loc[db_stats["variant"] == variant].iloc[0]
@@ -147,14 +200,79 @@ def run_report_onset_age() -> None:
             all_stats.append({"variant": variant, "cohort": cohort, **row.to_dict()})
 
     if not all_stats:
-        log.info("Nessuna statistica onset_age disponibile per il report. Esco.")
-        return
+        log.info("[%s] Nessuna statistica onset_age disponibile per il report. Esco.", exposure)
+        return exposure
 
     stats_df = pd.DataFrame(all_stats)
     stats_df.to_csv(os.path.join(cfg.onset_age_out_dir, "onset_age_report_table.csv"), index=False)
     make_forest_plot(stats_df, os.path.join(cfg.onset_age_out_dir, "forest_plot.png"))
-    log.info("Report onset_age completato in %s", cfg.onset_age_out_dir)
+    log.info("[%s] Report onset_age completato in %s", exposure, cfg.onset_age_out_dir)
+    return exposure
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+def run_report_onset_age(single_exposure: bool = True, n_workers: int | None = None) -> None:
+    """
+    Parametri
+    ---------
+    single_exposure : bool
+        Se True, calcola solo per la exposure corrente (cfg.exposure).
+        Se False, recupera dal DB tutte le exposure disponibili
+        (DISTINCT exposure da variant_results) e le processa tutte,
+        in parallelo.
+    n_workers : int | None
+        Numero di processi paralleli. Default: min(n. exposure, n. cpu).
+    """
+    base_cfg = get_config()
+    configure_logging(base_cfg.log_dir)
+
+    if single_exposure:
+        exposures = [base_cfg.exposure]
+    else:
+        exposures = get_available_exposures(base_cfg)
+        log.info("Trovate %d exposure da processare: %s", len(exposures), exposures)
+        if not exposures:
+            log.warning("Nessuna exposure trovata in variant_results. Esco.")
+            return
+
+    if len(exposures) == 1:
+        # Nessun vantaggio a spawnare un processo per una sola exposure
+        _process_exposure(exposures[0])
+        return
+
+    n_workers = n_workers or min(len(exposures), os.cpu_count() or 1)
+    log.info("Avvio pool con %d worker per %d exposure", n_workers, len(exposures))
+
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_process_exposure, exp): exp for exp in exposures}
+        for future in as_completed(futures):
+            exp = futures[future]
+            try:
+                future.result()
+            except Exception:
+                log.exception("Errore processando exposure %s", exp)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Report onset_age (boxplot + forest plot)")
+    parser.add_argument(
+        "--all-exposures",
+        action="store_true",
+        help="Se presente, calcola per tutte le exposure disponibili nel DB "
+             "invece che solo per quella corrente (cfg.exposure).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Numero di processi paralleli (default: min(n. exposure, n. cpu)).",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run_report_onset_age()
+    args = _parse_args()
+    run_report_onset_age(single_exposure=not args.all_exposures, n_workers=args.workers)
