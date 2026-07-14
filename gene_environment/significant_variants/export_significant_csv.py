@@ -83,6 +83,7 @@ def run_export(alpha: float | None = None, from_export:bool | None = None) -> st
 
     if from_export:
         df = load_raw_significant_results()
+        print(df)
     else:
         df = fetch_current_results(cfg.exposure, cfg.generation, cfg.n_perm_high)
 
