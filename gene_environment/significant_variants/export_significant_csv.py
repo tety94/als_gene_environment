@@ -86,7 +86,8 @@ def run_export(alpha: float | None = None) -> str | None:
         return None
 
     df = add_fdr(df, p_col="empirical_p", fdr_col="fdr")
-    significant = df[df["fdr"] < alpha].copy()
+    # significant = df[df["fdr"] < alpha].copy()
+    significant = df.copy()
     log.info("Risultati totali: %d, significativi (FDR < %.3f): %d", len(df), alpha, len(significant))
 
     if significant.empty:
