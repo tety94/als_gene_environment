@@ -215,7 +215,7 @@ def run_extract_significant_matrices(force: bool = False, exposure: str | None =
     configure_logging(cfg.log_dir)
 
     log.info("Recupero varianti significative dal DB%s", f" (exposure={exposure})" if exposure else "")
-    sig = get_significant_results(exposure=exposure)
+    sig = get_significant_results()
     if sig.empty:
         log.info("Nessuna variante significativa trovata. Esco.")
         return None

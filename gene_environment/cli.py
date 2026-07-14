@@ -9,6 +9,7 @@ Esempi:
     python -m gene_environment.cli filter-vcf
     python -m gene_environment.cli build-matrix
     python -m gene_environment.cli run-model
+    python -m gene_environment.cli replicate-significant --source-generation 2 --target-generation 1
     python -m gene_environment.cli extract-significant
     python -m gene_environment.cli export-significant-csv
     python -m gene_environment.cli report-onset-age
