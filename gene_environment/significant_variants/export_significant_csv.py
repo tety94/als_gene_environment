@@ -84,6 +84,10 @@ def run_export(alpha: float | None = None, from_export:bool | None = None) -> st
     if from_export:
         df = load_raw_significant_results()
         print(df)
+        if not df.empty:
+            # Schema "wide" (coorte 1 e 2 affiancate): usiamo g1 come p-value di riferimento
+            df["empirical_p"] = df["empirical_p_g1"]
+            df["obs_coef"] = df["obs_coef_g1"]
     else:
         df = fetch_current_results(cfg.exposure, cfg.generation, cfg.n_perm_high)
 
