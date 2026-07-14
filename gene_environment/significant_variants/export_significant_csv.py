@@ -31,6 +31,7 @@ import pandas as pd
 
 from gene_environment.config import get_config
 from gene_environment.db.connection import get_connection
+from gene_environment.db.repository import get_significant_results
 from gene_environment.logging_utils import configure_logging, get_logger
 from gene_environment.utils.stats_utils import add_fdr
 
@@ -80,7 +81,8 @@ def run_export(alpha: float | None = None) -> str | None:
     configure_logging(cfg.log_dir)
     alpha = alpha if alpha is not None else cfg.pvalue_threshold
 
-    df = fetch_current_results(cfg.exposure, cfg.generation, cfg.n_perm_high)
+    df = get_significant_results()
+    # df = fetch_current_results(cfg.exposure, cfg.generation, cfg.n_perm_high)
     if df.empty:
         log.info("Nessun risultato completato con iterations=%d al momento. Nessun export prodotto.", cfg.n_perm_high)
         return None
