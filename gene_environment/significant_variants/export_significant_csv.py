@@ -60,6 +60,18 @@ def fetch_current_results(exposure: str, generation: int, iterations: int) -> pd
     """
     with get_connection() as conn:
         df = pd.read_sql(query, conn, params=(exposure, generation, iterations))
+
+    log.info(
+        "fetch_current_results: exposure=%s generation=%s iterations=%s -> %d righe",
+        exposure, generation, iterations, len(df),
+    )
+    if df.empty:
+        log.warning("fetch_current_results: 0 righe con questi filtri, controlla completed/iterations in DB")
+    else:
+        log.info(
+            "fetch_current_results: variant distinct=%d, duplicati per join=%d",
+            df["variant"].nunique(), len(df) - df["variant"].nunique(),
+        )
     return df
 
 
