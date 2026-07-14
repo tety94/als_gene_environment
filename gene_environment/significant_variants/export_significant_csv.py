@@ -56,6 +56,7 @@ def fetch_current_results(exposure: str, generation: int, iterations: int) -> pd
         FROM variant_results vr
         WHERE vr.exposure = %s AND vr.generation = %s AND vr.completed = 1
               AND vr.iterations = %s AND vr.onset_low_power = 0
+              AND vr.empirical_p <= 0.05
         ORDER BY vr.empirical_p ASC
     """
     with get_connection() as conn:
