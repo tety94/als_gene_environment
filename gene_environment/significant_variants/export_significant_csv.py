@@ -48,32 +48,31 @@ RESULT_COLUMNS = [
 def fetch_current_results(exposure: str, generation: int, iterations: int) -> pd.DataFrame:
     query = """
         SELECT vr.variant, vr.chromosome, vr.position, vr.mutation, vr.gene,
-               vrs.gene_name AS gene_name,
                vr.mutati, vr.non_mutati, vr.obs_coef, vr.mean_coef, vr.sd_coef,
                vr.empirical_p, vr.iterations, vr.balance,
                vr.onset_n_mutati, vr.onset_n_non_mutati, vr.onset_median_mutati, vr.onset_median_non_mutati,
                vr.onset_delta_median, vr.onset_ci_low, vr.onset_ci_high, vr.onset_p_value,
                vr.onset_effect_size, vr.onset_low_power, vr.onset_method
         FROM variant_results vr
-        LEFT JOIN variant_results_significant vrs ON vrs.variant = vr.variant
-        WHERE vr.exposure = %s AND vr.generation = %s AND vr.completed = 1 AND vr.iterations = %s
+        WHERE vr.exposure = %s AND vr.generation = %s AND vr.completed = 1
+              AND vr.iterations = %s AND vr.onset_low_power = 0
+        ORDER BY vr.empirical_p ASC
     """
     with get_connection() as conn:
         df = pd.read_sql(query, conn, params=(exposure, generation, iterations))
+
+    df["gene_name"] = None
 
     log.info(
         "fetch_current_results: exposure=%s generation=%s iterations=%s -> %d righe",
         exposure, generation, iterations, len(df),
     )
     if df.empty:
-        log.warning("fetch_current_results: 0 righe con questi filtri, controlla completed/iterations in DB")
+        log.warning("fetch_current_results: 0 righe con questi filtri, controlla completed/iterations/onset_low_power in DB")
     else:
-        log.info(
-            "fetch_current_results: variant distinct=%d, duplicati per join=%d",
-            df["variant"].nunique(), len(df) - df["variant"].nunique(),
-        )
-    return df
+        log.info("fetch_current_results: variant distinct=%d", df["variant"].nunique())
 
+    return df
 
 def run_export(alpha: float | None = None) -> str | None:
     cfg = get_config()
