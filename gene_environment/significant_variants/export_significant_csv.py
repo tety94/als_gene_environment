@@ -31,7 +31,7 @@ import pandas as pd
 
 from gene_environment.config import get_config
 from gene_environment.db.connection import get_connection
-from gene_environment.db.repository import get_significant_results
+from gene_environment.db.repository import get_significant_results, load_raw_significant_results
 from gene_environment.logging_utils import configure_logging, get_logger
 from gene_environment.utils.stats_utils import add_fdr
 
