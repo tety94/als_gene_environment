@@ -330,7 +330,7 @@ def get_significant_results(exposure: str | None = None) -> pd.DataFrame:
     with get_connection() as conn:
         with cursor_scope(conn) as cur:
             if exposure is not None:
-                cur.callproc("get_significant_results", (exposure,))
+                cur.callproc("get_significant_results_by_exposure", (exposure,))
             else:
                 cur.callproc("get_significant_results")
             rows = []
