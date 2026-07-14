@@ -20,6 +20,25 @@ NOVITÀ rispetto all'originale (come richiesto):
      indipendenti.
   4) Config (path VCF, cartella output) spostata in gene_environment.config
      invece di hardcoded in testa allo script.
+
+FIX (rispetto alla versione precedente):
+  Il checkpoint teneva traccia solo delle generazioni completate, ma NON
+  congelava l'elenco delle varianti significative usato per costruire le
+  colonne del CSV. Se tra un run e l'altro il DB cambiava (es. modeling.py
+  rieseguito, nuove varianti significative aggiunte per un'altra exposure)
+  e per qualche motivo il checkpoint non era sincronizzato con lo stato del
+  file su disco (es. crash tra la scrittura del CSV e il salvataggio dello
+  stato), un rilancio poteva riscrivere/appendere una generazione con un
+  numero di colonne diverso da quello già su disco, producendo un CSV con
+  righe di lunghezza diversa (illeggibile da pandas: "Expected N fields,
+  saw M"). Ora:
+    - la lista di varianti viene congelata nel checkpoint alla prima
+      esecuzione (o alla prima con force=True);
+    - un rilancio senza force=True verifica che il set di varianti nel DB
+      non sia cambiato rispetto al checkpoint: se è cambiato, si ferma con
+      un errore esplicito invece di produrre un CSV incoerente;
+    - prima di ogni append, si valida che l'header già presente su disco
+      corrisponda esattamente alle colonne attese per quel run.
 """
 from __future__ import annotations
 
@@ -202,7 +221,7 @@ def _load_checkpoint(state_path: str) -> dict:
     if os.path.exists(state_path):
         with open(state_path) as f:
             return json.load(f)
-    return {"completed_generations": []}
+    return {"completed_generations": [], "variant_labels": None}
 
 
 def _save_checkpoint(state_path: str, state: dict) -> None:
@@ -210,7 +229,15 @@ def _save_checkpoint(state_path: str, state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
-def run_extract_significant_matrices(force: bool = False, exposure: str | None = None) -> str | None:
+def _read_existing_header(out_path: str) -> list[str] | None:
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        return None
+    with open(out_path) as f:
+        first_line = f.readline().rstrip("\n")
+    return first_line.split(",") if first_line else None
+
+
+def run_extract_significant_matrices(force: bool = True, exposure: str | None = None) -> str | None:
     cfg = get_config()
     configure_logging(cfg.log_dir)
 
@@ -233,9 +260,46 @@ def run_extract_significant_matrices(force: bool = False, exposure: str | None =
     out_path = os.path.join(cfg.significant_matrix_dir, "combined_significant_variants.csv")
     state_path = os.path.join(cfg.significant_matrix_dir, "extract_state.json")
 
-    state = {"completed_generations": []} if force else _load_checkpoint(state_path)
-    if force and os.path.exists(out_path):
-        os.remove(out_path)
+    if force:
+        state = {"completed_generations": [], "variant_labels": all_variant_labels}
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        if os.path.exists(state_path):
+            os.remove(state_path)
+    else:
+        state = _load_checkpoint(state_path)
+
+        if state.get("variant_labels") is None:
+            # Nessun checkpoint precedente (o checkpoint da versione vecchia
+            # dello script, senza variant_labels): lo congeliamo ora.
+            state["variant_labels"] = all_variant_labels
+        elif state["variant_labels"] != all_variant_labels:
+            # Il set di varianti significative nel DB è cambiato rispetto a
+            # quando è stato scritto il checkpoint: continuare produrrebbe
+            # un CSV con colonne incoerenti tra generazioni. Ci si ferma
+            # esplicitamente invece di corrompere silenziosamente l'output.
+            old_n = len(state["variant_labels"])
+            new_n = len(all_variant_labels)
+            raise RuntimeError(
+                f"Il set di varianti significative nel DB e' cambiato rispetto al "
+                f"checkpoint esistente ({old_n} varianti nel checkpoint, {new_n} ora). "
+                f"Rilancia con force=True per rigenerare '{out_path}' da zero, oppure "
+                f"ripristina il DB allo stato precedente se il cambiamento non era voluto."
+            )
+
+        # Anche se il checkpoint e' coerente con il DB, verifichiamo che
+        # l'header effettivamente scritto su disco corrisponda: protegge da
+        # CSV toccati a mano o da run interrotti in modo anomalo (es. crash
+        # durante la scrittura del CSV, prima del salvataggio dello stato).
+        existing_header = _read_existing_header(out_path)
+        expected_header = ["id", "generation"] + all_variant_labels
+        if existing_header is not None and existing_header != expected_header:
+            raise RuntimeError(
+                f"L'header di '{out_path}' ({len(existing_header)} colonne) non "
+                f"corrisponde alle varianti attese ({len(expected_header)} colonne). "
+                f"Il file potrebbe essere corrotto da un run precedente incoerente. "
+                f"Rilancia con force=True per rigenerarlo da zero."
+            )
 
     header_written = os.path.exists(out_path) and os.path.getsize(out_path) > 0
 
