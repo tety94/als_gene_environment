@@ -82,7 +82,7 @@ def run_export(alpha: float | None = None, from_export:bool | None = None) -> st
     alpha = alpha if alpha is not None else cfg.pvalue_threshold
 
     if from_export:
-        df = get_significant_results()
+        df = load_raw_significant_results()
     else:
         df = fetch_current_results(cfg.exposure, cfg.generation, cfg.n_perm_high)
 

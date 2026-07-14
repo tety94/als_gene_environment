@@ -352,3 +352,15 @@ def get_significant_results(exposure: str | None = None) -> pd.DataFrame:
     df["position"] = parts[1]
     df["mutation"] = parts[2]
     return df
+
+def load_raw_significant_results() -> pd.DataFrame:
+    """
+    Wrapper minimale: chiama la stored procedure e ritorna il DataFrame senza modifiche.
+    - exposure: passato a get_significant_results se non None.
+    """
+    try:
+        df = get_significant_results()
+        return df
+    except Exception as exc:
+        log.exception("Errore nel recupero dei risultati significativi dalla stored procedure.")
+        raise
