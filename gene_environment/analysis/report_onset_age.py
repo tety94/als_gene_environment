@@ -19,6 +19,15 @@ NOVITA' rispetto alla versione precedente:
       disponibili in variant_results e le processa tutte, in parallelo.
     * True -> calcola solo per la exposure corrente (cfg.exposure), utile
       per debug rapido su una singola componente ambientale.
+
+NOTA IMPORTANTE su get_config(): e' un singleton letto una volta sola dagli
+env var (vedi config.py), quindi NON accetta e non puo' accettare un
+parametro `exposure` per generare config diverse per ogni componente
+ambientale. cfg.onset_age_out_dir e' percio' un path FISSO, identico per
+tutti i worker. Per evitare che processi paralleli su exposure diverse
+scrivano nella stessa cartella sovrascrivendosi a vicenda (boxplot,
+onset_age_report_table.csv, forest_plot.png), ogni worker crea la propria
+sottocartella <onset_age_out_dir>/<exposure>/.
 """
 from __future__ import annotations
 
@@ -46,17 +55,16 @@ log = get_logger(__name__)
 # --------------------------------------------------------------------------
 
 def _get_config_for_exposure(exposure: str | None = None):
-    """Ritorna la config per una data exposure.
+    """Ritorna la config globale.
 
-    ASSUNZIONE DA VERIFICARE: get_config() qui viene chiamata con un
-    parametro `exposure` per ottenere directory di output/input specifiche
-    per quella componente ambientale. Se la firma reale di get_config() e'
-    diversa, adattare questa funzione (es. get_config(cfg_path, exposure)
-    oppure un metodo cfg.with_exposure(exposure)).
+    get_config() e' un singleton letto una volta sola dagli env var: non
+    esiste (e non serve) una config diversa per exposure. Il parametro
+    `exposure` qui e' tenuto solo per compatibilita' di firma con le
+    chiamate esistenti, ma non viene passato a get_config(). La
+    differenziazione per exposure avviene invece a livello di directory di
+    output, dentro _process_exposure.
     """
-    if exposure is None:
-        return get_config()
-    return get_config(exposure=exposure)
+    return get_config()
 
 
 # --------------------------------------------------------------------------
@@ -169,8 +177,13 @@ def _process_exposure(exposure: str) -> str:
     cfg = _get_config_for_exposure(exposure)
     configure_logging(cfg.log_dir)
 
-    os.makedirs(cfg.onset_age_out_dir, exist_ok=True)
-    box_dir = os.path.join(cfg.onset_age_out_dir, "boxplots")
+    # cfg.onset_age_out_dir e' FISSO (stesso per tutti i processi, dato che
+    # cfg e' un singleton). Ogni worker scrive quindi nella propria
+    # sottocartella per exposure, per evitare che run parallele su
+    # componenti ambientali diverse si sovrascrivano a vicenda.
+    exp_out_dir = os.path.join(cfg.onset_age_out_dir, exposure)
+    os.makedirs(exp_out_dir, exist_ok=True)
+    box_dir = os.path.join(exp_out_dir, "boxplots")
     os.makedirs(box_dir, exist_ok=True)
 
     df_onset = load_onset_age(cfg)
@@ -205,9 +218,9 @@ def _process_exposure(exposure: str) -> str:
         return exposure
 
     stats_df = pd.DataFrame(all_stats)
-    stats_df.to_csv(os.path.join(cfg.onset_age_out_dir, "onset_age_report_table.csv"), index=False)
-    make_forest_plot(stats_df, os.path.join(cfg.onset_age_out_dir, "forest_plot.png"))
-    log.info("[%s] Report onset_age completato in %s", exposure, cfg.onset_age_out_dir)
+    stats_df.to_csv(os.path.join(exp_out_dir, "onset_age_report_table.csv"), index=False)
+    make_forest_plot(stats_df, os.path.join(exp_out_dir, "forest_plot.png"))
+    log.info("[%s] Report onset_age completato in %s", exposure, exp_out_dir)
     return exposure
 
 
