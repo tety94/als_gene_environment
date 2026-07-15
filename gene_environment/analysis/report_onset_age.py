@@ -15,9 +15,10 @@ NOVITA' rispetto alla versione precedente:
   in un processo separato, dato che le run sono indipendenti: query DB
   diverse, output su directory diverse).
 - Parametro `single_exposure`:
-    * True  -> calcola solo per la exposure corrente (cfg.exposure)
-    * False -> recupera dal DB tutte le exposure distinte disponibili in
-               variant_results e le processa tutte, in parallelo.
+    * False (default) -> recupera dal DB tutte le exposure distinte
+      disponibili in variant_results e le processa tutte, in parallelo.
+    * True -> calcola solo per la exposure corrente (cfg.exposure), utile
+      per debug rapido su una singola componente ambientale.
 """
 from __future__ import annotations
 
@@ -214,15 +215,16 @@ def _process_exposure(exposure: str) -> str:
 # Entry point
 # --------------------------------------------------------------------------
 
-def run_report_onset_age(single_exposure: bool = True, n_workers: int | None = None) -> None:
+def run_report_onset_age(single_exposure: bool = False, n_workers: int | None = None) -> None:
     """
     Parametri
     ---------
     single_exposure : bool
-        Se True, calcola solo per la exposure corrente (cfg.exposure).
-        Se False, recupera dal DB tutte le exposure disponibili
-        (DISTINCT exposure da variant_results) e le processa tutte,
-        in parallelo.
+        Se False (default), recupera dal DB tutte le exposure disponibili
+        (DISTINCT exposure da variant_results) e le processa tutte, in
+        parallelo.
+        Se True, calcola solo per la exposure corrente (cfg.exposure) —
+        utile per debug rapido su una singola componente ambientale.
     n_workers : int | None
         Numero di processi paralleli. Default: min(n. exposure, n. cpu).
     """
@@ -259,10 +261,10 @@ def run_report_onset_age(single_exposure: bool = True, n_workers: int | None = N
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Report onset_age (boxplot + forest plot)")
     parser.add_argument(
-        "--all-exposures",
+        "--single-exposure",
         action="store_true",
-        help="Se presente, calcola per tutte le exposure disponibili nel DB "
-             "invece che solo per quella corrente (cfg.exposure).",
+        help="Se presente, calcola solo per la exposure corrente (cfg.exposure) "
+             "invece che per tutte quelle disponibili nel DB.",
     )
     parser.add_argument(
         "--workers",
@@ -275,4 +277,4 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = _parse_args()
-    run_report_onset_age(single_exposure=not args.all_exposures, n_workers=args.workers)
+    run_report_onset_age(single_exposure=args.single_exposure, n_workers=args.workers)
