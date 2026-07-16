@@ -48,7 +48,7 @@ def _get_ensembl_api():
 
 def _get_gene_annotator():
     try:
-        from pipeline.gene_annotator import GeneAnnotator
+        from gene_environment.apis.gene_annotator import GeneAnnotator
         return GeneAnnotator
     except ImportError as e:
         raise ImportError(
