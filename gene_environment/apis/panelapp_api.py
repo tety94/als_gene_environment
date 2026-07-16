@@ -42,29 +42,52 @@ def _get_with_retry(url: str, params: dict, timeout: int, max_retries: int = 5) 
 class PanelAppAPI:
 
     @staticmethod
-    def get_als_status(gene_symbol: str, timeout: int = 15) -> dict:
-        resp = _get_with_retry(
-            f"{BASE_URL}/genes/",
-            params={"entity_name": gene_symbol},
-            timeout=timeout,
-        )
-        results = resp.json().get("results", [])
+    class PanelAppAPI:
 
-        als_matches = []
-        for entry in results:
-            panel_name = (entry.get("panel") or {}).get("name", "") or ""
-            relevant_disorders = " ".join(entry.get("relevant_disorders") or [])
-            haystack = f"{panel_name} {relevant_disorders}".lower()
-            if any(kw in haystack for kw in ALS_KEYWORDS):
-                als_matches.append(entry)
+        @staticmethod
+        def get_als_status(gene_symbol: str, timeout: int = 15) -> dict:
+            if not gene_symbol or gene_symbol.startswith("ENSG"):
+                log.warning(
+                    "PanelApp: simbolo gene mancante o non risolto ('%s'), skip query.",
+                    gene_symbol,
+                )
+                return {"found_in_als_panel": False, "confidence_level": None,
+                        "panel_name": None, "matches": [], "skipped_no_symbol": True}
 
-        if not als_matches:
-            return {"found_in_als_panel": False, "confidence_level": None, "panel_name": None, "matches": []}
+            resp = _get_with_retry(f"{BASE_URL}/genes/", params={"entity_name": gene_symbol}, timeout=timeout)
+            payload = resp.json()
 
-        best = max(als_matches, key=lambda e: e.get("confidence_level", "0"))
-        return {
-            "found_in_als_panel": True,
-            "confidence_level": best.get("confidence_level"),
-            "panel_name": (best.get("panel") or {}).get("name"),
-            "matches": als_matches,
-        }
+            log.info(
+                "PanelApp query gene_symbol=%s -> count=%s risultati totali",
+                gene_symbol, payload.get("count"),
+            )
+
+            results = payload.get("results", [])
+            als_matches = []
+            for entry in results:
+                panel_name = (entry.get("panel") or {}).get("name", "") or ""
+                relevant_disorders = " ".join(entry.get("relevant_disorders") or [])
+                haystack = f"{panel_name} {relevant_disorders}".lower()
+                if any(kw in haystack for kw in ALS_KEYWORDS):
+                    als_matches.append(entry)
+                    log.info(
+                        "PanelApp MATCH gene=%s panel='%s' confidence=%s",
+                        gene_symbol, panel_name, entry.get("confidence_level"),
+                    )
+
+            if not als_matches:
+                log.info(
+                    "PanelApp: gene=%s trovato in %d pannelli totali, nessuno relativo a SLA/MND",
+                    gene_symbol, len(results),
+                )
+                return {"found_in_als_panel": False, "confidence_level": None,
+                        "panel_name": None, "matches": [], "skipped_no_symbol": False}
+
+            best = max(als_matches, key=lambda e: e.get("confidence_level", "0"))
+            return {
+                "found_in_als_panel": True,
+                "confidence_level": best.get("confidence_level"),
+                "panel_name": (best.get("panel") or {}).get("name"),
+                "matches": als_matches,
+                "skipped_no_symbol": False,
+            }
