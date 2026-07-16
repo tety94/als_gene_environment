@@ -6,17 +6,6 @@ pattern "ProcessPoolExecutor + chiamata API esterna"):
   - process_variants.py     -> assegna il gene (Ensembl) a ogni variante
   - main_gene_analysis.py   -> annota i geni trovati con info neuro (CTD/GO)
 
-Fix:
-  - `apis.ensembl_api.EnsemblAPI` e `pipeline.gene_annotator.GeneAnnotator`
-    sono moduli esterni al set di file fornito: qui l'import è protetto con
-    un messaggio d'errore chiaro invece di un ImportError criptico, così chi
-    esegue lo script sa subito cosa manca.
-  - Logging invece di print(); un'eccezione su UNA variante/gene non ferma
-    più silenziosamente l'intero batch senza traccia (era già gestito con
-    try/except in main_gene_analysis.py, qui uniformato e loggato anche in
-    process_variants, che nell'originale non aveva alcuna gestione errori:
-    un fallimento della chiamata Ensembl per una variante avrebbe fermato
-    l'intero script, perdendo il lavoro fatto su tutte le altre).
 """
 from __future__ import annotations
 
@@ -52,9 +41,7 @@ def _get_gene_annotator():
         return GeneAnnotator
     except ImportError as e:
         raise ImportError(
-            "Modulo 'pipeline.gene_annotator.GeneAnnotator' non trovato. È una dipendenza "
-            "esterna al pacchetto refattorizzato: assicurati che sia installato/nel "
-            "PYTHONPATH prima di lanciare annotate_genes."
+            "Modulo 'gene_environment.apis.gene_annotator' non trovato."
         ) from e
 
 
