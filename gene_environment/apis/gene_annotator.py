@@ -1,10 +1,10 @@
-from ensembl_api import EnsemblAPI
-from gtex_api import GTExAPI
-from hpa_api import HPAAPI
-from ctd_api import CTDAPI
-from neuro_score import NeuroScore
+from gene_environment.apis.ensembl_api import EnsemblAPI
+from gene_environment.apis.gtex_api import GTExAPI
+from gene_environment.apis.hpa_api import HPAAPI
+from gene_environment.apis.ctd_api import CTDAPI
+from gene_environment.apis.neuro_score import NeuroScore
+from gene_environment.apis.go_api import GOAPI
 from gene_environment.db.repository import upsert_gene_neuro_annotation
-from go_api import GOAPI
 
 class GeneAnnotator:
 

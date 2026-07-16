@@ -29,9 +29,7 @@ def _get_ensembl_api():
         return EnsemblAPI
     except ImportError as e:
         raise ImportError(
-            "Modulo 'apis.ensembl_api.EnsemblAPI' non trovato. È una dipendenza esterna "
-            "al pacchetto refattorizzato: assicurati che sia installato/nel PYTHONPATH "
-            "prima di lanciare annotate_genes."
+            "Modulo 'apis.ensembl_api.EnsemblAPI' non trovato."
         ) from e
 
 
