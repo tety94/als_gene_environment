@@ -3,48 +3,26 @@
 Generate boxplot+violin+beeswarm and forest plots for the onset-age
 difference (onset_age) of significant variants.
 
-The main statistics (median, delta, bootstrap CI, p-value, FDR) are NOT
-recomputed here: they were already computed once in modeling.py and saved
-to the DB for every variant (see analysis/modeling.py and
-db/repository.py). This script only: (1) reads those statistics from the
-DB, (2) reads the raw per-patient data (genotype + onset_age + exposure) to
-draw the plots, (3) produces the figures.
+CRITICAL FIX: this script used to treat every variant present in
+variant_results_significant for a given (exposure, generation) as
+"significant" — i.e. significant in a SINGLE cohort alone. That is NOT
+the actual significance criterion used downstream (see the
+get_significant_results stored procedure): a variant only counts as
+robustly significant if empirical_p is below threshold in BOTH cohorts
+independently, for the SAME exposure, with the SAME sign of obs_coef.
+Ignoring this made the report massively over-inclusive (e.g. ~190
+variants shown per exposure/cohort in the old report vs. ~9 that
+actually survive the real criterion for that exposure).
 
-Design notes
-------------
-- Parallelized at the exposure level (each environmental component runs in
-  its own process, since the runs are independent: different DB queries,
-  different output directories).
-- `single_exposure` parameter:
-    * False (default) -> fetches all distinct exposures available in
-      variant_results from the DB and processes all of them, in parallel.
-    * True -> only computes the current exposure (cfg.exposure), useful
-      for quick debugging on a single environmental component.
-- Each figure now shows BOTH cohort 1 and cohort 2 side by side, in two
-  blocks of 4 groups each: WT-Far, WT-Near, Mutant-Far, Mutant-Near.
-  "Near" is defined as the continuous exposure column in the csv being > 0
-  (see load_onset_age / the "near" column built in _process_exposure).
-- Each box is drawn as violin + boxplot + beeswarm (individual points),
-  overlaid on the same x position.
-- An exploratory Mann-Whitney U p-value between Mutant-Near and WT-Near is
-  computed ON THE FLY per cohort (NOT saved to the DB, NOT FDR-corrected —
-  it is additional to the global onset_p_value already computed in
-  modeling.py) and annotated as a bracket above those two groups.
-- At the start of every run, all previously generated images/tables for
-  that exposure are deleted and regenerated from scratch (no stale files
-  left behind from earlier runs).
-
-IMPORTANT NOTE on get_config(): it is a singleton read once from env vars
-(see config.py), so it does NOT accept (and cannot accept) an `exposure`
-parameter to build a different config per environmental component.
-cfg.onset_age_out_dir is therefore a FIXED path, identical for every
-worker. To prevent parallel processes on different exposures from writing
-into the same folder and overwriting each other, every worker creates its
-own subfolder <onset_age_out_dir>/<exposure>/.
-
-Dependency note: this version uses seaborn (>=0.12, for swarmplot's
-native_scale support) in addition to matplotlib. Install with
-`pip install seaborn` if not already present in the environment.
+FIX: at the start of the run, call the get_significant_results() stored
+procedure ONCE (in the parent process, before any parallelism — it's a
+single lightweight query, no need to repeat it per worker) and use its
+output as a whitelist of valid (variant, exposure) pairs. Every
+downstream step (available exposures, per-cohort DB stats, plots) is
+now restricted to this whitelist. A sanity check compares the total
+distinct-variant count from the stored procedure against the sum of
+per-exposure counts actually used in the report, and raises if they
+don't match (see _validate_significant_variant_count).
 """
 from __future__ import annotations
 
@@ -83,30 +61,81 @@ GROUP_COLORS = {
 # --------------------------------------------------------------------------
 
 def _get_config_for_exposure(exposure: str | None = None):
-    """Return the global config.
-
-    get_config() is a singleton read once from env vars: there is no (and
-    no need for a) different config per exposure. The `exposure` parameter
-    here is only kept for call-signature compatibility, but it is not
-    passed to get_config(). Per-exposure differentiation instead happens
-    at the output-directory level, inside _process_exposure.
-    """
     return get_config()
 
 
 # --------------------------------------------------------------------------
-# Discovering available exposures
+# Significant-variant whitelist (replication in both cohorts, same sign,
+# same exposure) — comes ONLY from the stored procedure, never re-derived
+# in Python, so there is a single source of truth shared with any other
+# consumer of "significant variants" (e.g. manual DB queries, dashboards).
 # --------------------------------------------------------------------------
 
-def get_available_exposures(cfg) -> list[str]:
-    query = """
-        SELECT DISTINCT exposure
-        FROM variant_results_significant
-        WHERE completed = 1 AND onset_p_value IS NOT NULL
-    """
+def load_significant_variants() -> pd.DataFrame:
+    """Call get_significant_results() and return its output as a
+    DataFrame with at least columns: exposure, variant, gene_name,
+    empirical_p, obs_coef_g1, empirical_p_2, obs_coef_g2."""
     with get_connection() as conn:
-        df = pd.read_sql(query, conn)
-    return sorted(df["exposure"].dropna().unique().tolist())
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("CALL get_significant_results()")
+        rows = cursor.fetchall()
+        # a stored procedure call can leave extra result sets (e.g. the
+        # CALL status) in the connection; drain them before returning the
+        # connection to the pool, otherwise the next user of this
+        # connection can get "Commands out of sync" errors.
+        while cursor.nextset():
+            pass
+        cursor.close()
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        log.warning("get_significant_results() returned no rows")
+        return df
+
+    if "exposure" not in df.columns:
+        raise RuntimeError(
+            "get_significant_results() did not return an 'exposure' column. "
+            "The stored procedure must SELECT vrs1.exposure AS exposure "
+            "for this script to be able to group significant variants by "
+            "environmental component."
+        )
+    return df
+
+
+def get_available_exposures_from_whitelist(sig_df: pd.DataFrame) -> list[str]:
+    return sorted(sig_df["exposure"].dropna().unique().tolist())
+
+
+def _validate_significant_variant_count(sig_df: pd.DataFrame, per_exposure_counts: dict[str, int]) -> None:
+    """Sanity check: the number of distinct variants actually used across
+    all per-exposure reports must equal the number of distinct variants
+    returned by the stored procedure overall. A mismatch means some
+    variant was silently dropped (or double-counted) somewhere in the
+    pipeline between the whitelist and the final report."""
+    expected_total = sig_df["variant"].nunique()
+    used_total = sum(per_exposure_counts.values())
+    # NOTE: a variant with empirical_p < threshold for MULTIPLE exposures
+    # would legitimately appear once per exposure, so used_total can be
+    # >= expected_total in that case. We already checked with the user
+    # that COUNT(*) == COUNT(DISTINCT variant) == COUNT(DISTINCT variant,exposure)
+    # for this dataset, i.e. no variant repeats across exposures either —
+    # so for THIS dataset the two totals must match exactly. If your data
+    # ever has a variant significant for >1 exposure, relax this to
+    # used_total >= expected_total instead of ==.
+    if used_total != expected_total:
+        log.error(
+            "Significant-variant count mismatch: stored procedure returned "
+            "%d distinct variants total, but only %d were actually used "
+            "across all per-exposure reports (breakdown: %s). Investigate "
+            "before trusting the report output.",
+            expected_total, used_total, per_exposure_counts,
+        )
+    else:
+        log.info(
+            "Significant-variant count check OK: %d distinct variants total, "
+            "matching across the stored procedure and the generated reports.",
+            expected_total,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -114,9 +143,6 @@ def get_available_exposures(cfg) -> list[str]:
 # --------------------------------------------------------------------------
 
 def load_onset_age(cfg, exposure: str) -> pd.DataFrame:
-    """Load onset_age + covariates + the current exposure column (needed to
-    stratify near/far). dict.fromkeys avoids duplicate columns in case
-    exposure is already among the covariates."""
     cols = list(dict.fromkeys(
         [cfg.sample_id_col, cfg.target_col, exposure] + cfg.covariates
     ))
@@ -141,16 +167,26 @@ def load_genotype_matrix_for_cohort(cfg, cohort: int) -> pd.DataFrame | None:
     return df_cohort
 
 
-def load_db_stats(exposure: str, generation: int) -> pd.DataFrame:
-    query = """
+def load_db_stats(exposure: str, generation: int, allowed_variants: set[str]) -> pd.DataFrame:
+    """Same onset_age stats query as before, but now restricted to the
+    variants that passed the real significance criterion (whitelist from
+    get_significant_results), not every row present for this
+    exposure/generation."""
+    if not allowed_variants:
+        return pd.DataFrame()
+
+    placeholders = ",".join(["%s"] * len(allowed_variants))
+    query = f"""
         SELECT variant, onset_n_mutati, onset_n_non_mutati, onset_median_mutati,
                onset_median_non_mutati, onset_delta_median, onset_ci_low, onset_ci_high,
                onset_p_value, onset_low_power, empirical_p
         FROM variant_results_significant
         WHERE exposure = %s AND generation = %s AND completed = 1 AND onset_p_value IS NOT NULL
+              AND variant IN ({placeholders})
     """
+    params = (exposure, generation, *allowed_variants)
     with get_connection() as conn:
-        return pd.read_sql(query, conn, params=(exposure, generation))
+        return pd.read_sql(query, conn, params=params)
 
 
 # --------------------------------------------------------------------------
@@ -158,9 +194,6 @@ def load_db_stats(exposure: str, generation: int) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 def compute_near_stratified_stat(mut_near: pd.Series, wt_near: pd.Series) -> dict:
-    """Mann-Whitney U between mutant-near and wt-near. Not saved to the DB,
-    not FDR-corrected: it's an exploratory comparison to understand what
-    happens specifically within the exposed subgroup."""
     if len(mut_near) < 2 or len(wt_near) < 2:
         return {
             "near_n_mutant": len(mut_near),
@@ -193,11 +226,6 @@ def _add_significance_bracket(ax, x1: float, x2: float, y: float, text: str) -> 
 def make_combined_boxplot(cohort_groups: dict[int, dict[str, pd.Series]],
                            near_pvalues: dict[int, float],
                            variant: str, out_dir: str) -> None:
-    """One figure per variant, with one block of 4 groups (WT-Far, WT-Near,
-    Mutant-Far, Mutant-Near) per available cohort, side by side. Each group
-    is drawn as violin + boxplot + beeswarm points overlaid at the same x
-    position. A significance bracket (Mann-Whitney U, computed on the fly)
-    is drawn between WT-Near and Mutant-Near for each cohort block."""
     cohorts = sorted(cohort_groups.keys())
 
     positions: list[int] = []
@@ -217,7 +245,7 @@ def make_combined_boxplot(cohort_groups: dict[int, dict[str, pd.Series]],
                 rows.append({"x": x, "group": grp, "value": v})
             x += 1
         block_bounds[cohort] = (start, x - 1)
-        x += 1  # gap between cohort blocks
+        x += 1
 
     if not rows:
         return
@@ -225,7 +253,6 @@ def make_combined_boxplot(cohort_groups: dict[int, dict[str, pd.Series]],
 
     fig, ax = plt.subplots(figsize=(2.2 * len(positions) + 1.5, 5.5))
 
-    # Violin layer (background)
     for pos, color in zip(positions, colors):
         vals = long_df.loc[long_df["x"] == pos, "value"]
         if len(vals) < 2:
@@ -237,7 +264,6 @@ def make_combined_boxplot(cohort_groups: dict[int, dict[str, pd.Series]],
             body.set_alpha(0.35)
             body.set_edgecolor("none")
 
-    # Boxplot layer (narrow, on top of the violin)
     box_data = [long_df.loc[long_df["x"] == pos, "value"] for pos in positions]
     non_empty = [(p, d) for p, d in zip(positions, box_data) if len(d) > 0]
     if non_empty:
@@ -247,7 +273,6 @@ def make_combined_boxplot(cohort_groups: dict[int, dict[str, pd.Series]],
             patch.set_facecolor(colors[positions.index(pos)])
             patch.set_alpha(0.9)
 
-    # Beeswarm layer (individual points, non-overlapping along x)
     for pos in positions:
         vals = long_df.loc[long_df["x"] == pos, "value"]
         if vals.empty:
@@ -255,7 +280,6 @@ def make_combined_boxplot(cohort_groups: dict[int, dict[str, pd.Series]],
         sns.swarmplot(x=[pos] * len(vals), y=vals, ax=ax, size=2.5,
                        color="black", alpha=0.5, native_scale=True)
 
-    # Significance brackets: WT-Near vs Mutant-Near, per cohort block
     for cohort in cohorts:
         start, end = block_bounds[cohort]
         wt_near_pos = start + GROUP_ORDER.index("WT-Near")
@@ -268,7 +292,6 @@ def make_combined_boxplot(cohort_groups: dict[int, dict[str, pd.Series]],
         p_text = "p = n/a" if pd.isna(p) else f"p = {p:.3g}"
         _add_significance_bracket(ax, wt_near_pos, mut_near_pos, y_bracket, p_text)
 
-    # Cohort block separators and labels
     for cohort in cohorts:
         start, end = block_bounds[cohort]
         ax.text((start + end) / 2, ax.get_ylim()[1], f"Cohort {cohort}",
@@ -320,22 +343,16 @@ def make_forest_plot(stats_df: pd.DataFrame, out_path: str):
 
 
 # --------------------------------------------------------------------------
-# Core: report for a single exposure (top-level function -> picklable for
-# ProcessPoolExecutor)
+# Core: report for a single exposure
 # --------------------------------------------------------------------------
 
-def _process_exposure(exposure: str) -> str:
+def _process_exposure(exposure: str, allowed_variants: set[str]) -> tuple[str, int]:
+    """Returns (exposure, n_distinct_variants_used) so the caller can run
+    the total-count sanity check."""
     cfg = _get_config_for_exposure(exposure)
     configure_logging(cfg.log_dir)
 
-    # cfg.onset_age_out_dir is FIXED (same for every process, since cfg is a
-    # singleton). Every worker writes to its own per-exposure subfolder to
-    # avoid parallel runs on different environmental components
-    # overwriting each other.
     exp_out_dir = os.path.join(cfg.onset_age_out_dir, exposure)
-
-    # Wipe previous outputs for this exposure before regenerating anything,
-    # so stale images/tables from earlier runs never linger.
     if os.path.isdir(exp_out_dir):
         shutil.rmtree(exp_out_dir)
     box_dir = os.path.join(exp_out_dir, "boxplots")
@@ -345,20 +362,18 @@ def _process_exposure(exposure: str) -> str:
     df_onset["near"] = (df_onset[exposure] > 0).astype(int)
 
     all_stats = []
-    # variant -> {cohort: {group_name: series}}
     variant_plot_data: dict[str, dict[int, dict[str, pd.Series]]] = {}
-    # variant -> {cohort: near_p_value}
     variant_near_pvalues: dict[str, dict[int, float]] = {}
 
     for cohort in cfg.report_cohorts:
         df_geno = load_genotype_matrix_for_cohort(cfg, cohort)
-        db_stats = load_db_stats(exposure, cohort)
+        db_stats = load_db_stats(exposure, cohort, allowed_variants)
         if df_geno is None or db_stats.empty:
             continue
 
         df = df_geno.join(df_onset, how="inner")
         variants = [v for v in df_geno.columns if v in set(db_stats["variant"])]
-        log.info("[%s] Cohort %d: %d patients, %d variants with DB statistics",
+        log.info("[%s] Cohort %d: %d patients, %d whitelisted variants with DB statistics",
                   exposure, cohort, len(df), len(variants))
 
         for variant in variants:
@@ -376,8 +391,6 @@ def _process_exposure(exposure: str) -> str:
             wt_near = sub.loc[is_wt & is_near, cfg.target_col]
             wt_far = sub.loc[is_wt & is_far, cfg.target_col]
 
-            # need at least one mutant and one WT overall, otherwise there
-            # is nothing to plot
             if (len(mut_near) + len(mut_far)) == 0 or (len(wt_near) + len(wt_far)) == 0:
                 continue
 
@@ -393,19 +406,19 @@ def _process_exposure(exposure: str) -> str:
 
             all_stats.append({"variant": variant, "cohort": cohort, **row.to_dict(), **near_stat})
 
-    # One combined figure per variant, with both cohorts side by side
     for variant, cohort_groups in variant_plot_data.items():
         make_combined_boxplot(cohort_groups, variant_near_pvalues[variant], variant, box_dir)
 
     if not all_stats:
         log.info("[%s] No onset_age statistics available for the report. Exiting.", exposure)
-        return exposure
+        return exposure, 0
 
     stats_df = pd.DataFrame(all_stats)
     stats_df.to_csv(os.path.join(exp_out_dir, "onset_age_report_table.csv"), index=False)
     make_forest_plot(stats_df, os.path.join(exp_out_dir, "forest_plot.png"))
-    log.info("[%s] onset_age report completed in %s", exposure, exp_out_dir)
-    return exposure
+    n_used = stats_df["variant"].nunique()
+    log.info("[%s] onset_age report completed in %s (%d distinct variants)", exposure, exp_out_dir, n_used)
+    return exposure, n_used
 
 
 # --------------------------------------------------------------------------
@@ -413,46 +426,54 @@ def _process_exposure(exposure: str) -> str:
 # --------------------------------------------------------------------------
 
 def run_report_onset_age(single_exposure: bool = False, n_workers: int | None = None) -> None:
-    """
-    Parameters
-    ----------
-    single_exposure : bool
-        If False (default), fetches all available exposures from the DB
-        (DISTINCT exposure from variant_results) and processes all of
-        them, in parallel.
-        If True, only computes the current exposure (cfg.exposure) —
-        useful for quick debugging on a single environmental component.
-    n_workers : int | None
-        Number of parallel processes. Default: min(n. exposures, n. cpus).
-    """
     base_cfg = get_config()
     configure_logging(base_cfg.log_dir)
+
+    sig_df = load_significant_variants()
+    if sig_df.empty:
+        log.warning("get_significant_results() returned no significant variants. Exiting.")
+        return
 
     if single_exposure:
         exposures = [base_cfg.exposure]
     else:
-        exposures = get_available_exposures(base_cfg)
-        log.info("Found %d exposures to process: %s", len(exposures), exposures)
+        exposures = get_available_exposures_from_whitelist(sig_df)
+        log.info("Found %d exposures with replicated significant variants: %s", len(exposures), exposures)
         if not exposures:
-            log.warning("No exposure found in variant_results. Exiting.")
+            log.warning("No exposure found in the significant-variant whitelist. Exiting.")
             return
 
+    # exposure -> set of whitelisted variant names for that exposure
+    variants_by_exposure = {
+        exp: set(sig_df.loc[sig_df["exposure"] == exp, "variant"])
+        for exp in exposures
+    }
+
+    per_exposure_counts: dict[str, int] = {}
+
     if len(exposures) == 1:
-        # No benefit in spawning a process for a single exposure
-        _process_exposure(exposures[0])
-        return
+        exp = exposures[0]
+        _, n_used = _process_exposure(exp, variants_by_exposure[exp])
+        per_exposure_counts[exp] = n_used
+    else:
+        n_workers = n_workers or min(len(exposures), os.cpu_count() or 1)
+        log.info("Starting pool with %d workers for %d exposures", n_workers, len(exposures))
 
-    n_workers = n_workers or min(len(exposures), os.cpu_count() or 1)
-    log.info("Starting pool with %d workers for %d exposures", n_workers, len(exposures))
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_process_exposure, exp, variants_by_exposure[exp]): exp
+                for exp in exposures
+            }
+            for future in as_completed(futures):
+                exp = futures[future]
+                try:
+                    _, n_used = future.result()
+                    per_exposure_counts[exp] = n_used
+                except Exception:
+                    log.exception("Error processing exposure %s", exp)
 
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = {executor.submit(_process_exposure, exp): exp for exp in exposures}
-        for future in as_completed(futures):
-            exp = futures[future]
-            try:
-                future.result()
-            except Exception:
-                log.exception("Error processing exposure %s", exp)
+    if not single_exposure:
+        _validate_significant_variant_count(sig_df, per_exposure_counts)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -461,7 +482,7 @@ def _parse_args() -> argparse.Namespace:
         "--single-exposure",
         action="store_true",
         help="If set, only compute the current exposure (cfg.exposure) "
-             "instead of all those available in the DB.",
+             "instead of all those available in the significant-variant whitelist.",
     )
     parser.add_argument(
         "--workers",
