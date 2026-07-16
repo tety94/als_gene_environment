@@ -74,7 +74,7 @@ def _get_config_for_exposure(exposure: str | None = None):
 def get_available_exposures(cfg) -> list[str]:
     query = """
         SELECT DISTINCT exposure
-        FROM variant_results
+        FROM variant_results_significant
         WHERE completed = 1 AND onset_p_value IS NOT NULL
     """
     with get_connection() as conn:
@@ -113,7 +113,7 @@ def load_db_stats(exposure: str, generation: int) -> pd.DataFrame:
         SELECT variant, onset_n_mutati, onset_n_non_mutati, onset_median_mutati,
                onset_median_non_mutati, onset_delta_median, onset_ci_low, onset_ci_high,
                onset_p_value, onset_low_power, empirical_p
-        FROM variant_results
+        FROM variant_results_significant
         WHERE exposure = %s AND generation = %s AND completed = 1 AND onset_p_value IS NOT NULL
     """
     with get_connection() as conn:
