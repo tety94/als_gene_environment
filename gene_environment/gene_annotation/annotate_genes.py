@@ -68,9 +68,11 @@ def run_assign_genes(iterations: int | None = None) -> None:
     variants = get_empty_variants_gene(iterations or cfg.n_perm_high)
     log.info("Varianti senza gene assegnato: %d", len(variants))
 
+    COMMIT_EVERY = 20  # numero di varianti tra un commit e l'altro
+
     ok, failed = 0, 0
     with get_connection() as conn:
-        for _, variant in variants.iterrows():
+        for i, (_, variant) in enumerate(variants.iterrows(), start=1):
             chrom, pos = variant["chromosome"], variant["position"]
             try:
                 gene_id, gene_name = EnsemblAPI.fetch_gene(chrom, pos)
@@ -88,8 +90,13 @@ def run_assign_genes(iterations: int | None = None) -> None:
                 log.info("Nessun gene trovato per %s", variant["variant"])
                 ok += 1
 
-    log.info("Assegnazione geni completata: %d ok, %d falliti", ok, failed)
+            if i % COMMIT_EVERY == 0:
+                conn.commit()
+                log.info("Commit intermedio dopo %d varianti processate", i)
 
+        conn.commit()  # flush finale per l'ultimo blocco parziale (< 20 varianti)
+
+    log.info("Assegnazione geni completata: %d ok, %d falliti", ok, failed)
 
 def _annotate_one_gene(gene: str) -> tuple[str, bool, str | None]:
     GeneAnnotator = _get_gene_annotator()
