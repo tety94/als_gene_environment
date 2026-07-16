@@ -2,6 +2,8 @@ from gene_environment.apis.ensembl_api import EnsemblAPI
 from gene_environment.apis.gtex_api import GTExAPI
 from gene_environment.apis.hpa_api import HPAAPI
 from gene_environment.apis.neuro_score import NeuroScore
+from gene_environment.apis.open_targets_api import OpenTargetsAPI
+from gene_environment.apis.panelapp_api import PanelAppAPI
 from gene_environment.db.repository import upsert_gene_neuro_annotation
 
 class GeneAnnotator:
@@ -19,6 +21,9 @@ class GeneAnnotator:
         ctd_chemicals = None
         ctd_neuro_diseases = None
 
+        panelapp = PanelAppAPI.get_als_status(info["gene_symbol"])
+        opentargets = OpenTargetsAPI.get_als_association(ensg)
+
         data = {
             "gene_id": ensg,
             "gene_symbol": info["gene_symbol"],
@@ -32,6 +37,8 @@ class GeneAnnotator:
             "go_toxic_response": go_toxic_response,
             "ctd_chemicals": ctd_chemicals,
             "ctd_neuro_diseases": ctd_neuro_diseases,
+            "als_panelapp_confidence" : panelapp["confidence_level"],
+            "als_opentargets_score": opentargets["score"],
         }
 
         data["neuro_plausibility_score"] = NeuroScore.compute(data)
