@@ -20,10 +20,24 @@ SOLUZIONE:
     pool automaticamente (commit se tutto ok, rollback se eccezione).
   - Un context manager `cursor_scope()` per i cursori, che chiude sempre il
     cursore anche in caso di errore.
+
+NOTA su multiprocessing (ProcessPoolExecutor / fork):
+  - `_pool` e' un singleton di modulo. Se venisse creato nel processo padre
+    (es. perche' get_connection() viene chiamato li' prima di spawnare i
+    worker) e poi il padre facesse fork() per creare i worker, questi
+    ultimi erediterebbero una COPIA del pool con le connessioni TCP gia'
+    aperte nel padre. Piu' processi che leggono/scrivono sullo stesso
+    socket ereditato via fork corrompono il protocollo MySQL lato client,
+    causando errori tipo "MySQL Connection not available".
+  - Per evitarlo, _get_pool() tiene traccia del PID che ha creato il pool
+    e lo ricrea da zero se il PID corrente e' diverso: cosi' ogni processo
+    (padre o worker figlio) finisce per avere un proprio pool con
+    connessioni TCP nuove, mai condivise.
 """
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 
 import mysql.connector
@@ -35,14 +49,19 @@ from gene_environment.logging_utils import get_logger
 log = get_logger(__name__)
 
 _pool: pooling.MySQLConnectionPool | None = None
+_pool_pid: int | None = None
 
 
 def _get_pool() -> pooling.MySQLConnectionPool:
-    global _pool
-    if _pool is None:
+    global _pool, _pool_pid
+    current_pid = os.getpid()
+    if _pool is None or _pool_pid != current_pid:
         cfg: DBConfig = get_config().db
         _pool = pooling.MySQLConnectionPool(
-            pool_name="gene_env_pool",
+            # pool_name univoco per processo: evita collisioni nel registro
+            # interno di mysql-connector se il pool viene ricreato dopo un
+            # fork con lo stesso nome logico
+            pool_name=f"gene_env_pool_{current_pid}",
             pool_size=cfg.pool_size,
             host=cfg.host,
             port=cfg.port,
@@ -51,8 +70,9 @@ def _get_pool() -> pooling.MySQLConnectionPool:
             database=cfg.name,
             autocommit=False,
         )
-        log.info("Connection pool MySQL creato (pool_size=%d, host=%s:%s, db=%s)",
-                  cfg.pool_size, cfg.host, cfg.port, cfg.name)
+        _pool_pid = current_pid
+        log.info("Connection pool MySQL creato (pid=%d, pool_size=%d, host=%s:%s, db=%s)",
+                  current_pid, cfg.pool_size, cfg.host, cfg.port, cfg.name)
     return _pool
 
 
