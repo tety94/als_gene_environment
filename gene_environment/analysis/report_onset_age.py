@@ -3,12 +3,12 @@
 Genera boxplot e forest plot per la differenza di età d'esordio (onset_age)
 delle varianti significative. (ex analyze_variant_onset_age.py)
 
-Le statistiche (mediana, delta, IC bootstrap, p-value, FDR) NON vengono
-ricalcolate qui: sono già state calcolate una volta sola in modeling.py e
-salvate a DB per ogni variante (vedi analysis/modeling.py e
-db/repository.py). Questo script si limita a: (1) leggere quelle
-statistiche dal DB, (2) leggere i dati grezzi paziente-per-paziente
-(genotipo + onset_age) solo per disegnare i boxplot, (3) produrre i grafici.
+Le statistiche principali (mediana, delta, IC bootstrap, p-value, FDR) NON
+vengono ricalcolate qui: sono già state calcolate una volta sola in
+modeling.py e salvate a DB per ogni variante (vedi analysis/modeling.py e
+db/repository.py). Questo script si limita a: (1) leggere quelle statistiche
+dal DB, (2) leggere i dati grezzi paziente-per-paziente (genotipo + onset_age
++ esposizione) per disegnare i boxplot, (3) produrre i grafici.
 
 NOVITA' rispetto alla versione precedente:
 - Parallelizzazione a livello di exposure (ogni componente ambientale gira
@@ -19,6 +19,13 @@ NOVITA' rispetto alla versione precedente:
       disponibili in variant_results e le processa tutte, in parallelo.
     * True -> calcola solo per la exposure corrente (cfg.exposure), utile
       per debug rapido su una singola componente ambientale.
+- Boxplot ora a 4 gruppi (mutato-vicino, mutato-non_vicino, non_mutato-vicino,
+  non_mutato-non_vicino) invece che solo mutato/non_mutato. "Vicino" e'
+  definito come colonna continua nel csv > 0 (vedi load_onset_age).
+- Calcolo esplorativo ON THE FLY (Mann-Whitney U) del p-value specifico tra
+  mutato-vicino e non_mutato-vicino: NON e' salvato a DB, NON passa da FDR,
+  e' aggiuntivo rispetto al p-value globale (onset_p_value) gia' calcolato
+  in modeling.py.
 
 NOTA IMPORTANTE su get_config(): e' un singleton letto una volta sola dagli
 env var (vedi config.py), quindi NON accetta e non puo' accettare un
@@ -38,6 +45,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import matplotlib
+from scipy.stats import mannwhitneyu
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -86,8 +94,14 @@ def get_available_exposures(cfg) -> list[str]:
 # I/O
 # --------------------------------------------------------------------------
 
-def load_onset_age(cfg) -> pd.DataFrame:
-    df = pd.read_csv(cfg.env_file, usecols=[cfg.sample_id_col, cfg.target_col] + cfg.covariates)
+def load_onset_age(cfg, exposure: str) -> pd.DataFrame:
+    """Carica onset_age + covariate + la colonna dell'esposizione corrente
+    (necessaria per stratificare vicino/non vicino). dict.fromkeys evita
+    colonne duplicate nel caso exposure sia gia' tra i covariates."""
+    cols = list(dict.fromkeys(
+        [cfg.sample_id_col, cfg.target_col, exposure] + cfg.covariates
+    ))
+    df = pd.read_csv(cfg.env_file, usecols=cols)
     return df.set_index(cfg.sample_id_col)
 
 
@@ -121,12 +135,40 @@ def load_db_stats(exposure: str, generation: int) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------
+# Statistica esplorativa: mutato vs non mutato SOLO tra i vicini
+# --------------------------------------------------------------------------
+
+def compute_vicino_stratified_stat(mut_vic: pd.Series, nonmut_vic: pd.Series) -> dict:
+    """Mann-Whitney U tra mutati-vicini e non_mutati-vicini. Non e' salvato
+    a DB, non passa da FDR: e' un confronto esplorativo per capire cosa
+    succede specificamente nel sottogruppo esposto."""
+    if len(mut_vic) < 2 or len(nonmut_vic) < 2:
+        return {
+            "vicino_n_mutati": len(mut_vic),
+            "vicino_n_non_mutati": len(nonmut_vic),
+            "vicino_median_mutati": mut_vic.median() if len(mut_vic) else np.nan,
+            "vicino_median_non_mutati": nonmut_vic.median() if len(nonmut_vic) else np.nan,
+            "vicino_p_value": np.nan,
+        }
+    stat, p = mannwhitneyu(mut_vic, nonmut_vic, alternative="two-sided")
+    return {
+        "vicino_n_mutati": len(mut_vic),
+        "vicino_n_non_mutati": len(nonmut_vic),
+        "vicino_median_mutati": mut_vic.median(),
+        "vicino_median_non_mutati": nonmut_vic.median(),
+        "vicino_p_value": p,
+    }
+
+
+# --------------------------------------------------------------------------
 # Plotting
 # --------------------------------------------------------------------------
 
-def make_boxplot(mutati, non_mutati, variant, cohort, out_dir):
-    fig, ax = plt.subplots(figsize=(4, 5))
-    ax.boxplot([non_mutati, mutati], tick_labels=["WT", "Mutato"], showmeans=True)
+def make_boxplot_4groups(mut_vic, mut_nonvic, nonmut_vic, nonmut_nonvic, variant, cohort, out_dir):
+    fig, ax = plt.subplots(figsize=(6, 5))
+    data = [nonmut_nonvic, nonmut_vic, mut_nonvic, mut_vic]
+    labels = ["WT\nnon vicino", "WT\nvicino", "Mutato\nnon vicino", "Mutato\nvicino"]
+    ax.boxplot(data, tick_labels=labels, showmeans=True)
     ax.set_ylabel("Età d'esordio")
     ax.set_title(f"{variant}\ncoorte {cohort}")
     fig.tight_layout()
@@ -186,7 +228,10 @@ def _process_exposure(exposure: str) -> str:
     box_dir = os.path.join(exp_out_dir, "boxplots")
     os.makedirs(box_dir, exist_ok=True)
 
-    df_onset = load_onset_age(cfg)
+    df_onset = load_onset_age(cfg, exposure)
+    # colonna continua > 0 => vicino
+    df_onset["vicino"] = (df_onset[exposure] > 0).astype(int)
+
     all_stats = []
 
     for cohort in cfg.report_cohorts:
@@ -202,16 +247,29 @@ def _process_exposure(exposure: str) -> str:
 
         for variant in variants:
             row = db_stats.loc[db_stats["variant"] == variant].iloc[0]
-            sub = df[[variant, cfg.target_col]].dropna()
+            sub = df[[variant, cfg.target_col, "vicino"]].dropna()
             sub[variant] = pd.to_numeric(sub[variant], errors="coerce")
-            mutati = sub.loc[sub[variant] == 1, cfg.target_col]
-            non_mutati = sub.loc[sub[variant] == 0, cfg.target_col]
 
-            if len(mutati) == 0 or len(non_mutati) == 0:
+            mut = sub[variant] == 1
+            nonmut = sub[variant] == 0
+            vic = sub["vicino"] == 1
+            nonvic = sub["vicino"] == 0
+
+            mut_vic = sub.loc[mut & vic, cfg.target_col]
+            mut_nonvic = sub.loc[mut & nonvic, cfg.target_col]
+            nonmut_vic = sub.loc[nonmut & vic, cfg.target_col]
+            nonmut_nonvic = sub.loc[nonmut & nonvic, cfg.target_col]
+
+            # serve almeno un mutato e un non mutato complessivamente,
+            # altrimenti non c'e' niente da plottare
+            if (len(mut_vic) + len(mut_nonvic)) == 0 or (len(nonmut_vic) + len(nonmut_nonvic)) == 0:
                 continue
 
-            make_boxplot(mutati, non_mutati, variant, cohort, box_dir)
-            all_stats.append({"variant": variant, "cohort": cohort, **row.to_dict()})
+            make_boxplot_4groups(mut_vic, mut_nonvic, nonmut_vic, nonmut_nonvic,
+                                  variant, cohort, box_dir)
+
+            vicino_stat = compute_vicino_stratified_stat(mut_vic, nonmut_vic)
+            all_stats.append({"variant": variant, "cohort": cohort, **row.to_dict(), **vicino_stat})
 
     if not all_stats:
         log.info("[%s] Nessuna statistica onset_age disponibile per il report. Esco.", exposure)
