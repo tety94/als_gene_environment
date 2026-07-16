@@ -1,45 +1,56 @@
 #!/usr/bin/env python3
 """
-Genera boxplot e forest plot per la differenza di età d'esordio (onset_age)
-delle varianti significative. (ex analyze_variant_onset_age.py)
+Generate boxplot+violin+beeswarm and forest plots for the onset-age
+difference (onset_age) of significant variants.
 
-Le statistiche principali (mediana, delta, IC bootstrap, p-value, FDR) NON
-vengono ricalcolate qui: sono già state calcolate una volta sola in
-modeling.py e salvate a DB per ogni variante (vedi analysis/modeling.py e
-db/repository.py). Questo script si limita a: (1) leggere quelle statistiche
-dal DB, (2) leggere i dati grezzi paziente-per-paziente (genotipo + onset_age
-+ esposizione) per disegnare i boxplot, (3) produrre i grafici.
+The main statistics (median, delta, bootstrap CI, p-value, FDR) are NOT
+recomputed here: they were already computed once in modeling.py and saved
+to the DB for every variant (see analysis/modeling.py and
+db/repository.py). This script only: (1) reads those statistics from the
+DB, (2) reads the raw per-patient data (genotype + onset_age + exposure) to
+draw the plots, (3) produces the figures.
 
-NOVITA' rispetto alla versione precedente:
-- Parallelizzazione a livello di exposure (ogni componente ambientale gira
-  in un processo separato, dato che le run sono indipendenti: query DB
-  diverse, output su directory diverse).
-- Parametro `single_exposure`:
-    * False (default) -> recupera dal DB tutte le exposure distinte
-      disponibili in variant_results e le processa tutte, in parallelo.
-    * True -> calcola solo per la exposure corrente (cfg.exposure), utile
-      per debug rapido su una singola componente ambientale.
-- Boxplot ora a 4 gruppi (mutato-vicino, mutato-non_vicino, non_mutato-vicino,
-  non_mutato-non_vicino) invece che solo mutato/non_mutato. "Vicino" e'
-  definito come colonna continua nel csv > 0 (vedi load_onset_age).
-- Calcolo esplorativo ON THE FLY (Mann-Whitney U) del p-value specifico tra
-  mutato-vicino e non_mutato-vicino: NON e' salvato a DB, NON passa da FDR,
-  e' aggiuntivo rispetto al p-value globale (onset_p_value) gia' calcolato
-  in modeling.py.
+Design notes
+------------
+- Parallelized at the exposure level (each environmental component runs in
+  its own process, since the runs are independent: different DB queries,
+  different output directories).
+- `single_exposure` parameter:
+    * False (default) -> fetches all distinct exposures available in
+      variant_results from the DB and processes all of them, in parallel.
+    * True -> only computes the current exposure (cfg.exposure), useful
+      for quick debugging on a single environmental component.
+- Each figure now shows BOTH cohort 1 and cohort 2 side by side, in two
+  blocks of 4 groups each: WT-Far, WT-Near, Mutant-Far, Mutant-Near.
+  "Near" is defined as the continuous exposure column in the csv being > 0
+  (see load_onset_age / the "near" column built in _process_exposure).
+- Each box is drawn as violin + boxplot + beeswarm (individual points),
+  overlaid on the same x position.
+- An exploratory Mann-Whitney U p-value between Mutant-Near and WT-Near is
+  computed ON THE FLY per cohort (NOT saved to the DB, NOT FDR-corrected —
+  it is additional to the global onset_p_value already computed in
+  modeling.py) and annotated as a bracket above those two groups.
+- At the start of every run, all previously generated images/tables for
+  that exposure are deleted and regenerated from scratch (no stale files
+  left behind from earlier runs).
 
-NOTA IMPORTANTE su get_config(): e' un singleton letto una volta sola dagli
-env var (vedi config.py), quindi NON accetta e non puo' accettare un
-parametro `exposure` per generare config diverse per ogni componente
-ambientale. cfg.onset_age_out_dir e' percio' un path FISSO, identico per
-tutti i worker. Per evitare che processi paralleli su exposure diverse
-scrivano nella stessa cartella sovrascrivendosi a vicenda (boxplot,
-onset_age_report_table.csv, forest_plot.png), ogni worker crea la propria
-sottocartella <onset_age_out_dir>/<exposure>/.
+IMPORTANT NOTE on get_config(): it is a singleton read once from env vars
+(see config.py), so it does NOT accept (and cannot accept) an `exposure`
+parameter to build a different config per environmental component.
+cfg.onset_age_out_dir is therefore a FIXED path, identical for every
+worker. To prevent parallel processes on different exposures from writing
+into the same folder and overwriting each other, every worker creates its
+own subfolder <onset_age_out_dir>/<exposure>/.
+
+Dependency note: this version uses seaborn (>=0.12, for swarmplot's
+native_scale support) in addition to matplotlib. Install with
+`pip install seaborn` if not already present in the environment.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -49,6 +60,7 @@ from scipy.stats import mannwhitneyu
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 from gene_environment.config import get_config
 from gene_environment.db.connection import get_connection
@@ -57,26 +69,33 @@ from gene_environment.utils.id_utils import clean_sample_id
 
 log = get_logger(__name__)
 
+GROUP_ORDER = ["WT-Far", "WT-Near", "Mutant-Far", "Mutant-Near"]
+GROUP_COLORS = {
+    "WT-Far": "#B0B0B0",
+    "WT-Near": "#6FA8DC",
+    "Mutant-Far": "#F6B26B",
+    "Mutant-Near": "#E06666",
+}
+
 
 # --------------------------------------------------------------------------
 # Config helper
 # --------------------------------------------------------------------------
 
 def _get_config_for_exposure(exposure: str | None = None):
-    """Ritorna la config globale.
+    """Return the global config.
 
-    get_config() e' un singleton letto una volta sola dagli env var: non
-    esiste (e non serve) una config diversa per exposure. Il parametro
-    `exposure` qui e' tenuto solo per compatibilita' di firma con le
-    chiamate esistenti, ma non viene passato a get_config(). La
-    differenziazione per exposure avviene invece a livello di directory di
-    output, dentro _process_exposure.
+    get_config() is a singleton read once from env vars: there is no (and
+    no need for a) different config per exposure. The `exposure` parameter
+    here is only kept for call-signature compatibility, but it is not
+    passed to get_config(). Per-exposure differentiation instead happens
+    at the output-directory level, inside _process_exposure.
     """
     return get_config()
 
 
 # --------------------------------------------------------------------------
-# Discovery delle exposure disponibili
+# Discovering available exposures
 # --------------------------------------------------------------------------
 
 def get_available_exposures(cfg) -> list[str]:
@@ -95,9 +114,9 @@ def get_available_exposures(cfg) -> list[str]:
 # --------------------------------------------------------------------------
 
 def load_onset_age(cfg, exposure: str) -> pd.DataFrame:
-    """Carica onset_age + covariate + la colonna dell'esposizione corrente
-    (necessaria per stratificare vicino/non vicino). dict.fromkeys evita
-    colonne duplicate nel caso exposure sia gia' tra i covariates."""
+    """Load onset_age + covariates + the current exposure column (needed to
+    stratify near/far). dict.fromkeys avoids duplicate columns in case
+    exposure is already among the covariates."""
     cols = list(dict.fromkeys(
         [cfg.sample_id_col, cfg.target_col, exposure] + cfg.covariates
     ))
@@ -108,13 +127,13 @@ def load_onset_age(cfg, exposure: str) -> pd.DataFrame:
 def load_genotype_matrix_for_cohort(cfg, cohort: int) -> pd.DataFrame | None:
     combined_path = os.path.join(cfg.significant_matrix_dir, "combined_significant_variants.csv")
     if not os.path.exists(combined_path):
-        log.warning("Manca %s (esegui prima extract_matrix)", combined_path)
+        log.warning("Missing %s (run extract_matrix first)", combined_path)
         return None
 
     df_all = pd.read_csv(combined_path, index_col="id")
     df_cohort = df_all[df_all["generation"] == cohort].drop(columns=["generation"])
     if df_cohort.empty:
-        log.warning("Nessun paziente per coorte %d in %s", cohort, combined_path)
+        log.warning("No patients for cohort %d in %s", cohort, combined_path)
         return None
 
     df_cohort.index = [clean_sample_id(idx) for idx in df_cohort.index]
@@ -135,28 +154,28 @@ def load_db_stats(exposure: str, generation: int) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------
-# Statistica esplorativa: mutato vs non mutato SOLO tra i vicini
+# Exploratory stat: mutant vs WT ONLY among the "near" patients
 # --------------------------------------------------------------------------
 
-def compute_vicino_stratified_stat(mut_vic: pd.Series, nonmut_vic: pd.Series) -> dict:
-    """Mann-Whitney U tra mutati-vicini e non_mutati-vicini. Non e' salvato
-    a DB, non passa da FDR: e' un confronto esplorativo per capire cosa
-    succede specificamente nel sottogruppo esposto."""
-    if len(mut_vic) < 2 or len(nonmut_vic) < 2:
+def compute_near_stratified_stat(mut_near: pd.Series, wt_near: pd.Series) -> dict:
+    """Mann-Whitney U between mutant-near and wt-near. Not saved to the DB,
+    not FDR-corrected: it's an exploratory comparison to understand what
+    happens specifically within the exposed subgroup."""
+    if len(mut_near) < 2 or len(wt_near) < 2:
         return {
-            "vicino_n_mutati": len(mut_vic),
-            "vicino_n_non_mutati": len(nonmut_vic),
-            "vicino_median_mutati": mut_vic.median() if len(mut_vic) else np.nan,
-            "vicino_median_non_mutati": nonmut_vic.median() if len(nonmut_vic) else np.nan,
-            "vicino_p_value": np.nan,
+            "near_n_mutant": len(mut_near),
+            "near_n_wt": len(wt_near),
+            "near_median_mutant": mut_near.median() if len(mut_near) else np.nan,
+            "near_median_wt": wt_near.median() if len(wt_near) else np.nan,
+            "near_p_value": np.nan,
         }
-    stat, p = mannwhitneyu(mut_vic, nonmut_vic, alternative="two-sided")
+    _, p = mannwhitneyu(mut_near, wt_near, alternative="two-sided")
     return {
-        "vicino_n_mutati": len(mut_vic),
-        "vicino_n_non_mutati": len(nonmut_vic),
-        "vicino_median_mutati": mut_vic.median(),
-        "vicino_median_non_mutati": nonmut_vic.median(),
-        "vicino_p_value": p,
+        "near_n_mutant": len(mut_near),
+        "near_n_wt": len(wt_near),
+        "near_median_mutant": mut_near.median(),
+        "near_median_wt": wt_near.median(),
+        "near_p_value": p,
     }
 
 
@@ -164,25 +183,115 @@ def compute_vicino_stratified_stat(mut_vic: pd.Series, nonmut_vic: pd.Series) ->
 # Plotting
 # --------------------------------------------------------------------------
 
-def make_boxplot_4groups(mut_vic, mut_nonvic, nonmut_vic, nonmut_nonvic, variant, cohort, out_dir):
-    fig, ax = plt.subplots(figsize=(6, 5))
-    data = [nonmut_nonvic, nonmut_vic, mut_nonvic, mut_vic]
-    labels = ["WT\nnon vicino", "WT\nvicino", "Mutato\nnon vicino", "Mutato\nvicino"]
-    ax.boxplot(data, tick_labels=labels, showmeans=True)
-    ax.set_ylabel("Età d'esordio")
-    ax.set_title(f"{variant}\ncoorte {cohort}")
+def _add_significance_bracket(ax, x1: float, x2: float, y: float, text: str) -> None:
+    bar_height = y * 0.02
+    ax.plot([x1, x1, x2, x2], [y, y + bar_height, y + bar_height, y],
+            lw=1.2, color="black")
+    ax.text((x1 + x2) / 2, y + bar_height, text, ha="center", va="bottom", fontsize=8)
+
+
+def make_combined_boxplot(cohort_groups: dict[int, dict[str, pd.Series]],
+                           near_pvalues: dict[int, float],
+                           variant: str, out_dir: str) -> None:
+    """One figure per variant, with one block of 4 groups (WT-Far, WT-Near,
+    Mutant-Far, Mutant-Near) per available cohort, side by side. Each group
+    is drawn as violin + boxplot + beeswarm points overlaid at the same x
+    position. A significance bracket (Mann-Whitney U, computed on the fly)
+    is drawn between WT-Near and Mutant-Near for each cohort block."""
+    cohorts = sorted(cohort_groups.keys())
+
+    positions: list[int] = []
+    labels: list[str] = []
+    colors: list[str] = []
+    rows = []
+    block_bounds: dict[int, tuple[int, int]] = {}
+    x = 0
+    for cohort in cohorts:
+        start = x
+        for grp in GROUP_ORDER:
+            series = cohort_groups[cohort].get(grp, pd.Series(dtype=float))
+            positions.append(x)
+            labels.append(grp)
+            colors.append(GROUP_COLORS[grp])
+            for v in series:
+                rows.append({"x": x, "group": grp, "value": v})
+            x += 1
+        block_bounds[cohort] = (start, x - 1)
+        x += 1  # gap between cohort blocks
+
+    if not rows:
+        return
+    long_df = pd.DataFrame(rows)
+
+    fig, ax = plt.subplots(figsize=(2.2 * len(positions) + 1.5, 5.5))
+
+    # Violin layer (background)
+    for pos, color in zip(positions, colors):
+        vals = long_df.loc[long_df["x"] == pos, "value"]
+        if len(vals) < 2:
+            continue
+        parts = ax.violinplot([vals], positions=[pos], widths=0.8,
+                               showmeans=False, showmedians=False, showextrema=False)
+        for body in parts["bodies"]:
+            body.set_facecolor(color)
+            body.set_alpha(0.35)
+            body.set_edgecolor("none")
+
+    # Boxplot layer (narrow, on top of the violin)
+    box_data = [long_df.loc[long_df["x"] == pos, "value"] for pos in positions]
+    non_empty = [(p, d) for p, d in zip(positions, box_data) if len(d) > 0]
+    if non_empty:
+        bp = ax.boxplot([d for _, d in non_empty], positions=[p for p, _ in non_empty],
+                         widths=0.18, patch_artist=True, showfliers=False, zorder=3)
+        for patch, (pos, _) in zip(bp["boxes"], non_empty):
+            patch.set_facecolor(colors[positions.index(pos)])
+            patch.set_alpha(0.9)
+
+    # Beeswarm layer (individual points, non-overlapping along x)
+    for pos in positions:
+        vals = long_df.loc[long_df["x"] == pos, "value"]
+        if vals.empty:
+            continue
+        sns.swarmplot(x=[pos] * len(vals), y=vals, ax=ax, size=2.5,
+                       color="black", alpha=0.5, native_scale=True)
+
+    # Significance brackets: WT-Near vs Mutant-Near, per cohort block
+    for cohort in cohorts:
+        start, end = block_bounds[cohort]
+        wt_near_pos = start + GROUP_ORDER.index("WT-Near")
+        mut_near_pos = start + GROUP_ORDER.index("Mutant-Near")
+        block_vals = long_df.loc[(long_df["x"] >= start) & (long_df["x"] <= end), "value"]
+        if block_vals.empty:
+            continue
+        y_bracket = block_vals.max() * 1.05
+        p = near_pvalues.get(cohort, np.nan)
+        p_text = "p = n/a" if pd.isna(p) else f"p = {p:.3g}"
+        _add_significance_bracket(ax, wt_near_pos, mut_near_pos, y_bracket, p_text)
+
+    # Cohort block separators and labels
+    for cohort in cohorts:
+        start, end = block_bounds[cohort]
+        ax.text((start + end) / 2, ax.get_ylim()[1], f"Cohort {cohort}",
+                ha="center", va="bottom", fontsize=10, fontweight="bold")
+        if end + 1 < len(positions):
+            ax.axvline(end + 1, color="gray", linestyle=":", linewidth=1)
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_ylabel("Onset age")
+    ax.set_title(variant)
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, f"{variant}_cohort{cohort}.png"), dpi=150)
+    fig.savefig(os.path.join(out_dir, f"{variant}.png"), dpi=150)
     plt.close(fig)
 
 
 def make_forest_plot(stats_df: pd.DataFrame, out_path: str):
     stats_df = stats_df.sort_values(["variant", "cohort"]).reset_index(drop=True)
     if stats_df.empty:
-        log.warning("Nessun dato per il forest plot")
+        log.warning("No data available for the forest plot")
         return
 
-    y_labels = [f"{r.variant}  (coorte {r.cohort})" for r in stats_df.itertuples()]
+    y_labels = [f"{r.variant}  (cohort {r.cohort})" for r in stats_df.itertuples()]
     y_pos = np.arange(len(stats_df))[::-1]
 
     xerr_low = stats_df["onset_delta_median"] - stats_df["onset_ci_low"]
@@ -197,21 +306,21 @@ def make_forest_plot(stats_df: pd.DataFrame, out_path: str):
     ax.axvline(0, color="black", linestyle="--", linewidth=1)
     ax.set_yticks(y_pos)
     ax.set_yticklabels(y_labels)
-    ax.set_xlabel("Delta mediana onset_age (mutati - non mutati) [IC 95% bootstrap]")
+    ax.set_xlabel("Median onset_age delta (mutant - WT) [95% bootstrap CI]")
 
     handles = [
-        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=palette.get(c, "gray"), label=f"Coorte {c}")
+        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=palette.get(c, "gray"), label=f"Cohort {c}")
         for c in sorted(stats_df["cohort"].unique())
     ]
     ax.legend(handles=handles, loc="best")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    log.info("Forest plot salvato in %s", out_path)
+    log.info("Forest plot saved to %s", out_path)
 
 
 # --------------------------------------------------------------------------
-# Core: report per singola exposure (funzione top-level -> picklabile per
+# Core: report for a single exposure (top-level function -> picklable for
 # ProcessPoolExecutor)
 # --------------------------------------------------------------------------
 
@@ -219,20 +328,27 @@ def _process_exposure(exposure: str) -> str:
     cfg = _get_config_for_exposure(exposure)
     configure_logging(cfg.log_dir)
 
-    # cfg.onset_age_out_dir e' FISSO (stesso per tutti i processi, dato che
-    # cfg e' un singleton). Ogni worker scrive quindi nella propria
-    # sottocartella per exposure, per evitare che run parallele su
-    # componenti ambientali diverse si sovrascrivano a vicenda.
+    # cfg.onset_age_out_dir is FIXED (same for every process, since cfg is a
+    # singleton). Every worker writes to its own per-exposure subfolder to
+    # avoid parallel runs on different environmental components
+    # overwriting each other.
     exp_out_dir = os.path.join(cfg.onset_age_out_dir, exposure)
-    os.makedirs(exp_out_dir, exist_ok=True)
+
+    # Wipe previous outputs for this exposure before regenerating anything,
+    # so stale images/tables from earlier runs never linger.
+    if os.path.isdir(exp_out_dir):
+        shutil.rmtree(exp_out_dir)
     box_dir = os.path.join(exp_out_dir, "boxplots")
     os.makedirs(box_dir, exist_ok=True)
 
     df_onset = load_onset_age(cfg, exposure)
-    # colonna continua > 0 => vicino
-    df_onset["vicino"] = (df_onset[exposure] > 0).astype(int)
+    df_onset["near"] = (df_onset[exposure] > 0).astype(int)
 
     all_stats = []
+    # variant -> {cohort: {group_name: series}}
+    variant_plot_data: dict[str, dict[int, dict[str, pd.Series]]] = {}
+    # variant -> {cohort: near_p_value}
+    variant_near_pvalues: dict[str, dict[int, float]] = {}
 
     for cohort in cfg.report_cohorts:
         df_geno = load_genotype_matrix_for_cohort(cfg, cohort)
@@ -242,43 +358,53 @@ def _process_exposure(exposure: str) -> str:
 
         df = df_geno.join(df_onset, how="inner")
         variants = [v for v in df_geno.columns if v in set(db_stats["variant"])]
-        log.info("[%s] Coorte %d: %d pazienti, %d varianti con statistiche in DB",
+        log.info("[%s] Cohort %d: %d patients, %d variants with DB statistics",
                   exposure, cohort, len(df), len(variants))
 
         for variant in variants:
             row = db_stats.loc[db_stats["variant"] == variant].iloc[0]
-            sub = df[[variant, cfg.target_col, "vicino"]].dropna()
+            sub = df[[variant, cfg.target_col, "near"]].dropna()
             sub[variant] = pd.to_numeric(sub[variant], errors="coerce")
 
-            mut = sub[variant] == 1
-            nonmut = sub[variant] == 0
-            vic = sub["vicino"] == 1
-            nonvic = sub["vicino"] == 0
+            is_mut = sub[variant] == 1
+            is_wt = sub[variant] == 0
+            is_near = sub["near"] == 1
+            is_far = sub["near"] == 0
 
-            mut_vic = sub.loc[mut & vic, cfg.target_col]
-            mut_nonvic = sub.loc[mut & nonvic, cfg.target_col]
-            nonmut_vic = sub.loc[nonmut & vic, cfg.target_col]
-            nonmut_nonvic = sub.loc[nonmut & nonvic, cfg.target_col]
+            mut_near = sub.loc[is_mut & is_near, cfg.target_col]
+            mut_far = sub.loc[is_mut & is_far, cfg.target_col]
+            wt_near = sub.loc[is_wt & is_near, cfg.target_col]
+            wt_far = sub.loc[is_wt & is_far, cfg.target_col]
 
-            # serve almeno un mutato e un non mutato complessivamente,
-            # altrimenti non c'e' niente da plottare
-            if (len(mut_vic) + len(mut_nonvic)) == 0 or (len(nonmut_vic) + len(nonmut_nonvic)) == 0:
+            # need at least one mutant and one WT overall, otherwise there
+            # is nothing to plot
+            if (len(mut_near) + len(mut_far)) == 0 or (len(wt_near) + len(wt_far)) == 0:
                 continue
 
-            make_boxplot_4groups(mut_vic, mut_nonvic, nonmut_vic, nonmut_nonvic,
-                                  variant, cohort, box_dir)
+            variant_plot_data.setdefault(variant, {})[cohort] = {
+                "WT-Far": wt_far,
+                "WT-Near": wt_near,
+                "Mutant-Far": mut_far,
+                "Mutant-Near": mut_near,
+            }
 
-            vicino_stat = compute_vicino_stratified_stat(mut_vic, nonmut_vic)
-            all_stats.append({"variant": variant, "cohort": cohort, **row.to_dict(), **vicino_stat})
+            near_stat = compute_near_stratified_stat(mut_near, wt_near)
+            variant_near_pvalues.setdefault(variant, {})[cohort] = near_stat["near_p_value"]
+
+            all_stats.append({"variant": variant, "cohort": cohort, **row.to_dict(), **near_stat})
+
+    # One combined figure per variant, with both cohorts side by side
+    for variant, cohort_groups in variant_plot_data.items():
+        make_combined_boxplot(cohort_groups, variant_near_pvalues[variant], variant, box_dir)
 
     if not all_stats:
-        log.info("[%s] Nessuna statistica onset_age disponibile per il report. Esco.", exposure)
+        log.info("[%s] No onset_age statistics available for the report. Exiting.", exposure)
         return exposure
 
     stats_df = pd.DataFrame(all_stats)
     stats_df.to_csv(os.path.join(exp_out_dir, "onset_age_report_table.csv"), index=False)
     make_forest_plot(stats_df, os.path.join(exp_out_dir, "forest_plot.png"))
-    log.info("[%s] Report onset_age completato in %s", exposure, exp_out_dir)
+    log.info("[%s] onset_age report completed in %s", exposure, exp_out_dir)
     return exposure
 
 
@@ -288,16 +414,16 @@ def _process_exposure(exposure: str) -> str:
 
 def run_report_onset_age(single_exposure: bool = False, n_workers: int | None = None) -> None:
     """
-    Parametri
-    ---------
+    Parameters
+    ----------
     single_exposure : bool
-        Se False (default), recupera dal DB tutte le exposure disponibili
-        (DISTINCT exposure da variant_results) e le processa tutte, in
-        parallelo.
-        Se True, calcola solo per la exposure corrente (cfg.exposure) —
-        utile per debug rapido su una singola componente ambientale.
+        If False (default), fetches all available exposures from the DB
+        (DISTINCT exposure from variant_results) and processes all of
+        them, in parallel.
+        If True, only computes the current exposure (cfg.exposure) —
+        useful for quick debugging on a single environmental component.
     n_workers : int | None
-        Numero di processi paralleli. Default: min(n. exposure, n. cpu).
+        Number of parallel processes. Default: min(n. exposures, n. cpus).
     """
     base_cfg = get_config()
     configure_logging(base_cfg.log_dir)
@@ -306,18 +432,18 @@ def run_report_onset_age(single_exposure: bool = False, n_workers: int | None = 
         exposures = [base_cfg.exposure]
     else:
         exposures = get_available_exposures(base_cfg)
-        log.info("Trovate %d exposure da processare: %s", len(exposures), exposures)
+        log.info("Found %d exposures to process: %s", len(exposures), exposures)
         if not exposures:
-            log.warning("Nessuna exposure trovata in variant_results. Esco.")
+            log.warning("No exposure found in variant_results. Exiting.")
             return
 
     if len(exposures) == 1:
-        # Nessun vantaggio a spawnare un processo per una sola exposure
+        # No benefit in spawning a process for a single exposure
         _process_exposure(exposures[0])
         return
 
     n_workers = n_workers or min(len(exposures), os.cpu_count() or 1)
-    log.info("Avvio pool con %d worker per %d exposure", n_workers, len(exposures))
+    log.info("Starting pool with %d workers for %d exposures", n_workers, len(exposures))
 
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         futures = {executor.submit(_process_exposure, exp): exp for exp in exposures}
@@ -326,22 +452,22 @@ def run_report_onset_age(single_exposure: bool = False, n_workers: int | None = 
             try:
                 future.result()
             except Exception:
-                log.exception("Errore processando exposure %s", exp)
+                log.exception("Error processing exposure %s", exp)
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Report onset_age (boxplot + forest plot)")
+    parser = argparse.ArgumentParser(description="Onset_age report (boxplot + forest plot)")
     parser.add_argument(
         "--single-exposure",
         action="store_true",
-        help="Se presente, calcola solo per la exposure corrente (cfg.exposure) "
-             "invece che per tutte quelle disponibili nel DB.",
+        help="If set, only compute the current exposure (cfg.exposure) "
+             "instead of all those available in the DB.",
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=None,
-        help="Numero di processi paralleli (default: min(n. exposure, n. cpu)).",
+        help="Number of parallel processes (default: min(n. exposures, n. cpus)).",
     )
     return parser.parse_args()
 
