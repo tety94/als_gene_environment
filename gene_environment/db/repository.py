@@ -245,16 +245,24 @@ def get_variants_to_run(mapping: dict, variant_cols_safe: list[str], exposure: s
 # Geni / annotazione
 # --------------------------------------------------------------------------
 
-def get_empty_variants_gene(iterations: int) -> pd.DataFrame:
+def get_empty_variants_gene() -> pd.DataFrame:
+    """Recupera le varianti significative dalla stored procedure
+    get_significant_results (nessun filtro exposure) e le filtra per
+    tenere solo quelle che in variant_results_significant non hanno
+    ancora un gene assegnato."""
+    sig_df = get_significant_results()
+    if sig_df.empty:
+        return pd.DataFrame(columns=["variant", "mutation", "position", "chromosome"])
+
     with get_connection() as conn:
         with cursor_scope(conn) as cur:
             cur.execute(
-                "SELECT variant, mutation, position, chromosome FROM variant_results_significant "
-                "WHERE gene IS NULL AND iterations = %s",
-                (iterations,),
+                "SELECT variant FROM variant_results_significant WHERE gene IS NOT NULL"
             )
-            rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=["variant", "mutation", "position", "chromosome"])
+            already_assigned = {row[0] for row in cur.fetchall()}
+
+    empty_df = sig_df[~sig_df["variant"].isin(already_assigned)]
+    return empty_df[["variant", "mutation", "position", "chromosome"]].reset_index(drop=True)
 
 
 def update_variant_gene(conn, variant: str, gene_id: str, gene_name: str) -> None:
