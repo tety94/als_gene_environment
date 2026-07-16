@@ -250,7 +250,7 @@ def get_empty_variants_gene() -> pd.DataFrame:
     get_significant_results (nessun filtro exposure) e le filtra per
     tenere solo quelle che in variant_results_significant non hanno
     ancora un gene assegnato."""
-    sig_df = get_significant_results()
+    sig_df = get_significant_results(exposure=None)
     if sig_df.empty:
         return pd.DataFrame(columns=["variant", "mutation", "position", "chromosome"])
 
