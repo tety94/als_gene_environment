@@ -23,7 +23,7 @@ query AssociatedDiseases($ensemblId: String!) {
     target(ensemblId: $ensemblId) {
         id
         approvedSymbol
-        associatedDiseases(page: {index: 0, size: 200}) {
+        associatedDiseases(page: {index: 0, size: 1000}) {
             rows {
                 disease {
                     id
