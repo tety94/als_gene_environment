@@ -65,7 +65,7 @@ def run_assign_genes(iterations: int | None = None) -> None:
     configure_logging(cfg.log_dir)
     EnsemblAPI = _get_ensembl_api()
 
-    variants = get_empty_variants_gene(iterations or cfg.n_perm_high)
+    variants = get_empty_variants_gene()
     log.info("Varianti senza gene assegnato: %d", len(variants))
 
     COMMIT_EVERY = 20  # numero di varianti tra un commit e l'altro
