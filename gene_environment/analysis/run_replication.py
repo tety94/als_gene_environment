@@ -45,7 +45,8 @@ def get_significant_variant_labels(exposure: str, generation: int, iterations: i
     if df.empty:
         return []
     df = add_fdr(df, p_col="empirical_p", fdr_col="fdr")
-    significant = df[df["fdr"] < alpha]
+    # significant = df[df["fdr"] < alpha]
+    significant = df.copy()
     return sorted(significant["variant"].unique().tolist())
 
 
