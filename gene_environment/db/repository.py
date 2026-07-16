@@ -330,6 +330,7 @@ def get_significant_results(exposure: str | None = None) -> pd.DataFrame:
     parametro IN p_exposure — vedi nota nel modulo). Se None, comportamento
     invariato (nessun filtro, come prima)."""
     expected_columns = [
+        "exposure",
         "gene_name", "variant",
         "empirical_p_g1", "obs_coef_g1",
         "empirical_p_g2", "obs_coef_g2",
