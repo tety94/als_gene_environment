@@ -93,8 +93,6 @@ def _annotate_one_gene(gene: str) -> tuple[str, bool, str | None]:
 
 
 def run_annotate_gene_neuro_info() -> None:
-    """ex main_gene_analysis.py: arricchisce i geni trovati con annotazioni
-    neuro (espressione cerebrale, processi GO, malattie CTD, ecc.)."""
     cfg = get_config()
     configure_logging(cfg.log_dir)
 
@@ -103,8 +101,13 @@ def run_annotate_gene_neuro_info() -> None:
     if not genes:
         return
 
+    # Le API esterne (PanelApp, Open Targets) hanno rate limit propri,
+    # indipendenti da quanti core ha la macchina: max_workers generico
+    # è troppo aggressivo qui. Un valore basso e fisso è più sicuro.
+    annotation_workers = min(cfg.max_workers, 3)
+
     failed = []
-    with ProcessPoolExecutor(max_workers=cfg.max_workers) as ex:
+    with ProcessPoolExecutor(max_workers=annotation_workers) as ex:
         futures = {ex.submit(_annotate_one_gene, g): g for g in genes}
         for fut in as_completed(futures):
             gene, ok, err = fut.result()
@@ -113,7 +116,6 @@ def run_annotate_gene_neuro_info() -> None:
                 log.error("Errore sul gene %s: %s", gene, err)
 
     log.info("Annotazione completata: %d ok, %d falliti", len(genes) - len(failed), len(failed))
-
 
 if __name__ == "__main__":
     run_assign_genes()
