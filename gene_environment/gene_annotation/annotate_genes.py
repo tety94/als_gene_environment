@@ -36,7 +36,7 @@ log = get_logger(__name__)
 
 def _get_ensembl_api():
     try:
-        from apis.ensembl_api import EnsemblAPI
+        from gene_environment.apis.ensembl_api import EnsemblAPI
         return EnsemblAPI
     except ImportError as e:
         raise ImportError(
