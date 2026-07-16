@@ -262,6 +262,7 @@ def get_empty_variants_gene() -> pd.DataFrame:
             already_assigned = {row[0] for row in cur.fetchall()}
 
     empty_df = sig_df[~sig_df["variant"].isin(already_assigned)]
+    log.info(f"Da calcolare {len(empty_df)} variants")
     return empty_df[["variant", "mutation", "position", "chromosome"]].reset_index(drop=True)
 
 
