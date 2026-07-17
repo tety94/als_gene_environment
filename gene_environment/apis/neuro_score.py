@@ -8,18 +8,26 @@ class NeuroScore:
         score += 1 if d.get("expressed_glia") else 0
 
         # GO disattivato (vedi GeneAnnotator) -> non contribuisce allo score.
-        # CTD e' invece attivo: contribuisce con due segnali distinti, pesati
-        # diversamente perche' rispondono a due domande diverse:
-        #   - ctd_neuro_diseases: il gene e' associato (letteratura curata) a
-        #     una malattia neuro/SLA? Stessa "famiglia" di evidenza di
-        #     PanelApp/Open Targets, quindi peso comparabile a quello.
-        #   - ctd_chemicals (pesticidi): il gene e' influenzato da
-        #     un'esposizione ambientale nota? Non e' evidenza di causalita'
-        #     con la SLA di per se', ma e' centrale per lo studio
-        #     gene-ambiente: un gene sia SLA-rilevante SIA responsivo a
-        #     pesticidi e' il caso piu' interessante. Peso minore perche'
-        #     e' un segnale di plausibilita' meccanicistica, non di malattia.
-        if d.get("ctd_neuro_diseases"):
+        # CTD e' invece attivo, con TRE segnali distinti pesati diversamente:
+        #
+        #   - ctd_neuro_disease_direct: associazione CURATA direttamente in
+        #     letteratura, stessa "famiglia" di evidenza di PanelApp/Open
+        #     Targets -> peso comparabile a quello.
+        #
+        #   - ctd_neuro_disease_pesticide_mediated: CTD stessa infierisce un
+        #     collegamento a malattia neuro passando per un pesticida
+        #     specifico. E' il segnale piu' specifico per questo studio,
+        #     perche' conferma, da una fonte indipendente, esattamente
+        #     l'ipotesi gene-ambiente che si sta testando -> peso alto,
+        #     paragonabile o superiore all'evidenza diretta.
+        #
+        #   - ctd_chemicals (pesticidi, senza legame a malattia riportato):
+        #     il gene e' influenzato da un'esposizione ambientale nota, ma
+        #     senza che CTD colleghi esplicitamente quel chimico alla SLA.
+        #     Plausibilita' meccanicistica piu' debole -> peso minore.
+        if d.get("ctd_neuro_disease_pesticide_mediated"):
+            score += 3
+        elif d.get("ctd_neuro_disease_direct"):
             score += 2
 
         if d.get("ctd_chemicals"):

@@ -32,11 +32,19 @@ class GeneAnnotator:
             CTDAPI.get_disease_index(),
         )
 
-        pesticide_names = [ci.chemical_name for ci in ctd_data["pesticide_interactions"]]
-        neuro_disease_names = [
-            d.disease_name for d in ctd_data["diseases"]
-            if "neuro" in d.disease_name.lower() or "amyotrophic" in d.disease_name.lower()
+        pesticide_names = [
+            ci.chemical_name for ci in ctd_data["chemical_interactions"]
+            if ci.is_pesticide_by_keyword
         ]
+
+        neuro_diseases_all = [
+            d for d in ctd_data["diseases"]
+            if "amyotrophic" in d.disease_name.lower() or "motor neuron" in d.disease_name.lower()
+        ]
+        neuro_diseases_direct = [d for d in neuro_diseases_all if d.is_direct]
+        neuro_diseases_pesticide_mediated = [d for d in neuro_diseases_all if d.is_pesticide_mediated]
+
+        neuro_disease_names = [d.disease_name for d in neuro_diseases_all]
 
         data = {
             "gene_id": ensg,
@@ -51,6 +59,8 @@ class GeneAnnotator:
             "go_toxic_response": go_toxic_response,
             "ctd_chemicals": ",".join(pesticide_names) if pesticide_names else None,
             "ctd_neuro_diseases": ",".join(neuro_disease_names) if neuro_disease_names else None,
+            "ctd_neuro_disease_direct": bool(neuro_diseases_direct),
+            "ctd_neuro_disease_pesticide_mediated": bool(neuro_diseases_pesticide_mediated),
             "als_panelapp_confidence": panelapp["confidence_level"],
             "als_opentargets_score": opentargets["score"],
         }

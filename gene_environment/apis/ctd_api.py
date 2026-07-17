@@ -45,24 +45,91 @@ class ChemGeneInteraction:
     def is_pesticide_by_keyword(self) -> bool:
         return any(kw in self.chemical_name.lower() for kw in PESTICIDE_KEYWORDS)
 
-
 @dataclass
 class GeneDiseaseAssociation:
     gene_symbol: str
     disease_name: str
     disease_id: str
-    direct_evidence: str
+    disease_categories: str
+    direct_evidence: str              # non vuoto = associazione curata diretta
+    inference_chemical_name: str      # valorizzato = associazione inferita TRAMITE questo chimico
     inference_score: Optional[float]
+    omim_ids: str
     pubmed_ids: List[str] = field(default_factory=list)
 
-class CTDAPI:
+    @property
+    def is_direct(self) -> bool:
+        return bool(self.direct_evidence)
 
+    @property
+    def is_inferred_via_chemical(self) -> bool:
+        return bool(self.inference_chemical_name) and not self.is_direct
+
+    @property
+    def is_pesticide_mediated(self) -> bool:
+        return self.is_inferred_via_chemical and any(
+            kw in self.inference_chemical_name.lower() for kw in PESTICIDE_KEYWORDS
+        )
+
+
+class CTDAPI:
     # path di default, sovrascrivibili da config se preferisci
     CHEM_GENE_TSV_PATH = "/srv/python-projects/gene_environment_v2/data/ctd_chem_gene_export.tsv"
     DISEASE_TSV_PATH = "/srv/python-projects/gene_environment_v2/data/ctd_gene_disease_export.tsv"
 
     _chem_index_cache: Dict[str, List["ChemGeneInteraction"]] | None = None
     _disease_index_cache: Dict[str, List["GeneDiseaseAssociation"]] | None = None
+
+    @staticmethod
+    def build_disease_index(path: str, keyword_filter: Optional[str] = None
+                             ) -> Dict[str, List[GeneDiseaseAssociation]]:
+        """Formato reale: Input, DiseaseName, DiseaseID, GeneSymbol, GeneID,
+        DiseaseCategories, DirectEvidence, InferenceChemicalName,
+        InferenceScore, OmimIDs, PubMedIDs
+
+        keyword_filter: se valorizzato, tiene solo le righe il cui
+        DiseaseName contiene questa stringa (case-insensitive)."""
+        rows = CTDAPI._read_tsv_rows(path)
+        index: Dict[str, List[GeneDiseaseAssociation]] = {}
+        skipped_no_gene = 0
+
+        for row in rows:
+            gene = (row.get("GeneSymbol") or "").strip().upper()
+            disease = (row.get("DiseaseName") or "").strip()
+            if not gene or not disease:
+                skipped_no_gene += 1
+                continue
+            if keyword_filter and keyword_filter.lower() not in disease.lower():
+                continue
+
+            pubmed_raw = (row.get("PubMedIDs") or "").strip()
+            pubmed_ids = [p for p in pubmed_raw.split("|") if p]
+
+            score_raw = (row.get("InferenceScore") or "").strip()
+            try:
+                score = float(score_raw) if score_raw else None
+            except ValueError:
+                score = None
+
+            index.setdefault(gene, []).append(GeneDiseaseAssociation(
+                gene_symbol=gene,
+                disease_name=disease,
+                disease_id=(row.get("DiseaseID") or "").strip(),
+                disease_categories=(row.get("DiseaseCategories") or "").strip(),
+                direct_evidence=(row.get("DirectEvidence") or "").strip(),
+                inference_chemical_name=(row.get("InferenceChemicalName") or "").strip(),
+                inference_score=score,
+                omim_ids=(row.get("OmimIDs") or "").strip(),
+                pubmed_ids=pubmed_ids,
+            ))
+
+        log.info(
+            "CTD disease index: %d geni distinti, %d righe senza gene risolto (filtro keyword='%s')",
+            len(index), skipped_no_gene, keyword_filter,
+        )
+        return index
+
+
 
     @classmethod
     def get_chem_index(cls) -> Dict[str, List["ChemGeneInteraction"]]:
@@ -147,48 +214,6 @@ class CTDAPI:
             "CTD chem-gene index: %d geni distinti, %d righe scartate per filtro organismo (%s)",
             len(index), skipped_organism, organism_filter,
         )
-        return index
-
-    @staticmethod
-    def build_disease_index(path: str, keyword_filter: Optional[str] = None
-                             ) -> Dict[str, List[GeneDiseaseAssociation]]:
-        """Costruisce indice gene_symbol -> lista associazioni malattia, dal
-        file 'Gene-Disease Associations' scaricato dal Batch Query.
-
-        NB: i nomi colonna qui sono un'ipotesi basata sulla convenzione CTD
-        standard (GeneSymbol, DiseaseName, DiseaseID, DirectEvidence,
-        InferenceScore, PubMedIDs) — vanno confermati contro il primo file
-        reale che scarichi, potrebbero differire leggermente."""
-        rows = CTDAPI._read_tsv_rows(path)
-        index: Dict[str, List[GeneDiseaseAssociation]] = {}
-
-        for row in rows:
-            gene = (row.get("GeneSymbol") or "").strip().upper()
-            disease = (row.get("DiseaseName") or "").strip()
-            if not gene or not disease:
-                continue
-            if keyword_filter and keyword_filter.lower() not in disease.lower():
-                continue
-
-            pubmed_raw = (row.get("PubMedIDs") or "").strip()
-            pubmed_ids = [p for p in pubmed_raw.split("|") if p]
-
-            score_raw = (row.get("InferenceScore") or "").strip()
-            try:
-                score = float(score_raw) if score_raw else None
-            except ValueError:
-                score = None
-
-            index.setdefault(gene, []).append(GeneDiseaseAssociation(
-                gene_symbol=gene,
-                disease_name=disease,
-                disease_id=(row.get("DiseaseID") or "").strip(),
-                direct_evidence=(row.get("DirectEvidence") or "").strip(),
-                inference_score=score,
-                pubmed_ids=pubmed_ids,
-            ))
-
-        log.info("CTD disease index: %d geni distinti (filtro keyword='%s')", len(index), keyword_filter)
         return index
 
     # --------------------------------------------------------------
