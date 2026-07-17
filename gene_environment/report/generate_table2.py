@@ -19,8 +19,10 @@ Behavior:
     output/table2/figures/variants_per_chromosome.png
     output/table2/figures/genes_vs_variants_scatter.png
     output/table2/figures/empirical_p_g1_histogram.png
-    output/table2/figures/significant_by_exposure.png
-    output/table2/table2_exposure_enrichment_stats.csv
+    output/table2/figures/observed_vs_expected_by_chromosome.png
+    output/table2/figures/observed_vs_expected_by_chromosome_per_exposure.png
+    output/table2/table2_chromosome_enrichment_stats.csv
+    output/table2/table2_chromosome_enrichment_by_exposure_stats.csv
 - Numeric formatting: p-values 3 significant digits, coefficients 2 decimals.
 """
 
@@ -319,33 +321,58 @@ def drop_gna_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=to_drop, errors="ignore") if to_drop else df
 
 
-def fetch_tested_variant_counts_by_exposure(get_connection, cursor_scope, generation: int) -> Dict[str, int]:
+def _normalize_chrom_label(chrom) -> str:
+    """Same normalization as `extract_chromosome`'s tail, applied to a raw
+    DB chromosome value so DB counts and variant-string-derived chromosomes
+    are guaranteed to line up (e.g. 'chr1' / '1' both become '1')."""
+    if chrom is None:
+        return "NA"
+    c = str(chrom).lower().lstrip("chr")
+    if c.isalpha():
+        c = c.upper()
+    return c
+
+
+def fetch_tested_variant_counts_by_exposure_and_chromosome(get_connection, cursor_scope, generation: int) -> pd.DataFrame:
     """
-    Return a dict exposure -> n_tested_variants for the given generation:
-        SELECT exposure, COUNT(*) AS c
+    Return a DataFrame [exposure, chromosome, n_tested] for the given
+    generation, for ALL exposures in one query:
+        SELECT exposure, chromosome, COUNT(*) AS c
         FROM variant_results
         WHERE generation = <generation>
-        GROUP BY exposure
+        GROUP BY exposure, chromosome
 
-    Returns an empty dict if no rows.
+    Returns an empty DataFrame (with the right columns) if no rows.
     """
     sql = (
-        "SELECT exposure, COUNT(*) AS c "
+        "SELECT exposure, chromosome, COUNT(*) AS c "
         "FROM variant_results "
         "WHERE generation = %s "
-        "GROUP BY exposure"
+        "GROUP BY exposure, chromosome"
     )
-    counts: Dict[str, int] = {}
+    rows: List[dict] = []
     with get_connection() as conn:
         with cursor_scope(conn, dictionary=True) as cur:
             cur.execute(sql, (generation,))
             for r in cur.fetchall():
                 exposure = r.get("exposure")
+                chrom = r.get("chromosome")
                 cnt = r.get("c", 0)
-                if exposure is None:
+                if exposure is None or chrom is None:
                     continue
-                counts[str(exposure)] = int(cnt)
-    return counts
+                rows.append({
+                    "exposure": str(exposure),
+                    "chromosome": _normalize_chrom_label(chrom),
+                    "n_tested": int(cnt),
+                })
+
+    if not rows:
+        return pd.DataFrame(columns=["exposure", "chromosome", "n_tested"])
+
+    out = pd.DataFrame(rows)
+    # Collapse duplicates that can appear if normalization merges two raw DB
+    # labels (e.g. "1" and "chr1" both -> "1").
+    return out.groupby(["exposure", "chromosome"], as_index=False)["n_tested"].sum()
 
 
 # ---------------------------------------------------------------------------
@@ -455,75 +482,162 @@ def _empty_placeholder_figure(path: Path, message: str) -> None:
     plt.close()
 
 
-def compute_enrichment_stats_by_exposure(
+def _chrom_sort_key(ch):
+    try:
+        return (0, int(ch))
+    except ValueError:
+        return (1, ch)
+
+
+def _short_variant_label(variant: str) -> str:
+    """'chr1:12345_A/T' -> '12345_A/T' (drop the chromosome part, we already
+    know it from the bar it's attached to)."""
+    if not isinstance(variant, str):
+        return str(variant)
+    return variant.split(":", 1)[-1] if ":" in variant else variant
+
+
+def _sig_annotation_text(sig_variants: list) -> str:
+    """Short label listing which variants are significant on a given bar."""
+    if not sig_variants:
+        return ""
+    if len(sig_variants) <= 3:
+        return "\n".join(_short_variant_label(v) for v in sig_variants)
+    return f"{len(sig_variants)} significant"
+
+
+def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
+    """Add expected/chi2-ready columns + BH-adjusted binomial p-values to a
+    per-chromosome table with n_tested / n_significant_observed columns."""
+    total_tested = merged["n_tested"].sum()
+    total_sig = merged["n_significant_observed"].sum()
+    if total_tested == 0:
+        merged["expected"] = 0.0
+        merged["binom_p"] = 1.0
+        merged["binom_p_adj"] = 1.0
+        return merged
+
+    merged["expected"] = merged["n_tested"] * (total_sig / total_tested)
+    p_global = total_sig / total_tested
+    binom_pvals = []
+    for _, row in merged.iterrows():
+        n, k = int(row["n_tested"]), int(row["n_significant_observed"])
+        if n <= 0:
+            binom_pvals.append(1.0)
+            continue
+        try:
+            binom_pvals.append(binomtest(k, n, p_global).pvalue)
+        except ValueError:
+            binom_pvals.append(1.0)
+    merged["binom_p"] = binom_pvals
+    try:
+        _, p_adj, _, _ = multipletests(merged["binom_p"].fillna(1.0).values, method="fdr_bh")
+        merged["binom_p_adj"] = p_adj
+    except ValueError:
+        merged["binom_p_adj"] = merged["binom_p"]
+    return merged
+
+
+def _draw_chrom_bars(ax, merged: pd.DataFrame, title: str) -> None:
+    """Draw one observed-vs-expected-per-chromosome panel on `ax`.
+    Chromosomes with 0 observed significant variants still get a (zero-height)
+    bar. Chromosomes that DO have significant variants get a red star over the
+    observed bar plus a short label naming the variant(s)."""
+    if merged.empty:
+        ax.text(0.5, 0.5, "No tested variants", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+        return
+
+    x_labels = merged["chromosome"].astype(str)
+    xi = range(len(merged))
+    bar_w = 0.4
+
+    ax.bar([i - bar_w / 2 for i in xi], merged["n_significant_observed"], width=bar_w,
+           label="Observed", color="#4472C4")
+    ax.bar([i + bar_w / 2 for i in xi], merged["expected"], width=bar_w,
+           label="Expected", color="#ED7D31", alpha=0.85)
+    ax.set_xticks(list(xi))
+    ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Count", fontsize=9)
+    ax.set_title(title, fontsize=10)
+    ax.legend(fontsize=7)
+    ax.set_ylim(bottom=0)
+
+    has_annotation = False
+    for i, (_, row) in enumerate(merged.iterrows()):
+        sig_variants = row.get("sig_variants") or []
+        if not sig_variants:
+            continue
+        has_annotation = True
+        top = max(row["n_significant_observed"], row["expected"])
+        ax.plot(i - bar_w / 2, row["n_significant_observed"], marker="*", color="#C00000", markersize=9, zorder=5)
+        ax.text(i, top + max(0.3, 0.05 * (top or 1)), _sig_annotation_text(sig_variants),
+                ha="center", va="bottom", fontsize=6, color="#C00000", rotation=90)
+
+    if has_annotation:
+        # Rotated text extends well above its anchor point and isn't picked
+        # up by matplotlib's autoscale, so reserve extra headroom manually.
+        _, top_ylim = ax.get_ylim()
+        ax.set_ylim(top=top_ylim * 1.6 + 0.5)
+
+
+def compute_chromosome_enrichment_global(
     df: pd.DataFrame,
-    tested_counts: Dict[str, int],
+    tested_df: pd.DataFrame,
     alpha: float = SIG_ALPHA_DEFAULT,
     out_dir: Path = OUT_DIR,
 ):
     """
-    Enrichment of significant variants *per exposure* (gene), using
-    `tested_counts` (exposure -> n_tested_variants) as the null baseline.
+    Observed vs. expected significant variants *per chromosome*, pooling all
+    exposures together. `tested_df` (exposure, chromosome, n_tested) is summed
+    across exposure to get the total number of variants ever tested on each
+    chromosome -- that's the baseline "expected" is proportional to.
 
-    Handles exposures with 0 observed significant variants (and, symmetrically,
-    exposures present in `tested_counts` but absent from `df`) without raising:
-    they simply enter the table with n_significant_observed = 0.
-
-    Returns (merged_df, summary_dict). If there is no usable data at all,
-    returns an empty DataFrame and a summary noting that, and still writes a
-    placeholder figure instead of crashing the pipeline.
+    Chromosomes with zero significant hits still appear (zero-height bar).
+    Bars with at least one significant variant are starred and labelled with
+    the variant(s) responsible.
     """
-    fig_path = out_dir / "figures" / "significant_by_exposure.png"
-    stats_path = out_dir / "table2_exposure_enrichment_stats.csv"
+    fig_path = out_dir / "figures" / "observed_vs_expected_by_chromosome.png"
+    stats_path = out_dir / "table2_chromosome_enrichment_stats.csv"
 
-    if not tested_counts:
-        print("[warn] tested_counts is empty -- skipping exposure enrichment stats.", file=sys.stderr)
+    if tested_df.empty:
+        print("[warn] no tested-variant counts -- skipping chromosome enrichment stats.", file=sys.stderr)
         _empty_placeholder_figure(fig_path, "No tested-variant counts available")
-        empty = pd.DataFrame(columns=["exposure", "n_tested", "n_significant_observed",
-                                       "expected", "ratio_obs_exp", "binom_p", "binom_p_adj",
-                                       "binom_reject_bh05"])
+        empty = pd.DataFrame(columns=["chromosome", "n_tested", "n_significant_observed",
+                                       "expected", "binom_p", "binom_p_adj", "sig_variants"])
         empty.to_csv(stats_path, index=False)
-        return empty, {"total_tested": 0, "total_significant": 0, "chi2_stat": None,
-                        "chi2_p": None, "per_exposure_csv": str(stats_path), "figure": str(fig_path)}
+        return empty, {"total_tested": 0, "total_significant": 0, "chi2_stat": None, "chi2_p": None,
+                        "per_chromosome_csv": str(stats_path), "figure": str(fig_path)}
+
+    tested_by_chrom = tested_df.groupby("chromosome", as_index=False)["n_tested"].sum()
 
     df = df.copy()
+    df["chromosome"] = df["variant"].apply(lambda v: extract_chromosome(v) if pd.notna(v) else "NA")
     df["empirical_p_g1_num"] = pd.to_numeric(df.get("empirical_p_g1", pd.Series(dtype=float)), errors="coerce")
     df["is_sig_raw"] = df["empirical_p_g1_num"] < alpha
 
-    obs_counts = (
-        df.loc[df["is_sig_raw"]]
-        .groupby("exposure")["variant"]
-        .nunique()
-        .rename("n_significant_observed")
-        .reset_index()
-    )
+    sig_df = df.loc[df["is_sig_raw"]]
+    obs_counts = sig_df.groupby("chromosome")["variant"].nunique().rename("n_significant_observed").reset_index()
+    sig_lists = sig_df.groupby("chromosome")["variant"].apply(list).rename("sig_variants").reset_index()
 
-    tested_df = pd.DataFrame(
-        [{"exposure": k, "n_tested": int(v)} for k, v in tested_counts.items()]
-    )
-
-    # Outer merge so exposures with 0 significant variants (present only in
-    # tested_counts) AND exposures with hits but no DB tested-count entry
-    # both survive, with the missing side filled as 0.
-    merged = tested_df.merge(obs_counts, on="exposure", how="outer").fillna(0)
+    merged = tested_by_chrom.merge(obs_counts, on="chromosome", how="left")
+    merged = merged.merge(sig_lists, on="chromosome", how="left")
+    merged["n_significant_observed"] = merged["n_significant_observed"].fillna(0).astype(int)
+    merged["sig_variants"] = merged["sig_variants"].apply(lambda v: v if isinstance(v, list) else [])
     merged["n_tested"] = merged["n_tested"].astype(int)
-    merged["n_significant_observed"] = merged["n_significant_observed"].astype(int)
 
-    total_tested = merged["n_tested"].sum()
-    total_sig = merged["n_significant_observed"].sum()
+    total_tested = int(merged["n_tested"].sum())
+    total_sig = int(merged["n_significant_observed"].sum())
 
     if total_tested == 0:
         print("[warn] total tested variants is zero -- skipping enrichment stats.", file=sys.stderr)
         _empty_placeholder_figure(fig_path, "No tested variants for this generation")
         merged.to_csv(stats_path, index=False)
-        return merged, {"total_tested": 0, "total_significant": int(total_sig), "chi2_stat": None,
-                         "chi2_p": None, "per_exposure_csv": str(stats_path), "figure": str(fig_path)}
+        return merged, {"total_tested": 0, "total_significant": total_sig, "chi2_stat": None, "chi2_p": None,
+                         "per_chromosome_csv": str(stats_path), "figure": str(fig_path)}
 
-    merged["expected"] = merged["n_tested"] * (total_sig / total_tested)
-    merged["ratio_obs_exp"] = merged.apply(
-        lambda r: (r["n_significant_observed"] / r["expected"]) if r["expected"] > 0 else float("nan"),
-        axis=1,
-    )
+    merged = _add_binomial_enrichment_stats(merged)
 
     mask_nonzero = merged["expected"] > 0
     chi2_stat, chi2_p = None, None
@@ -534,80 +648,118 @@ def compute_enrichment_stats_by_exposure(
         )
         chi2_stat, chi2_p = float(chi2_res.statistic), float(chi2_res.pvalue)
 
-    p_global = total_sig / total_tested if total_tested > 0 else 0.0
-    binom_pvals = []
-    for _, row in merged.iterrows():
-        n, k = int(row["n_tested"]), int(row["n_significant_observed"])
-        if n <= 0:
-            binom_pvals.append(1.0)
-            continue
-        try:
-            binom_pvals.append(binomtest(k, n, p_global).pvalue)
-        except (ValueError, Exception):
-            binom_pvals.append(1.0)
-    merged["binom_p"] = binom_pvals
-
-    try:
-        rej, p_adj, _, _ = multipletests(merged["binom_p"].fillna(1.0).values, method="fdr_bh")
-        merged["binom_p_adj"] = p_adj
-        merged["binom_reject_bh05"] = rej
-    except ValueError:
-        merged["binom_p_adj"] = merged["binom_p"]
-        merged["binom_reject_bh05"] = False
-
-    merged = merged.sort_values(by="n_significant_observed", ascending=False)
+    merged = merged.sort_values(by="chromosome", key=lambda s: s.map(_chrom_sort_key))
     merged.to_csv(stats_path, index=False)
 
-    _plot_significant_by_exposure(merged, fig_path, total_tested)
+    plt.figure(figsize=(max(8, 0.5 * len(merged)), 6))
+    ax = plt.gca()
+    _draw_chrom_bars(ax, merged, title="Observed vs expected significant variants per chromosome (all exposures)")
+    plt.tight_layout()
+    plt.savefig(fig_path, dpi=300)
+    plt.close()
 
     summary = {
-        "total_tested": int(total_tested),
-        "total_significant": int(total_sig),
+        "total_tested": total_tested,
+        "total_significant": total_sig,
         "chi2_stat": chi2_stat,
         "chi2_p": chi2_p,
-        "per_exposure_csv": str(stats_path),
+        "per_chromosome_csv": str(stats_path),
         "figure": str(fig_path),
     }
     return merged, summary
 
 
-def _plot_significant_by_exposure(merged: pd.DataFrame, fig_path: Path, total_tested: int) -> None:
-    """One chart, one group of bars per exposure (observed vs expected).
-    Exposures with 0 significant variants simply render as a zero-height bar
-    instead of being dropped or raising an error.
+def compute_chromosome_enrichment_by_exposure(
+    df: pd.DataFrame,
+    tested_df: pd.DataFrame,
+    alpha: float = SIG_ALPHA_DEFAULT,
+    out_dir: Path = OUT_DIR,
+):
     """
-    if merged.empty:
-        _empty_placeholder_figure(fig_path, "No exposures to plot")
-        return
+    Same idea as `compute_chromosome_enrichment_global`, but computed
+    separately for each exposure (its own tested-per-chromosome baseline, its
+    own observed significant variants), and rendered as one grid figure with
+    one panel per exposure. Exposures with no tested-variant rows for this
+    generation are skipped (nothing to compare against); exposures with
+    tested variants but zero significant hits still get a panel, with every
+    bar at zero height.
+    """
+    fig_path = out_dir / "figures" / "observed_vs_expected_by_chromosome_per_exposure.png"
+    stats_path = out_dir / "table2_chromosome_enrichment_by_exposure_stats.csv"
 
-    n_exposures = len(merged)
-    fig_width = max(8, min(0.5 * n_exposures, 30))  # scale width, cap it so huge N doesn't explode the image
-    plt.figure(figsize=(fig_width, 6))
+    if tested_df.empty:
+        print("[warn] no tested-variant counts -- skipping per-exposure chromosome enrichment.", file=sys.stderr)
+        _empty_placeholder_figure(fig_path, "No tested-variant counts available")
+        empty = pd.DataFrame(columns=["exposure", "chromosome", "n_tested", "n_significant_observed",
+                                       "expected", "binom_p", "binom_p_adj", "sig_variants"])
+        empty.to_csv(stats_path, index=False)
+        return empty, {"n_exposures_plotted": 0, "per_exposure_csv": str(stats_path), "figure": str(fig_path)}
 
-    x_labels = merged["exposure"].astype(str)
-    xi = range(n_exposures)
-    obs_vals = merged["n_significant_observed"]
-    exp_vals = merged["expected"]
-    bar_w = 0.4
+    df = df.copy()
+    df["chromosome"] = df["variant"].apply(lambda v: extract_chromosome(v) if pd.notna(v) else "NA")
+    df["empirical_p_g1_num"] = pd.to_numeric(df.get("empirical_p_g1", pd.Series(dtype=float)), errors="coerce")
+    df["is_sig_raw"] = df["empirical_p_g1_num"] < alpha
 
-    plt.bar([i - bar_w / 2 for i in xi], obs_vals, width=bar_w, label="Observed significant", color="#4472C4")
-    plt.bar([i + bar_w / 2 for i in xi], exp_vals, width=bar_w, label="Expected (proportional to tested)",
-             color="#ED7D31", alpha=0.85)
-    plt.xticks(list(xi), x_labels, rotation=90 if n_exposures > 15 else 45, ha="right")
-    plt.ylabel("Count")
-    plt.title("Observed vs expected significant variants per exposure")
-    plt.legend()
+    exposures = sorted(set(tested_df["exposure"].unique()) | set(df["exposure"].dropna().unique()))
 
-    for i, (_, row) in enumerate(merged.iterrows()):
-        p_adj = row.get("binom_p_adj")
-        if pd.notna(p_adj):
-            top = max(row["n_significant_observed"], row["expected"])
-            plt.text(i, top + max(0.5, 0.01 * total_tested), f"p_adj={p_adj:.1e}",
-                      ha="center", va="bottom", fontsize=7, rotation=90)
+    per_exposure_tables = {}
+    all_rows = []
+    for exposure in exposures:
+        t_sub = tested_df.loc[tested_df["exposure"] == exposure, ["chromosome", "n_tested"]]
+        if t_sub.empty:
+            # No tested-variant baseline for this exposure/generation -> can't
+            # compute an "expected" count, so skip rather than guess.
+            continue
 
-    plt.tight_layout()
-    plt.savefig(fig_path, dpi=300)
-    plt.close()
+        df_sub = df.loc[df["exposure"] == exposure]
+        sig_sub = df_sub.loc[df_sub["is_sig_raw"]]
+        obs = sig_sub.groupby("chromosome")["variant"].nunique().rename("n_significant_observed").reset_index()
+        sig_lists = sig_sub.groupby("chromosome")["variant"].apply(list).rename("sig_variants").reset_index()
+
+        merged = t_sub.merge(obs, on="chromosome", how="left").merge(sig_lists, on="chromosome", how="left")
+        merged["n_significant_observed"] = merged["n_significant_observed"].fillna(0).astype(int)
+        merged["sig_variants"] = merged["sig_variants"].apply(lambda v: v if isinstance(v, list) else [])
+        merged["n_tested"] = merged["n_tested"].astype(int)
+
+        merged = _add_binomial_enrichment_stats(merged)
+        merged = merged.sort_values(by="chromosome", key=lambda s: s.map(_chrom_sort_key))
+        merged["exposure"] = exposure
+
+        per_exposure_tables[exposure] = merged
+        all_rows.append(merged)
+
+    if not all_rows:
+        print("[warn] no exposure had tested-variant rows -- skipping per-exposure chromosome enrichment.", file=sys.stderr)
+        _empty_placeholder_figure(fig_path, "No exposures with tested-variant data")
+        empty = pd.DataFrame(columns=["exposure", "chromosome", "n_tested", "n_significant_observed",
+                                       "expected", "binom_p", "binom_p_adj", "sig_variants"])
+        empty.to_csv(stats_path, index=False)
+        return empty, {"n_exposures_plotted": 0, "per_exposure_csv": str(stats_path), "figure": str(fig_path)}
+
+    combined = pd.concat(all_rows, ignore_index=True)
+    combined.to_csv(stats_path, index=False)
+
+    n = len(per_exposure_tables)
+    ncols = min(3, n)
+    nrows = -(-n // ncols)  # ceil
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.6 * nrows), squeeze=False)
+    for idx, (exposure, merged) in enumerate(per_exposure_tables.items()):
+        r, c = divmod(idx, ncols)
+        _draw_chrom_bars(axes[r][c], merged, title=str(exposure))
+    for idx in range(n, nrows * ncols):
+        r, c = divmod(idx, ncols)
+        axes[r][c].axis("off")
+    fig.suptitle("Observed vs expected significant variants per chromosome, by exposure", fontsize=12)
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
+    plt.savefig(fig_path, dpi=200)
+    plt.close(fig)
+
+    summary = {
+        "n_exposures_plotted": n,
+        "per_exposure_csv": str(stats_path),
+        "figure": str(fig_path),
+    }
+    return combined, summary
 
 
 # ---------------------------------------------------------------------------
@@ -637,11 +789,17 @@ def main():
 
     make_figures(df)
 
-    tested_counts = fetch_tested_variant_counts_by_exposure(get_connection, cursor_scope, args.generation)
-    exposure_stats_df, exposure_summary = compute_enrichment_stats_by_exposure(
-        df, tested_counts, alpha=args.alpha, out_dir=OUT_DIR
+    tested_df = fetch_tested_variant_counts_by_exposure_and_chromosome(get_connection, cursor_scope, args.generation)
+
+    chrom_stats_df, chrom_summary = compute_chromosome_enrichment_global(
+        df, tested_df, alpha=args.alpha, out_dir=OUT_DIR
     )
-    print("Exposure enrichment summary:", exposure_summary)
+    print("Chromosome enrichment summary (all exposures):", chrom_summary)
+
+    chrom_by_exposure_df, chrom_by_exposure_summary = compute_chromosome_enrichment_by_exposure(
+        df, tested_df, alpha=args.alpha, out_dir=OUT_DIR
+    )
+    print("Chromosome enrichment summary (by exposure):", chrom_by_exposure_summary)
 
     # --- Table 2 (top 10) ---
     doc_top10 = Document()
@@ -671,9 +829,13 @@ def main():
                        "Figure 2. Genes vs variants per chromosome.")
     add_figure_to_doc(doc_full, FIG_DIR / "empirical_p_g1_histogram.png",
                        "Figure 3. Distribution of empirical_p_g1.")
-    add_figure_to_doc(doc_full, FIG_DIR / "significant_by_exposure.png",
-                       "Figure 4. Observed vs expected significant variants per exposure "
-                       f"(generation {args.generation}).")
+    add_figure_to_doc(doc_full, FIG_DIR / "observed_vs_expected_by_chromosome.png",
+                       "Figure 4. Observed vs expected significant variants per chromosome, all exposures pooled "
+                       f"(generation {args.generation}). Starred bars mark chromosomes with at least one "
+                       "significant variant; the label names it.")
+    add_figure_to_doc(doc_full, FIG_DIR / "observed_vs_expected_by_chromosome_per_exposure.png",
+                       "Figure 5. Observed vs expected significant variants per chromosome, one panel per exposure "
+                       f"(generation {args.generation}).", width_in=6.5)
 
     full_path = OUT_DIR / "Table2_full_supplementary.docx"
     doc_full.save(full_path)
@@ -682,7 +844,8 @@ def main():
     print(f"Top 10 Word: {top10_path}")
     print(f"Full supplementary Word: {full_path}")
     print(f"Figures saved in: {FIG_DIR}")
-    print(f"Per-exposure enrichment CSV: {exposure_summary['per_exposure_csv']}")
+    print(f"Chromosome enrichment CSV (pooled): {chrom_summary['per_chromosome_csv']}")
+    print(f"Chromosome enrichment CSV (by exposure): {chrom_by_exposure_summary['per_exposure_csv']}")
 
 
 if __name__ == "__main__":
