@@ -37,6 +37,8 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from scipy.stats import chisquare, binomtest
+from statsmodels.stats.multitest import multipletests
 
 
 # Output directories
@@ -386,23 +388,14 @@ def make_figures(df: pd.DataFrame):
 
 def main():
     # Import connection helpers here to avoid potential import-time circular issues
-    try:
-        from gene_environment.db.connection import get_connection, cursor_scope
-    except Exception as e:
-        raise ImportError(
-            "Could not import get_connection and cursor_scope from gene_environment.db.connection. "
-            "Ensure the package is importable and you run the script from the project root with: "
-            "python3 -m gene_environment.report.generate_table2"
-        ) from e
+    from gene_environment.db.connection import get_connection, cursor_scope
+
 
     # 1) Call the astore and load results
     print(f"Calling stored routine: {ASTORE_NAME}() ...")
     df = call_stored_routine_to_df(ASTORE_NAME, get_connection, cursor_scope)
-
-    # 2) Drop gna.* columns if present
     df = drop_gna_columns(df)
 
-    # 3) Ensure expected columns exist
     for c in TABLE_COLUMNS:
         if c not in df.columns:
             df[c] = pd.NA
@@ -435,10 +428,174 @@ def main():
     full_path = OUT_DIR / "Table2_full_supplementary.docx"
     doc_full.save(full_path)
 
+    # fetch tested counts for the exposure/generation of interest
+    exposure_name = "risaie_1500"
+    generation_number = 2
+    tested_counts = fetch_tested_variant_counts(get_connection, cursor_scope, exposure_name, generation_number)
+
+    # compute enrichment using tested counts
+    chrom_stats_df, chrom_summary = compute_enrichment_stats_using_tested(df, tested_counts, alpha=0.05, out_dir=OUT_DIR)
+    print("Chromosome enrichment summary:", chrom_summary)
+
     print("Done.")
     print(f"Top 10 Word: {top10_path}")
     print(f"Full supplementary Word: {full_path}")
     print(f"Figures saved in: {FIG_DIR}")
+
+def fetch_tested_variant_counts(get_connection, cursor_scope, exposure: str, generation: int) -> dict:
+    """
+    Return a dict chromosome -> n_tested_variants using the provided store:
+    SELECT chromosome, count(*) as c
+    FROM variant_results
+    WHERE exposure = <exposure> AND generation = <generation>
+    GROUP BY chromosome
+
+    Returns an empty dict if no rows.
+    """
+    sql = (
+        "SELECT chromosome, COUNT(*) AS c "
+        "FROM variant_results "
+        "WHERE exposure = %s AND generation = %s "
+        "GROUP BY chromosome"
+    )
+    counts = {}
+    with get_connection() as conn:
+        with cursor_scope(conn, dictionary=True) as cur:
+            cur.execute(sql, (exposure, generation))
+            rows = cur.fetchall()
+            for r in rows:
+                # r expected like {'chromosome': '1', 'c': 123}
+                chrom = r.get("chromosome")
+                cnt = r.get("c", 0)
+                # normalize chromosome string same way as extract_chromosome
+                if chrom is None:
+                    continue
+                chrom_norm = str(chrom).lower().lstrip("chr")
+                if chrom_norm.isalpha():
+                    chrom_norm = chrom_norm.upper()
+                counts[chrom_norm] = int(cnt)
+    return counts
+
+
+def compute_enrichment_stats_using_tested(df: pd.DataFrame,
+                                         tested_counts: dict,
+                                         alpha: float = 0.05,
+                                         out_dir: Path = OUT_DIR):
+    """
+    Compute enrichment using tested_counts (chromosome -> n_tested_variants)
+    - df: DataFrame with at least 'variant' and 'empirical_p_g1'
+    - tested_counts: dict mapping chromosome -> number of variants tested (from variant_results)
+    Returns (merged_df, summary_dict)
+    """
+    # prepare df
+    df = df.copy()
+    df["chromosome"] = df["variant"].apply(lambda v: extract_chromosome(v) if pd.notna(v) else "NA")
+    df["empirical_p_g1_num"] = pd.to_numeric(df.get("empirical_p_g1", pd.Series(dtype=float)), errors="coerce")
+    df["is_sig_raw"] = df["empirical_p_g1_num"] < alpha
+
+    # observed counts (unique variants tested in the resultset per chromosome)
+    obs_counts = df.groupby("chromosome")["variant"].nunique().rename("n_significant_observed").reset_index()
+    # tested_counts may include chromosomes not present in df; build base table
+    tested_df = pd.DataFrame([
+        {"chromosome": k, "n_tested": int(v)}
+        for k, v in tested_counts.items()
+    ])
+    if tested_df.empty:
+        raise RuntimeError("tested_counts is empty. Ensure the store returned counts for the given exposure/generation.")
+
+    # merge tested and observed (observed may be zero for some chroms)
+    merged = tested_df.merge(obs_counts, on="chromosome", how="left").fillna(0)
+    merged["n_tested"] = merged["n_tested"].astype(int)
+    merged["n_significant_observed"] = merged["n_significant_observed"].astype(int)
+
+    # total tested and total observed significant
+    total_tested = merged["n_tested"].sum()
+    total_sig = merged["n_significant_observed"].sum()
+    if total_tested == 0:
+        raise RuntimeError("Total tested variants is zero; cannot compute expectations.")
+
+    # expected under null: proportional to tested counts
+    merged["expected"] = merged["n_tested"] * (total_sig / total_tested)
+    merged["ratio_obs_exp"] = merged.apply(lambda r: (r["n_significant_observed"] / r["expected"]) if r["expected"] > 0 else float("nan"), axis=1)
+
+    # chi-square goodness-of-fit (exclude zero-expected bins)
+    mask_nonzero = merged["expected"] > 0
+    chi2_stat, chi2_p = (None, None)
+    if mask_nonzero.sum() >= 2:
+        chi2_res = chisquare(f_obs=merged.loc[mask_nonzero, "n_significant_observed"].values,
+                             f_exp=merged.loc[mask_nonzero, "expected"].values)
+        chi2_stat, chi2_p = float(chi2_res.statistic), float(chi2_res.pvalue)
+
+    # per-chromosome binomial tests (two-sided)
+    p_global = total_sig / total_tested
+    binom_pvals = []
+    for _, row in merged.iterrows():
+        n = int(row["n_tested"])
+        k = int(row["n_significant_observed"])
+        if n <= 0:
+            binom_pvals.append(1.0)
+            continue
+        try:
+            bt = binomtest(k, n, p_global)
+            binom_pvals.append(bt.pvalue)
+        except Exception:
+            binom_pvals.append(1.0)
+    merged["binom_p"] = binom_pvals
+
+    # BH correction
+    try:
+        rej, p_adj, _, _ = multipletests(merged["binom_p"].fillna(1.0).values, method="fdr_bh")
+        merged["binom_p_adj"] = p_adj
+        merged["binom_reject_bh05"] = rej
+    except Exception:
+        merged["binom_p_adj"] = merged["binom_p"]
+        merged["binom_reject_bh05"] = False
+
+    # sort chromosomes sensibly (numeric first)
+    def chrom_key(x):
+        try:
+            return (0, int(x))
+        except Exception:
+            return (1, x)
+    merged = merged.sort_values(by="chromosome", key=lambda s: s.map(chrom_key))
+
+    # save CSV and figure
+    stats_path = out_dir / "table2_chromosome_enrichment_stats_tested.csv"
+    merged.to_csv(stats_path, index=False)
+
+    # figure: observed vs expected
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 6))
+    x = merged["chromosome"].astype(str)
+    xi = range(len(x))
+    obs_vals = merged["n_significant_observed"]
+    exp_vals = merged["expected"]
+    bar_w = 0.4
+    plt.bar([i - bar_w/2 for i in xi], obs_vals, width=bar_w, label="Observed significant", color="C0")
+    plt.bar([i + bar_w/2 for i in xi], exp_vals, width=bar_w, label="Expected (proportional to tested)", color="C1", alpha=0.8)
+    plt.xticks(xi, x, rotation=45)
+    plt.ylabel("Count")
+    plt.title("Observed vs Expected significant variants per chromosome (tested-based expectation)")
+    plt.legend()
+    for i, (_, row) in enumerate(merged.iterrows()):
+        p_adj = row.get("binom_p_adj", None)
+        if p_adj is not None:
+            plt.text(i, max(row["n_significant_observed"], row["expected"]) + max(1, 0.01 * total_tested),
+                     f"p_adj={p_adj:.1e}", ha="center", va="bottom", fontsize=8, rotation=90)
+    fig_path = out_dir / "figures/observed_vs_expected_tested.png"
+    plt.tight_layout()
+    plt.savefig(fig_path, dpi=300)
+    plt.close()
+
+    summary = {
+        "total_tested": int(total_tested),
+        "total_significant": int(total_sig),
+        "chi2_stat": chi2_stat,
+        "chi2_p": chi2_p,
+        "per_chromosome_csv": str(stats_path),
+        "figure": str(fig_path),
+    }
+    return merged, summary
 
 
 if __name__ == "__main__":
