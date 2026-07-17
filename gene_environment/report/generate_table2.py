@@ -37,21 +37,7 @@ import seaborn as sns
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-
-# Import the connection helpers provided by your project.
-# Adjust the import path if db.py is in a different package/module.
-# Example: from gene_environment.db import get_connection, cursor_scope
-try:
-    from db import get_connection, cursor_scope
-except Exception:
-    # Try alternative import path if the project uses a package
-    try:
-        from gene_environment.db import get_connection, cursor_scope
-    except Exception as e:
-        raise ImportError(
-            "Could not import get_connection and cursor_scope. "
-            "Ensure db.py (or gene_environment.db) is on PYTHONPATH and exposes these names."
-        ) from e
+from gene_environment.db.connection import get_connection, cursor_scope
 
 # -------------------------
 # SQL exactly as provided
