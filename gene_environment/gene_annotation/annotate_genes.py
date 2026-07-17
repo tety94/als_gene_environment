@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+from gene_environment.apis.ctd_api import CTDAPI
 from gene_environment.config import get_config
 from gene_environment.db.connection import get_connection
 from gene_environment.db.repository import (
@@ -95,6 +96,7 @@ def _annotate_one_gene(gene: str) -> tuple[str, bool, str | None]:
 def run_annotate_gene_neuro_info() -> None:
     cfg = get_config()
     configure_logging(cfg.log_dir)
+
 
     genes = get_genes_to_annotate()
     log.info("Geni da annotare: %d", len(genes))
