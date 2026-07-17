@@ -14,22 +14,63 @@ set -euo pipefail
 # nell'ambiente conda "geneenv" che usi per gene_environment_v2 -- verifica
 # con: which plink2 bcftools
 #
-# NOVITA' rispetto alla versione precedente:
-#   - Step 1 (filtro + conversione pgen per batch/cromosoma) e' ora
-#     parallelizzato su fino a 16 worker con xargs -P, invece di essere
-#     sequenziale. Step 2-5 restano sequenziali perche' operano sul merge
-#     completo e non sono parallelizzabili in modo banale.
-#   - Tutto l'output (stdout+stderr) viene sia mostrato a schermo sia
-#     salvato su $OUT_DIR/logs/pipeline.log (via tee).
-#   - Ogni job di Step 1 scrive anche il proprio log dedicato in
-#     $OUT_DIR/logs/step1_<batch>_chr<N>.log, cosi' se qualcosa fallisce in
-#     parallelo sai subito quale batch/cromosoma e' stato.
+# NOTA SULLA STRUTTURA (IMPORTANTE, letta dopo un errore reale in produzione):
+#   plink2 --pmerge-list gestisce bene UN SOLO tipo di merge alla volta:
+#   o fondere campioni (stessi varianti, sample diversi) o concatenare
+#   (stessi campioni, varianti diverse). Qui abbiamo ENTRAMBE le cose
+#   insieme (3 batch = sample diversi, 22 cromosomi = varianti diverse),
+#   e quella combinazione da' "Error: Non-concatenating --pmerge[-list] is
+#   under development." -- una limitazione nota di plink2, non un bug
+#   nei tuoi dati.
+#
+#   Per questo tutto il merge (sia tra batch che tra cromosomi) viene fatto
+#   in bcftools, che gestisce nativamente entrambi i casi, e si converte
+#   in pgen UNA SOLA VOLTA alla fine, sul VCF genome-wide gia' completo:
+#     Step 1: filtro (se serve) + indicizzazione per batch x cromosoma
+#     Step 2: bcftools merge tra i batch, per ciascun cromosoma (parallelo)
+#     Step 3: bcftools concat dei 22 cromosomi -> un VCF genome-wide
+#     Step 4: UNA conversione plink2 --vcf ... --make-pgen
+#     Step 5: LD pruning
+#     Step 6: relatedness (KING)
+#     Step 7: PCA
+#
+# NOVITA' rispetto alla prima versione:
+#   - Step 1 e Step 2 sono parallelizzati con xargs -P (fino a 16 worker).
+#   - Tutto l'output (stdout+stderr) va sia a schermo sia su
+#     $OUT_DIR/logs/pipeline.log (via tee).
+#   - Ogni job di Step 1 e Step 2 scrive il proprio log dedicato in
+#     $OUT_DIR/logs/, cosi' un fallimento in parallelo e' facile da tracciare.
+#
+# RESUME (riprendi da dove eri rimasto): OGNI step, prima di eseguire,
+# controlla se il proprio output finale esiste gia' e in caso affermativo
+# lo SALTA (loggando "[skip, gia' presente]"), invece di rifarlo. Vale sia
+# per i singoli job paralleli di Step 1/2 (un batch/cromosoma o un
+# cromosoma gia' completato non viene rifatto) sia per gli step
+# sequenziali 3-7. Se rilanci lo script dopo un'interruzione (crash,
+# server riavviato, Ctrl-C), riparte automaticamente dal primo output
+# mancante. Usa --force per ignorare tutto questo e rifare comunque tutto
+# da zero.
+#
+# NOTA: il controllo di "esistenza" si basa sulla presenza del file di
+# output finale + relativo indice/companion file (es. .vcf.gz + .tbi, o
+# .pgen + .pvar + .psam), NON su un controllo di integrita' del contenuto.
+# Se uno step si interrompe A META' scrittura (es. kill -9 nel mezzo di un
+# bcftools merge), il file puo' esistere ma essere troncato/corrotto senza
+# che il resume se ne accorga. In quel caso usa --force, o cancella a mano
+# l'output sospetto prima di rilanciare.
 #
 # USO:
-#   ./00_run_plink_qc.sh [--use-filtered] [--jobs N] <dir_vcf_1> [<dir_vcf_2> ...] <out_dir>
+#   ./00_run_plink_qc.sh [--use-filtered] [--jobs N] [--force] <dir_vcf_1> [<dir_vcf_2> ...] <out_dir>
 #
-# --use-filtered: vedi sotto (invariato rispetto a prima).
-# --jobs N: numero di worker paralleli per lo Step 1 (default 16).
+# --use-filtered: se presente, lo script cerca *_filtered.vcf.gz dentro una
+#   sottocartella vcf_filtered/ di ciascuna directory data in input e SALTA
+#   lo step di bcftools view -m2 -M2 --min-af, assumendo che il filtro sia
+#   gia' stato applicato a monte da gene_environment_v2. Usalo SOLO dopo
+#   aver verificato che il filtro a monte includa gia' bialleliche + una
+#   soglia MAF ragionevole.
+# --jobs N: numero di worker paralleli per Step 1 e Step 2 (default 16).
+# --force: ignora tutti gli output gia' presenti e rifa' l'intera pipeline
+#   da zero, sovrascrivendo.
 #
 # Esempio con i tuoi 3 batch, VCF gia' filtrati, 16 worker:
 #   ./00_run_plink_qc.sh --use-filtered --jobs 16 \
@@ -38,24 +79,29 @@ set -euo pipefail
 #       /mnt/cresla_prod/genome_datasets/gen3 \
 #       /mnt/cresla_prod/genome_datasets/qc_output
 #
-# NOTA IMPORTANTE: se lo stesso paziente compare in piu' di un batch
-# (gen1/gen2/gen3), plink2 ti dara' un ERRORE di sample ID duplicati in
-# fase di merge, oppure -- se gli ID sono stati resi unici a valle -- il
-# controllo di relatedness qui sotto lo trovera' come kinship ~0.5 (falso
-# "gemello monozigote"). In entrambi i casi, PRIMA di procedere controlla
-# se gli ID campione si sovrappongono tra batch (fatto automaticamente
-# nello Step 0 qui sotto).
+# NOTA IMPORTANTE: se lo stesso paziente compare in piu' di un batch,
+# plink2/il merge dara' problemi (ID duplicati, o falsi "gemelli" nel
+# kinship se gli ID sono stati resi unici a valle). Lo Step 0 controlla
+# automaticamente la sovrapposizione tra gli ID campione tra i batch.
 #
-# NOTA SUL PARALLELISMO: attenzione a I/O e RAM. Ogni worker di Step 1
-# lancia bcftools view + plink2 su un VCF per cromosoma: con 16 worker
-# in parallelo il carico su disco (specialmente se /mnt/cresla_prod/ e'
-# uno storage di rete condiviso) puo' diventare il collo di bottiglia
-# reale, non la CPU. Se noti I/O wait altissimo o il server rallenta per
-# altri utenti, abbassa --jobs (es. 8).
+# NOTA SUL MERGE TRA BATCH: bcftools merge fa l'unione dei siti tra i
+# batch; un campione che non ha genotipo in un sito presente solo in un
+# altro batch viene riempito come mancante (./.) invece di essere escluso.
+# Con soglie MAF diverse o pipeline di chiamata leggermente diverse tra
+# batch questo puo' introdurre missingness non banale in alcuni siti. Il
+# filtro MAF >= 0.05 riapplicato allo Step 5 (dopo il merge) aiuta ma non
+# elimina la missingness sito-per-sito; se PCA/kinship sembrano strani,
+# vale la pena controllare $OUT_DIR/merged_all.log per il tasso di
+# missing genotype rate.
+#
+# NOTA SUL PARALLELISMO: attenzione a I/O. Con storage di rete condiviso
+# (es. /mnt/cresla_prod/), 16 worker in parallelo possono saturare il
+# disco prima della CPU. Se il server rallenta, abbassa --jobs (es. 8).
 # ============================================================================
 
 USE_FILTERED=0
 JOBS=16
+FORCE=0
 POSITIONAL=()
 
 while [ "$#" -gt 0 ]; do
@@ -68,6 +114,10 @@ while [ "$#" -gt 0 ]; do
             JOBS="$2"
             shift 2
             ;;
+        --force)
+            FORCE=1
+            shift
+            ;;
         *)
             POSITIONAL+=("$1")
             shift
@@ -77,7 +127,7 @@ done
 set -- "${POSITIONAL[@]}"
 
 if [ "$#" -lt 2 ]; then
-    echo "Uso: $0 [--use-filtered] [--jobs N] <dir_vcf_1> [<dir_vcf_2> ...] <out_dir>"
+    echo "Uso: $0 [--use-filtered] [--jobs N] [--force] <dir_vcf_1> [<dir_vcf_2> ...] <out_dir>"
     exit 1
 fi
 
@@ -85,7 +135,7 @@ ARGS=("$@")
 OUT_DIR="${ARGS[-1]}"
 VCF_DIRS=("${ARGS[@]:0:${#ARGS[@]}-1}")
 
-mkdir -p "$OUT_DIR" "$OUT_DIR/logs"
+mkdir -p "$OUT_DIR" "$OUT_DIR/logs" "$OUT_DIR/filtered" "$OUT_DIR/merged"
 cd "$OUT_DIR"
 
 # Da qui in poi tutto stdout+stderr va sia a schermo sia sul log principale.
@@ -94,7 +144,8 @@ exec > >(tee -a "$LOGFILE") 2>&1
 
 echo "==> Avvio pipeline: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Modalita': $([ $USE_FILTERED -eq 1 ] && echo 'USO VCF GIA FILTRATI (skip bcftools view)' || echo 'filtro MAF/bialleliche da zero')"
-echo "Worker paralleli per Step 1: $JOBS"
+echo "Worker paralleli: $JOBS"
+echo "Resume: $([ $FORCE -eq 1 ] && echo 'DISATTIVATO (--force: rifaccio tutto da zero)' || echo 'attivo (salto gli step il cui output esiste gia'"'"')')"
 echo "Log principale: $LOGFILE"
 
 echo "==> Verifica strumenti disponibili"
@@ -133,28 +184,33 @@ fi
 
 echo ""
 if [ "$USE_FILTERED" -eq 1 ]; then
-    echo "==> Step 1: uso i VCF gia' filtrati (skip bcftools view), converto direttamente in pgen"
+    echo "==> Step 1: uso i VCF gia' filtrati (skip bcftools view), indicizzo per il merge"
 else
-    echo "==> Step 1: filtro SNP bialleliche comuni (MAF >= 0.05) per cromosoma, per batch"
+    echo "==> Step 1: filtro SNP bialleliche comuni (MAF >= 0.05) per cromosoma, per batch, indicizzo"
 fi
 echo "    (parallelizzato su $JOBS worker; log per singolo job in $OUT_DIR/logs/step1_*.log)"
 
-mkdir -p "$OUT_DIR/filtered"
-PGEN_LIST="$OUT_DIR/pgen_list.txt"
-: > "$PGEN_LIST"
-
 # ---------------------------------------------------------------------------
-# Funzione worker per un singolo batch/cromosoma. Deve essere una funzione
-# esportata (export -f) perche' xargs -P la lancia in sotto-shell separate.
-# Ogni chiamata scrive il proprio log dedicato, e in caso di successo
-# stampa il prefisso pgen su stdout (che noi raccogliamo per il pgen_list).
+# Step 1 worker: prepara il VCF pronto per il merge per un batch/cromosoma
+# (filtrando se necessario) e lo indicizza (.tbi). NON converte piu' in pgen
+# qui: la conversione avviene una sola volta a fine pipeline, sul VCF
+# genome-wide gia' unito. Stampa su stdout il percorso del VCF pronto,
+# preceduto dal numero di cromosoma, cosi' il chiamante puo' raggruppare
+# per cromosoma nello Step 2.
 # ---------------------------------------------------------------------------
 process_one() {
-    local d="$1" chr="$2" use_filtered="$3" out_dir="$4"
-    local batch vcf_in out_prefix log_file
+    local d="$1" chr="$2" use_filtered="$3" out_dir="$4" force="$5"
+    local batch vcf_in out_prefix log_file merge_vcf
     batch=$(basename "$d")
     out_prefix="$out_dir/filtered/${batch}_chr${chr}"
+    merge_vcf="${out_prefix}.merge_input.vcf.gz"
     log_file="$out_dir/logs/step1_${batch}_chr${chr}.log"
+
+    if [ "$force" -ne 1 ] && [ -f "$merge_vcf" ] && [ -f "${merge_vcf}.tbi" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$batch] chr${chr}: [skip, gia' presente]" >> "$log_file"
+        echo "${chr} ${merge_vcf}"
+        return 0
+    fi
 
     {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$batch] chr${chr}: avvio"
@@ -170,97 +226,181 @@ process_one() {
         fi
 
         if [ "$use_filtered" -eq 1 ]; then
-            echo "  converto direttamente in pgen (nessun filtro aggiuntivo qui)"
-            plink2 --vcf "$vcf_in" \
-                   --double-id \
-                   --make-pgen \
-                   --out "$out_prefix" \
-                   --silent
+            echo "  gia' filtrato: creo symlink (nessuna copia, nessun filtro aggiuntivo)"
+            ln -sf "$(readlink -f "$vcf_in")" "$merge_vcf"
         else
-            echo "  filtro + converto in pgen"
-            bcftools view -m2 -M2 -v snps --min-af 0.05:minor "$vcf_in" -Oz -o "${out_prefix}.filt.vcf.gz"
-            plink2 --vcf "${out_prefix}.filt.vcf.gz" \
-                   --double-id \
-                   --make-pgen \
-                   --out "$out_prefix" \
-                   --silent
+            echo "  filtro (bialleliche, MAF >= 0.05)"
+            bcftools view -m2 -M2 -v snps --min-af 0.05:minor "$vcf_in" -Oz -o "$merge_vcf"
         fi
+
+        echo "  indicizzo"
+        bcftools index -t -f "$merge_vcf"
+
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$batch] chr${chr}: completato"
-        # Riga marcatore: la raccogliamo dal chiamante per costruire pgen_list.txt
-        echo "PGEN_OUT:$out_prefix"
+        echo "MERGE_VCF_OK:$merge_vcf"
     } > "$log_file" 2>&1
 
-    # Se il job e' andato a buon fine e ha prodotto un pgen, rilancia la riga
-    # marcatore anche su stdout del worker (fuori dal blocco loggato sopra),
-    # cosi' il processo padre puo' raccoglierla.
-    if [ -f "${out_prefix}.pgen" ]; then
-        echo "$out_prefix"
+    if [ -f "${merge_vcf}.tbi" ]; then
+        # formato: <chr> <path>   -- il chiamante raggruppa per chr
+        echo "${chr} ${merge_vcf}"
     fi
 }
 export -f process_one
 
-# Genera la lista di job (batch x cromosoma 1..22) e lancia con xargs -P.
-JOBLIST="$OUT_DIR/logs/step1_joblist.txt"
-: > "$JOBLIST"
+JOBLIST1="$OUT_DIR/logs/step1_joblist.txt"
+: > "$JOBLIST1"
 for d in "${VCF_DIRS[@]}"; do
     for chr in $(seq 1 22); do
-        echo "$d|$chr" >> "$JOBLIST"
+        echo "$d|$chr" >> "$JOBLIST1"
     done
 done
+echo "  Totale job Step 1: $(wc -l < "$JOBLIST1") (batch x 22 cromosomi)"
 
-echo "  Totale job Step 1: $(wc -l < "$JOBLIST") (batch x 22 cromosomi)"
-
-cat "$JOBLIST" | xargs -P "$JOBS" -I{} bash -c '
+STEP1_OUT="$OUT_DIR/logs/step1_output.txt"
+cat "$JOBLIST1" | xargs -P "$JOBS" -I{} bash -c '
     IFS="|" read -r d chr <<< "{}"
-    process_one "$d" "$chr" "'"$USE_FILTERED"'" "'"$OUT_DIR"'"
-' > "$PGEN_LIST.raw"
+    process_one "$d" "$chr" "'"$USE_FILTERED"'" "'"$OUT_DIR"'" "'"$FORCE"'"
+' > "$STEP1_OUT"
 
-# Filtra eventuali righe vuote/rumorose e deduplica mantenendo l'ordine.
-grep -v '^\s*$' "$PGEN_LIST.raw" | sort -u > "$PGEN_LIST"
-rm -f "$PGEN_LIST.raw"
-
-n_ok=$(wc -l < "$PGEN_LIST")
-echo "  Job completati con pgen prodotto: $n_ok"
-echo "  Se il numero e' inferiore a quanto atteso, controlla i log in"
-echo "  $OUT_DIR/logs/step1_*.log per i cromosomi/batch mancanti (probabile [skip])."
+n_ok=$(grep -c . "$STEP1_OUT" || true)
+echo "  Job completati con VCF pronto per il merge: $n_ok"
+echo "  Se il numero e' inferiore a quanto atteso (batch x 22), controlla i log"
+echo "  in $OUT_DIR/logs/step1_*.log per i cromosomi/batch mancanti (probabile [skip])."
 
 echo ""
-echo "==> Step 2: merge di tutti i file pgen (tutti i batch, tutti i cromosomi)"
-plink2 --pmerge-list "$PGEN_LIST" pfile \
-       --make-pgen \
-       --out "$OUT_DIR/merged_all"
+echo "==> Step 2: merge dei batch, per cromosoma (bcftools merge, parallelo su $JOBS worker)"
+echo "    (log per singolo cromosoma in $OUT_DIR/logs/step2_chr*.log)"
+
+merge_chr() {
+    local chr="$1" out_dir="$2" force="$3"
+    shift 3
+    local vcfs=("$@")
+    local out_vcf="$out_dir/merged/merged_chr${chr}.vcf.gz"
+    local log_file="$out_dir/logs/step2_chr${chr}.log"
+
+    if [ "$force" -ne 1 ] && [ -f "$out_vcf" ] && [ -f "${out_vcf}.tbi" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] chr${chr}: [skip, gia' presente]" >> "$log_file"
+        echo "$out_vcf"
+        return 0
+    fi
+
+    {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] chr${chr}: merge di ${#vcfs[@]} batch"
+        if [ "${#vcfs[@]}" -eq 1 ]; then
+            echo "  un solo batch presente per questo cromosoma, copio (nessun merge necessario)"
+            ln -sf "$(readlink -f "${vcfs[0]}")" "$out_vcf"
+        else
+            bcftools merge -m none -Oz -o "$out_vcf" "${vcfs[@]}"
+        fi
+        bcftools index -t -f "$out_vcf"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] chr${chr}: completato"
+        echo "MERGE_CHR_OK:$out_vcf"
+    } > "$log_file" 2>&1
+
+    if [ -f "${out_vcf}.tbi" ]; then
+        echo "$out_vcf"
+    fi
+}
+export -f merge_chr
+
+# Raggruppa i VCF di Step 1 per cromosoma (gestisce anche il caso in cui un
+# batch manchi di qualche cromosoma).
+JOBLIST2="$OUT_DIR/logs/step2_joblist.txt"
+: > "$JOBLIST2"
+for chr in $(seq 1 22); do
+    files=$(awk -v c="$chr" '$1 == c { $1=""; sub(/^ /,""); print }' "$STEP1_OUT")
+    if [ -n "$files" ]; then
+        echo "${chr}|${files}" >> "$JOBLIST2"
+    else
+        echo "  ATTENZIONE: nessun VCF disponibile per chr${chr}, salto interamente questo cromosoma."
+    fi
+done
+
+MERGED_CHR_LIST="$OUT_DIR/logs/step2_output.txt"
+cat "$JOBLIST2" | xargs -P "$JOBS" -I{} bash -c '
+    IFS="|" read -r chr files <<< "{}"
+    merge_chr "$chr" "'"$OUT_DIR"'" "'"$FORCE"'" $files
+' > "$MERGED_CHR_LIST"
+
+n_chr_ok=$(grep -c . "$MERGED_CHR_LIST" || true)
+echo "  Cromosomi mergiati con successo: $n_chr_ok / 22"
 
 echo ""
-echo "==> Step 3: LD pruning (finestra 50, step 5, r2 < 0.2 -- standard)"
+echo "==> Step 3: concatenazione dei 22 cromosomi in un unico VCF genome-wide"
+if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/merged_all.vcf.gz" ] && [ -f "$OUT_DIR/merged_all.vcf.gz.tbi" ]; then
+    echo "  [skip, gia' presente] $OUT_DIR/merged_all.vcf.gz"
+else
+    CONCAT_LIST="$OUT_DIR/logs/concat_list.txt"
+    : > "$CONCAT_LIST"
+    for chr in $(seq 1 22); do
+        f="$OUT_DIR/merged/merged_chr${chr}.vcf.gz"
+        if [ -f "$f" ]; then
+            echo "$f" >> "$CONCAT_LIST"
+        fi
+    done
+    bcftools concat -f "$CONCAT_LIST" -Oz -o "$OUT_DIR/merged_all.vcf.gz"
+    bcftools index -t -f "$OUT_DIR/merged_all.vcf.gz"
+    echo "  VCF genome-wide: $OUT_DIR/merged_all.vcf.gz"
+fi
+
+echo ""
+echo "==> Step 4: conversione in pgen (una sola volta, sul VCF gia' completo)"
+if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/merged_all.pgen" ] && [ -f "$OUT_DIR/merged_all.pvar" ] && [ -f "$OUT_DIR/merged_all.psam" ]; then
+    echo "  [skip, gia' presente] $OUT_DIR/merged_all.pgen"
+else
+    plink2 --vcf "$OUT_DIR/merged_all.vcf.gz" \
+           --double-id \
+           --make-pgen \
+           --out "$OUT_DIR/merged_all"
+fi
+
+echo ""
+echo "==> Step 5: LD pruning (finestra 50, step 5, r2 < 0.2 -- standard)"
 echo "    + filtro MAF >= 0.05 di sicurezza qui, indipendentemente dal filtro"
 echo "    applicato a monte nei VCF _filtered (PCA/kinship funzionano male"
 echo "    con varianti rare, quindi lo riapplichiamo comunque)."
-plink2 --pfile "$OUT_DIR/merged_all" \
-       --maf 0.05 \
-       --indep-pairwise 50 5 0.2 \
-       --out "$OUT_DIR/pruned"
+if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/pruned.prune.in" ]; then
+    echo "  [skip, gia' presente] $OUT_DIR/pruned.prune.in"
+else
+    plink2 --pfile "$OUT_DIR/merged_all" \
+           --maf 0.05 \
+           --indep-pairwise 50 5 0.2 \
+           --out "$OUT_DIR/pruned"
+fi
 
-plink2 --pfile "$OUT_DIR/merged_all" \
-       --maf 0.05 \
-       --extract "$OUT_DIR/pruned.prune.in" \
-       --make-pgen \
-       --out "$OUT_DIR/merged_pruned"
+if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/merged_pruned.pgen" ] && [ -f "$OUT_DIR/merged_pruned.pvar" ] && [ -f "$OUT_DIR/merged_pruned.psam" ]; then
+    echo "  [skip, gia' presente] $OUT_DIR/merged_pruned.pgen"
+else
+    plink2 --pfile "$OUT_DIR/merged_all" \
+           --maf 0.05 \
+           --extract "$OUT_DIR/pruned.prune.in" \
+           --make-pgen \
+           --out "$OUT_DIR/merged_pruned"
+fi
 
 n_pruned=$(wc -l < "$OUT_DIR/pruned.prune.in")
 echo "  SNP indipendenti dopo pruning: $n_pruned"
 
 echo ""
-echo "==> Step 4: relatedness (KING-robust kinship, via plink2)"
-plink2 --pfile "$OUT_DIR/merged_pruned" \
-       --make-king-table \
-       --out "$OUT_DIR/king"
+echo "==> Step 6: relatedness (KING-robust kinship, via plink2)"
+if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/king.kin0" ]; then
+    echo "  [skip, gia' presente] $OUT_DIR/king.kin0"
+else
+    plink2 --pfile "$OUT_DIR/merged_pruned" \
+           --make-king-table \
+           --out "$OUT_DIR/king"
+fi
 echo "  Output: $OUT_DIR/king.kin0 (colonne: #FID1 ID1 FID2 ID2 NSNP HETHET IBS0 KINSHIP)"
 
 echo ""
-echo "==> Step 5: PCA (10 componenti)"
-plink2 --pfile "$OUT_DIR/merged_pruned" \
-       --pca 10 \
-       --out "$OUT_DIR/pca"
+echo "==> Step 7: PCA (10 componenti)"
+if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/pca.eigenvec" ]; then
+    echo "  [skip, gia' presente] $OUT_DIR/pca.eigenvec"
+else
+    plink2 --pfile "$OUT_DIR/merged_pruned" \
+           --pca 10 \
+           --out "$OUT_DIR/pca"
+fi
 echo "  Output: $OUT_DIR/pca.eigenvec, $OUT_DIR/pca.eigenval"
 
 echo ""
@@ -270,7 +410,8 @@ echo "    - $OUT_DIR/king.kin0"
 echo "    - $OUT_DIR/pca.eigenvec"
 echo ""
 echo "Log completo di questa run: $LOGFILE"
-echo "Log per-job dello Step 1: $OUT_DIR/logs/step1_<batch>_chr<N>.log"
+echo "Log per-job Step 1: $OUT_DIR/logs/step1_<batch>_chr<N>.log"
+echo "Log per-job Step 2: $OUT_DIR/logs/step2_chr<N>.log"
 echo ""
 echo "Prossimo step: lancia interpret_plink_output.py passando questi due file"
 echo "piu' i tuoi metadati di esposizione."
