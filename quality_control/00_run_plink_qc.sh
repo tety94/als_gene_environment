@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# da lanciare così sudo bash quality_control/00_run_plink_qc.sh     /mnt/cresla_prod/genome_datasets/gen1     /mnt/cresla_prod/genome_datasets/gen2     /mnt/cresla_prod/genome_datasets/gen3     /mnt/cresla_prod/genome_datasets/qc_output
-
 # ============================================================================
 # 00_run_plink_qc.sh
 # ============================================================================
@@ -347,11 +345,17 @@ fi
 
 echo ""
 echo "==> Step 4: conversione in pgen (una sola volta, sul VCF gia' completo)"
+echo "    + assegno ID univoci alle varianti (chr:pos:ref:alt) e scarto duplicati"
+echo "    esatti: necessario perche' --indep-pairwise richiede ID univoci, e i"
+echo "    VCF grezzi hanno spesso '.' come ID per (quasi) tutte le varianti."
 if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/merged_all.pgen" ] && [ -f "$OUT_DIR/merged_all.pvar" ] && [ -f "$OUT_DIR/merged_all.psam" ]; then
     echo "  [skip, gia' presente] $OUT_DIR/merged_all.pgen"
 else
     plink2 --vcf "$OUT_DIR/merged_all.vcf.gz" \
            --double-id \
+           --set-all-var-ids '@:#:$r:$a' \
+           --new-id-max-allele-len 200 truncate \
+           --rm-dup force-first \
            --make-pgen \
            --out "$OUT_DIR/merged_all"
 fi
