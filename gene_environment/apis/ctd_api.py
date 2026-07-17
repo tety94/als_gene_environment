@@ -221,16 +221,31 @@ class CTDAPI:
     # --------------------------------------------------------------
 
     @staticmethod
+    @staticmethod
     def query_gene(gene_symbol: str,
-                    chem_index: Dict[str, List[ChemGeneInteraction]],
-                    disease_index: Optional[Dict[str, List[GeneDiseaseAssociation]]] = None
-                    ) -> dict:
+                   chem_index: Dict[str, List[ChemGeneAssociation]],
+                   disease_index: Optional[Dict[str, List[GeneDiseaseAssociation]]] = None
+                   ) -> dict:
         symbol = (gene_symbol or "").strip().upper()
+
+        if not symbol or symbol.startswith("ENSG"):
+            log.warning("CTD: simbolo gene mancante o non risolto ('%s'), skip.", gene_symbol)
+            return {"chemicals": [], "chemical_interactions": [], "pesticide_interactions": [], "diseases": []}
 
         chem_interactions = chem_index.get(symbol, [])
         pesticide_interactions = [ci for ci in chem_interactions if ci.is_pesticide_by_keyword]
-
         diseases = disease_index.get(symbol, []) if disease_index else []
+
+        log.info(
+            "CTD: gene=%s -> %d interazioni chimiche totali (%d pesticidi), %d malattie associate",
+            symbol, len(chem_interactions), len(pesticide_interactions), len(diseases),
+        )
+
+        if pesticide_interactions:
+            log.info(
+                "CTD MATCH pesticidi: gene=%s pesticidi=%s",
+                symbol, [ci.chemical_name for ci in pesticide_interactions],
+            )
 
         return {
             "chemicals": [ci.chemical_name for ci in chem_interactions],
