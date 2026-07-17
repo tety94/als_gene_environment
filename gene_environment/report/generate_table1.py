@@ -47,6 +47,13 @@ warnings.filterwarnings("ignore")
 CSV_PATH = "/srv/python-projects/gene_environment_v2/data/componenti_ambientali_full.csv"
 PARQUET_PATH = "/mnt/cresla_prod/genome_datasets/merged_csv/gen.parquet"
 
+# Sorgente per la mappatura id -> coorte/generazione:
+#   "parquet" -> usa PARQUET_PATH (gen.parquet)
+#   "csv"     -> usa COHORT_MAPPING_CSV (es. generato da build_cohort_mapping.py
+#                 leggendo gli header dei VCF, utile se il parquet è corrotto/pesante)
+COHORT_SOURCE = "parquet"
+COHORT_MAPPING_CSV = "output/table1/id_generation_mapping.csv"
+
 OUTPUT_DIR = Path("output/table1")
 
 # Nome colonna id nel CSV e nel parquet (se diverso, imposta ID_COL_PARQUET)
@@ -157,8 +164,13 @@ def load_data():
     if ID_COL_CSV not in df.columns:
         sys.exit(f"ERRORE: colonna id '{ID_COL_CSV}' non trovata nel CSV. Colonne disponibili: {list(df.columns)}")
 
-    print(f"Carico parquet: {PARQUET_PATH}")
-    gen = read_parquet_robust(PARQUET_PATH)
+    if COHORT_SOURCE == "csv":
+        print(f"Carico mappatura coorte da CSV: {COHORT_MAPPING_CSV}")
+        gen = pd.read_csv(COHORT_MAPPING_CSV)
+    else:
+        print(f"Carico parquet: {PARQUET_PATH}")
+        gen = read_parquet_robust(PARQUET_PATH)
+
     if ID_COL_PARQUET not in gen.columns:
         sys.exit(f"ERRORE: colonna id '{ID_COL_PARQUET}' non trovata nel parquet. Colonne disponibili: {list(gen.columns)}")
     if COHORT_COL not in gen.columns:
