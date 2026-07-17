@@ -308,7 +308,7 @@ export -f merge_chr
 JOBLIST2="$OUT_DIR/logs/step2_joblist.txt"
 : > "$JOBLIST2"
 for chr in $(seq 1 22); do
-    files=$(awk -v c="$chr" '$1 == c { $1=""; sub(/^ /,""); print }' "$STEP1_OUT")
+    files=$(awk -v c="$chr" '$1 == c { $1=""; sub(/^ /,""); print }' "$STEP1_OUT" | tr '\n' ' ' | sed 's/ *$//')
     if [ -n "$files" ]; then
         echo "${chr}|${files}" >> "$JOBLIST2"
     else
