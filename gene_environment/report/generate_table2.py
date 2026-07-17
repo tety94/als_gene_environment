@@ -692,7 +692,7 @@ def compute_chromosome_enrichment_global(
         empty = pd.DataFrame(columns=["chromosome", "n_tested", "n_significant_observed",
                                        "expected", "binom_p", "binom_p_adj", "sig_variants"])
         empty.to_csv(stats_path, index=False)
-        return empty, {"total_tested": 0, "total_significant": 0, "chi2_stat": None, "chi2_p": None,
+        return empty, {"total_tested": 0, "total_significant": 0, "overall_expected": None, "overall_binom_p": None,
                         "per_chromosome_csv": str(stats_path), "figure": str(fig_path)}
 
     tested_by_chrom = tested_df.groupby("chromosome", as_index=False)["n_tested"].sum()
@@ -724,14 +724,19 @@ def compute_chromosome_enrichment_global(
 
     merged = _add_binomial_enrichment_stats(merged, alpha)
 
-    mask_nonzero = merged["expected"] > 0
-    chi2_stat, chi2_p = None, None
-    if mask_nonzero.sum() >= 2:
-        chi2_res = chisquare(
-            f_obs=merged.loc[mask_nonzero, "n_significant_observed"].values,
-            f_exp=merged.loc[mask_nonzero, "expected"].values,
-        )
-        chi2_stat, chi2_p = float(chi2_res.statistic), float(chi2_res.pvalue)
+    # NOTE: a chi-square goodness-of-fit test *across chromosome categories*
+    # requires sum(observed) == sum(expected), which no longer holds now that
+    # expected = n_tested * alpha per chromosome (sum(expected) = total_tested
+    # * alpha, generally != total_sig). The per-chromosome question is already
+    # answered by the binomial tests above (one row per chromosome, BH-
+    # adjusted). The natural *overall* question -- "pooling all chromosomes,
+    # are there more significant hits than alpha alone would predict?" -- is
+    # a single one-sided binomial test on the totals.
+    overall_binom_stat = None
+    overall_binom_p = None
+    if total_tested > 0:
+        overall_binom_stat = float(total_tested * alpha)  # expected count, for reference
+        overall_binom_p = float(binomtest(total_sig, total_tested, alpha, alternative="greater").pvalue)
 
     merged = merged.sort_values(by="chromosome", key=lambda s: s.map(_chrom_sort_key))
     merged.to_csv(stats_path, index=False)
@@ -746,8 +751,8 @@ def compute_chromosome_enrichment_global(
     summary = {
         "total_tested": total_tested,
         "total_significant": total_sig,
-        "chi2_stat": chi2_stat,
-        "chi2_p": chi2_p,
+        "overall_expected": overall_binom_stat,
+        "overall_binom_p": overall_binom_p,
         "per_chromosome_csv": str(stats_path),
         "figure": str(fig_path),
     }
