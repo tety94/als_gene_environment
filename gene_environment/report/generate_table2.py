@@ -32,8 +32,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, Inches
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+
 
 # Output directories
 OUT_DIR = Path("output/table2")
@@ -56,6 +60,117 @@ TABLE_COLUMNS = [
 ]
 
 ASTORE_NAME = "get_significant_results_table_2"
+
+
+def _set_cell_bg(cell, color_hex: str):
+    """Set background color of a table cell (hex without #)."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), color_hex)
+    tcPr.append(shd)
+
+def _set_col_width(cell, width_inches: float):
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcW = OxmlElement('w:tcW')
+    tcW.set(qn('w:w'), str(int(width_inches * 914400)))  # twips
+    tcW.set(qn('w:type'), 'dxa')
+    tcPr.append(tcW)
+
+def add_table_to_doc(doc: Document, df: pd.DataFrame, title: str = None, caption: str = None, max_rows: int | None = None):
+    """
+    Improved table formatting for python-docx:
+    - bold headers, repeated header row
+    - fixed column widths (inches)
+    - numeric columns right-aligned, text left-aligned
+    - alternating row shading
+    - table style 'Table Grid'
+    """
+    if title:
+        h = doc.add_heading(title, level=2)
+        h.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+
+    # Ensure columns exist
+    for c in TABLE_COLUMNS:
+        if c not in df.columns:
+            df[c] = pd.NA
+
+    df_to_use = df[TABLE_COLUMNS]
+    if max_rows is not None:
+        df_to_use = df_to_use.head(max_rows)
+
+    # Create table
+    table = doc.add_table(rows=1, cols=len(TABLE_COLUMNS))
+    table.style = 'Table Grid'
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    hdr_cells = table.rows[0].cells
+
+    # Define column widths (in inches) - tune as needed
+    col_widths = {
+        "exposure": 1.6,
+        "variant": 2.4,
+        "empirical_p_g1": 0.9,
+        "obs_coef_g1": 0.8,
+        "muted_g1": 0.8,
+        "not_muted_g1": 0.9,
+        "empirical_p_2": 0.9,
+        "obs_coef_g2": 0.8,
+        "muted_g2": 0.8,
+        "not_muted_g2": 0.9,
+    }
+
+    # Header row
+    for i, col in enumerate(TABLE_COLUMNS):
+        p = hdr_cells[i].paragraphs[0]
+        run = p.add_run(col)
+        run.bold = True
+        run.font.size = Pt(10)
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        hdr_cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        # set width if available
+        w = col_widths.get(col, 1.0)
+        _set_col_width(hdr_cells[i], w)
+
+    # Add data rows with formatting
+    shade_colors = ("F2F2F2", "FFFFFF")  # light gray / white
+    numeric_prefixes = ("empirical_p", "obs_coef",)  # treat these as numeric
+    for ridx, (_, row) in enumerate(df_to_use.iterrows()):
+        cells = table.add_row().cells
+        shade = shade_colors[(ridx) % 2]
+        for i, col in enumerate(TABLE_COLUMNS):
+            val = format_value_for_word(col, row.get(col, pd.NA))
+            cell = cells[i]
+            # set width to match header
+            w = col_widths.get(col, 1.0)
+            _set_col_width(cell, w)
+            # set text and alignment
+            para = cell.paragraphs[0]
+            if col.startswith(numeric_prefixes):
+                para.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
+            else:
+                para.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+            run = para.add_run(val)
+            run.font.size = Pt(9)
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            # shading
+            _set_cell_bg(cell, shade)
+
+    # Repeat header row on each page
+    tbl_pr = table._tbl.get_or_add_tblPr()
+    tbl_header = OxmlElement('w:tblHeader')
+    tbl_header.set(qn('w:val'), "true")
+    # find first row's trPr and set header
+    first_tr = table.rows[0]._tr
+    trPr = first_tr.get_or_add_trPr()
+    tbl_header = OxmlElement('w:tblHeader')
+    tbl_header.set(qn('w:val'), "true")
+    trPr.append(tbl_header)
+
+    if caption:
+        doc.add_paragraph(caption)
 
 
 def call_stored_routine_to_df(astore_name: str, get_connection, cursor_scope) -> pd.DataFrame:
