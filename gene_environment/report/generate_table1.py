@@ -95,6 +95,62 @@ ALPHA = 0.05
 # ============================================================
 
 
+def read_parquet_robust(path):
+    """
+    pd.read_parquet può fallire con:
+      OSError: Could not open Parquet input source ... Exceeded size limit
+    Succede quando pyarrow deserializza il thrift metadata del file (tipico
+    con parquet scritti in tanti row-group/partizioni o con schema molto
+    ampio) e i limiti di default (thrift_string_size_limit /
+    thrift_container_size_limit) vengono superati.
+    Qui si prova prima con limiti alzati via pyarrow, poi con fastparquet
+    come ultima spiaggia.
+    """
+    import pyarrow.parquet as pq
+
+    try:
+        return pd.read_parquet(path)
+    except OSError as e:
+        if "size limit" not in str(e).lower():
+            raise
+        print("  -> limite thrift di default superato, riprovo con limiti alzati...")
+
+    try:
+        table = pq.read_table(
+            path,
+            thrift_string_size_limit=2_000_000_000,
+            thrift_container_size_limit=2_000_000_000,
+        )
+        return table.to_pandas()
+    except TypeError:
+        # versioni di pyarrow che non accettano questi kwarg su read_table:
+        # provo passandoli al ParquetFile
+        pf = pq.ParquetFile(
+            path,
+            thrift_string_size_limit=2_000_000_000,
+            thrift_container_size_limit=2_000_000_000,
+        )
+        return pf.read().to_pandas()
+    except OSError:
+        pass
+
+    print("  -> ancora fallito con pyarrow, provo engine fastparquet...")
+    try:
+        return pd.read_parquet(path, engine="fastparquet")
+    except ImportError:
+        sys.exit(
+            "ERRORE: impossibile leggere il parquet (limite thrift superato) e "
+            "'fastparquet' non è installato. Installa con: pip install fastparquet"
+        )
+    except Exception as e:
+        sys.exit(
+            f"ERRORE: impossibile leggere il parquet con nessun metodo disponibile.\n"
+            f"Ultimo errore: {e}\n"
+            f"Il file potrebbe essere corrotto o troncato: verificane l'integrità "
+            f"(es. `parquet-tools` o riscrivendolo dalla pipeline sorgente)."
+        )
+
+
 def load_data():
     print(f"Carico CSV: {CSV_PATH}")
     df = pd.read_csv(CSV_PATH)
@@ -102,7 +158,7 @@ def load_data():
         sys.exit(f"ERRORE: colonna id '{ID_COL_CSV}' non trovata nel CSV. Colonne disponibili: {list(df.columns)}")
 
     print(f"Carico parquet: {PARQUET_PATH}")
-    gen = pd.read_parquet(PARQUET_PATH)
+    gen = read_parquet_robust(PARQUET_PATH)
     if ID_COL_PARQUET not in gen.columns:
         sys.exit(f"ERRORE: colonna id '{ID_COL_PARQUET}' non trovata nel parquet. Colonne disponibili: {list(gen.columns)}")
     if COHORT_COL not in gen.columns:
