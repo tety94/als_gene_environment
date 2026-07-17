@@ -2,22 +2,21 @@
 """
 generate_table1.py
 
-Genera la Tabella 1 del paper (statistiche descrittive per due coorti) a partire da:
-  - un CSV con i dati clinico-ambientali dei pazienti (una riga per id)
-  - un CSV con la mappatura id -> generazione/coorte, generato da
-    build_cohort_mapping.py leggendo gli header dei VCF filtrati
-    (si evita gen.parquet, troppo pesante/instabile da caricare)
+Generates Table 1 for the paper (descriptive statistics for two cohorts) from:
+  - a CSV containing clinical/environmental patient data (one row per id)
+  - a CSV mapping id -> generation/cohort, produced by build_cohort_mapping.py
+    by reading VCF headers (avoids loading gen.parquet, too heavy/unstable)
 
 Output (in OUTPUT_DIR):
-  - table1_stats.csv         -> tabella statistiche "grezza", leggibile/riusabile
-  - Table1.docx               -> tabella pronta per il paper (Word)
-  - figures/*.png             -> boxplot/barplot di confronto tra le due coorti
+  - table1_stats.csv        -> raw statistics table, reusable
+  - Table1.docx             -> Word table ready for the paper
+  - figures/*.png           -> boxplots/barplots comparing the two cohorts
 
-Uso:
-    python build_cohort_mapping.py   # genera la mappatura id -> generazione
-    python generate_table1.py        # genera Tabella 1
+Usage:
+    python build_cohort_mapping.py   # generates id -> generation mapping
+    python generate_table1.py        # generates Table 1
 
-Modifica solo la sezione CONFIG qui sotto per adattarlo ai tuoi path/nomi colonna.
+Modify only the CONFIG section below to adapt paths/column names.
 """
 
 import os
@@ -44,35 +43,27 @@ from docx.oxml import OxmlElement
 warnings.filterwarnings("ignore")
 
 # ============================================================
-# CONFIG — modifica qui
+# CONFIG — edit here
 # ============================================================
 
 CSV_PATH = "/srv/python-projects/gene_environment_v2/data/componenti_ambientali_full.csv"
 
-# Mappatura id -> coorte/generazione, generata da build_cohort_mapping.py
-# leggendo i sample id direttamente dagli header dei VCF (si evita di
-# passare per gen.parquet, troppo pesante/instabile da caricare).
 COHORT_MAPPING_CSV = "output/table1/id_generation_mapping.csv"
 
 OUTPUT_DIR = Path("output/table1")
 
-# Nome colonna id nel CSV clinico e nella mappatura coorte (se diverso, imposta ID_COL_MAPPING)
 ID_COL_CSV = "id"
 ID_COL_MAPPING = "id"
 
-# Nome colonna nella mappatura coorte che identifica la coorte/generazione
 COHORT_COL = "generazione"
 
-# Se la mappatura contiene più di 2 valori distinti in COHORT_COL, indica qui
-# ESATTAMENTE quali due valori vuoi confrontare in Tabella 1 (altrimenti lo
-# script si ferma e ti stampa i valori trovati per farti scegliere).
-# Esempio: COHORT_VALUES = ["gen1", "gen2"]
-COHORT_VALUES = None  # None = auto-detect (richiede esattamente 2 valori distinti)
+# If more than 2 distinct values exist, specify EXACTLY which two to compare.
+# Example: COHORT_VALUES = ["gen1", "gen2"]
+COHORT_VALUES = None  # None = auto-detect (requires exactly 2 distinct values)
 
-# Etichette leggibili per la tabella (adatta ai due valori reali della tua coorte)
-COHORT_LABELS = None  # es. {"gen1": "Coorte 1 (PARALS)", "gen2": "Coorte 2 (Svezia)"}
+# Human-readable labels for the two cohorts
+COHORT_LABELS = None  # e.g. {"gen1": "Cohort 1 (PARALS)", "gen2": "Cohort 2 (Sweden)"}
 
-# Variabili categoriche e numeriche da includere in Tabella 1
 CATEGORICAL_VARS = ["sex", "onset_site"]
 NUMERIC_VARS = [
     "diagnostic_delay",
@@ -83,43 +74,41 @@ NUMERIC_VARS = [
     "risaie_1500",
 ]
 
-# Etichette leggibili per le variabili (per la tabella finale)
 VAR_LABELS = {
-    "sex": "Sesso",
-    "onset_site": "Sede d'esordio",
-    "diagnostic_delay": "Ritardo diagnostico (mesi)",
-    "onset_age": "Età all'esordio (anni)",
-    "survival": "Sopravvivenza (anni)",
-    "seminativi_1500": "Seminativi entro 1500 m (%)",
-    "vigneti_1500": "Vigneti entro 1500 m (%)",
-    "risaie_1500": "Risaie entro 1500 m (%)",
+    "sex": "Sex",
+    "onset_site": "Onset site",
+    "diagnostic_delay": "Diagnostic delay (months)",
+    "onset_age": "Age at onset (years)",
+    "survival": "Survival (years)",
+    "seminativi_1500": "Arable land within 1500 m (%)",
+    "vigneti_1500": "Vineyards within 1500 m (%)",
+    "risaie_1500": "Rice fields within 1500 m (%)",
 }
 
 ALPHA = 0.05
 
 # ============================================================
-# FUNZIONI
+# FUNCTIONS
 # ============================================================
 
-
 def load_data():
-    print(f"Carico CSV: {CSV_PATH}")
+    print(f"Loading CSV: {CSV_PATH}")
     df = pd.read_csv(CSV_PATH)
     if ID_COL_CSV not in df.columns:
-        sys.exit(f"ERRORE: colonna id '{ID_COL_CSV}' non trovata nel CSV. Colonne disponibili: {list(df.columns)}")
+        sys.exit(f"ERROR: id column '{ID_COL_CSV}' not found in CSV. Columns: {list(df.columns)}")
 
-    print(f"Carico mappatura coorte da CSV: {COHORT_MAPPING_CSV}")
+    print(f"Loading cohort mapping from CSV: {COHORT_MAPPING_CSV}")
     if not Path(COHORT_MAPPING_CSV).exists():
         sys.exit(
-            f"ERRORE: {COHORT_MAPPING_CSV} non trovato.\n"
-            f"Genera prima la mappatura con: python build_cohort_mapping.py"
+            f"ERROR: {COHORT_MAPPING_CSV} not found.\n"
+            f"Generate mapping first with: python build_cohort_mapping.py"
         )
     gen = pd.read_csv(COHORT_MAPPING_CSV)
 
     if ID_COL_MAPPING not in gen.columns:
-        sys.exit(f"ERRORE: colonna id '{ID_COL_MAPPING}' non trovata in {COHORT_MAPPING_CSV}. Colonne disponibili: {list(gen.columns)}")
+        sys.exit(f"ERROR: id column '{ID_COL_MAPPING}' not found in mapping CSV. Columns: {list(gen.columns)}")
     if COHORT_COL not in gen.columns:
-        sys.exit(f"ERRORE: colonna coorte '{COHORT_COL}' non trovata in {COHORT_MAPPING_CSV}. Colonne disponibili: {list(gen.columns)}")
+        sys.exit(f"ERROR: cohort column '{COHORT_COL}' not found in mapping CSV. Columns: {list(gen.columns)}")
 
     gen = gen[[ID_COL_MAPPING, COHORT_COL]].drop_duplicates()
 
@@ -128,40 +117,40 @@ def load_data():
     )
     n_lost = len(df) - len(merged)
     if n_lost > 0:
-        print(f"ATTENZIONE: {n_lost} pazienti del CSV non trovati nella mappatura coorte (esclusi dal merge).")
+        print(f"WARNING: {n_lost} patients in CSV not found in cohort mapping (excluded).")
 
     return merged
 
 
 def resolve_cohorts(merged):
-    values = merged[COHORT_COL].dropna().unique().tolist()
+    values = sorted(merged[COHORT_COL].dropna().unique().tolist())
 
     if COHORT_VALUES is not None:
         chosen = COHORT_VALUES
         missing = [v for v in chosen if v not in values]
         if missing:
-            sys.exit(f"ERRORE: i valori COHORT_VALUES {missing} non sono presenti in '{COHORT_COL}'. Valori trovati: {values}")
+            sys.exit(f"ERROR: COHORT_VALUES {missing} not present in '{COHORT_COL}'. Found: {values}")
     else:
         if len(values) != 2:
             sys.exit(
-                f"ERRORE: trovati {len(values)} valori distinti in '{COHORT_COL}': {values}.\n"
-                f"Imposta COHORT_VALUES = [valore1, valore2] in CONFIG per scegliere le due coorti da confrontare."
+                f"ERROR: found {len(values)} distinct values in '{COHORT_COL}': {values}.\n"
+                f"Set COHORT_VALUES = [value1, value2] in CONFIG."
             )
-        chosen = values
+        chosen = values  # sorted ensures stable ordering
 
     labels = COHORT_LABELS or {v: str(v) for v in chosen}
     for v in chosen:
         labels.setdefault(v, str(v))
 
     sub = merged[merged[COHORT_COL].isin(chosen)].copy()
-    print(f"Coorti selezionate: {chosen} -> N = {sub[COHORT_COL].value_counts().to_dict()}")
+    print(f"Selected cohorts: {chosen} -> N = {sub[COHORT_COL].value_counts().to_dict()}")
     return sub, chosen, labels
 
 
 def is_normal(series, alpha=0.05):
     series = series.dropna()
     if len(series) < 8:
-        return True  # troppo pochi dati per Shapiro, assume parametrico
+        return True
     stat, p = stats.shapiro(series)
     return p > alpha
 
@@ -185,7 +174,7 @@ def summarize_numeric(sub, var, cohort_col, groups):
         desc1 = f"{g1.mean():.2f} ± {g1.std():.2f}"
         desc2 = f"{g2.mean():.2f} ± {g2.std():.2f}"
         stat, p = stats.ttest_ind(g1, g2, equal_var=False, nan_policy="omit")
-        test_used = "t-test (Welch)"
+        test_used = "Welch t-test"
     else:
         desc1 = f"{g1.median():.2f} [{g1.quantile(.25):.2f}-{g1.quantile(.75):.2f}]"
         desc2 = f"{g2.median():.2f} [{g2.quantile(.25):.2f}-{g2.quantile(.75):.2f}]"
@@ -193,7 +182,7 @@ def summarize_numeric(sub, var, cohort_col, groups):
             stat, p = stats.mannwhitneyu(g1, g2, alternative="two-sided")
         else:
             p = np.nan
-        test_used = "Mann-Whitney U"
+        test_used = "Mann–Whitney U"
 
     rows.append(
         {
@@ -258,7 +247,7 @@ def build_stats_table(sub, cohort_col, groups):
 
 
 # ------------------------------------------------------------
-# GRAFICI
+# FIGURES
 # ------------------------------------------------------------
 
 def make_figures(sub, cohort_col, groups, labels, fig_dir):
@@ -267,7 +256,7 @@ def make_figures(sub, cohort_col, groups, labels, fig_dir):
     palette = {groups[0]: "#4C72B0", groups[1]: "#DD8452"}
 
     plot_df = sub.copy()
-    plot_df["Coorte"] = plot_df[cohort_col].map(labels)
+    plot_df["Cohort"] = plot_df[cohort_col].map(labels)
 
     for var in NUMERIC_VARS:
         if var not in plot_df.columns:
@@ -275,13 +264,13 @@ def make_figures(sub, cohort_col, groups, labels, fig_dir):
         fig, ax = plt.subplots(figsize=(5, 4))
         sns.boxplot(
             data=plot_df,
-            x="Coorte",
+            x="Cohort",
             y=var,
             ax=ax,
             palette=[palette[g] for g in groups],
         )
         sns.stripplot(
-            data=plot_df, x="Coorte", y=var, ax=ax, color="black", alpha=0.3, size=3, jitter=True
+            data=plot_df, x="Cohort", y=var, ax=ax, color="black", alpha=0.3, size=3, jitter=True
         )
         ax.set_title(VAR_LABELS.get(var, var))
         ax.set_xlabel("")
@@ -294,7 +283,7 @@ def make_figures(sub, cohort_col, groups, labels, fig_dir):
         if var not in plot_df.columns:
             continue
         fig, ax = plt.subplots(figsize=(5, 4))
-        ct = pd.crosstab(plot_df["Coorte"], plot_df[var], normalize="index") * 100
+        ct = pd.crosstab(plot_df["Cohort"], plot_df[var], normalize="index") * 100
         ct.plot(kind="bar", stacked=True, ax=ax, colormap="tab10")
         ax.set_ylabel("%")
         ax.set_xlabel("")
@@ -304,11 +293,11 @@ def make_figures(sub, cohort_col, groups, labels, fig_dir):
         fig.savefig(fig_dir / f"barplot_{var}.png", dpi=200)
         plt.close(fig)
 
-    print(f"Grafici salvati in: {fig_dir}")
+    print(f"Figures saved in: {fig_dir}")
 
 
 # ------------------------------------------------------------
-# TABELLA WORD
+# WORD TABLE
 # ------------------------------------------------------------
 
 def set_cell_shading(cell, color_hex):
@@ -328,7 +317,7 @@ def make_docx_table(stats_df, groups, labels, n_total, output_path):
     section.page_height = Cm(29.7)
 
     title = doc.add_paragraph()
-    run = title.add_run("Tabella 1. Caratteristiche cliniche e ambientali delle due coorti")
+    run = title.add_run("Table 1. Clinical and environmental characteristics of the two cohorts")
     run.bold = True
     run.font.size = Pt(12)
 
@@ -336,7 +325,7 @@ def make_docx_table(stats_df, groups, labels, n_total, output_path):
     n2 = n_total.get(groups[1], 0)
 
     col_headers = [
-        "Variabile",
+        "Variable",
         f"{labels[groups[0]]} (n={n1})",
         f"{labels[groups[1]]} (n={n2})",
         "Test",
@@ -378,21 +367,20 @@ def make_docx_table(stats_df, groups, labels, n_total, output_path):
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER if i > 0 else WD_ALIGN_PARAGRAPH.LEFT
                 for r in p.runs:
                     r.font.size = Pt(10)
-                    # evidenzia p significative
                     if i == 4 and row["p_value"] is not np.nan and not pd.isna(row["p_value"]) and row["p_value"] < ALPHA:
                         r.bold = True
 
     note = doc.add_paragraph()
     note_run = note.add_run(
-        "Variabili numeriche: media ± DS (t-test di Welch) se distribuzione normale, "
-        "altrimenti mediana [IQR] (Mann-Whitney U). Variabili categoriche: n (%) "
-        "(chi-quadrato o test esatto di Fisher se attese <5)."
+        "Numeric variables: mean ± SD (Welch t-test) if normally distributed, "
+        "otherwise median [IQR] (Mann–Whitney U). Categorical variables: n (%) "
+        "(Chi-square or Fisher exact test if expected counts <5)."
     )
     note_run.italic = True
     note_run.font.size = Pt(8)
 
     doc.save(output_path)
-    print(f"Tabella Word salvata in: {output_path}")
+    print(f"Word table saved in: {output_path}")
 
 
 # ============================================================
@@ -412,14 +400,14 @@ def main():
 
     csv_out = OUTPUT_DIR / "table1_stats.csv"
     stats_df.to_csv(csv_out, index=False)
-    print(f"CSV statistiche salvato in: {csv_out}")
+    print(f"Statistics CSV saved in: {csv_out}")
 
     make_figures(sub, COHORT_COL, groups, labels, fig_dir)
 
     docx_out = OUTPUT_DIR / "Table1.docx"
     make_docx_table(stats_df, groups, labels, n_total, docx_out)
 
-    print("\nFatto. Output in:", OUTPUT_DIR.resolve())
+    print("\nDone. Output in:", OUTPUT_DIR.resolve())
 
 
 if __name__ == "__main__":
