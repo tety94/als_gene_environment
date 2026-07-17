@@ -58,12 +58,12 @@ FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 ASTORE_NAME = "get_significant_results_table_2"
 
-# Columns to include in Word tables (order).
-# NOTE: "empirical_p_2" (no "g") is kept exactly as in the original script.
-# Every other column follows the "_g1"/"_g2" convention, so this looks like it
-# could be a typo for "empirical_p_g2" -- please confirm against the real
-# astore output before I rename it, otherwise the column will silently come
-# back empty in the report.
+LAND_USE_LABELS = {
+    "seminativi_1500": "Arable land - 1500m buffer",
+    "vigneti_1500": "Vineyards - 1500m buffer",
+    "risaie_1500": "Rice paddies - 1500m buffer",
+}
+
 TABLE_COLUMNS = [
     "exposure",
     "variant",
@@ -719,7 +719,7 @@ def compute_chromosome_enrichment_by_exposure(
     for exposure, merged in per_exposure_tables.items():
         indiv_path = by_exposure_dir / f"observed_vs_expected_chrom_{_slugify(exposure)}.png"
         plt.figure(figsize=(max(6, 0.6 * len(merged)), 4.5))
-        _draw_chrom_bars(plt.gca(), merged, title=str(exposure))
+        _draw_chrom_bars(plt.gca(), merged, title=LAND_USE_LABELS[exposure])
         plt.tight_layout()
         plt.savefig(indiv_path, dpi=200)
         plt.close()
@@ -731,7 +731,7 @@ def compute_chromosome_enrichment_by_exposure(
     fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.6 * nrows), squeeze=False)
     for idx, (exposure, merged) in enumerate(per_exposure_tables.items()):
         r, c = divmod(idx, ncols)
-        _draw_chrom_bars(axes[r][c], merged, title=str(exposure))
+        _draw_chrom_bars(axes[r][c], merged, title=LAND_USE_LABELS[exposure])
     for idx in range(n, nrows * ncols):
         r, c = divmod(idx, ncols)
         axes[r][c].axis("off")
