@@ -119,6 +119,7 @@ def main():
     mapping = pd.DataFrame(rows)
 
     # controllo duplicati id tra generazioni diverse (non dovrebbe succedere)
+    mapping["id"] = mapping["id"].str.split("_").str[0]
     dup = mapping[mapping.duplicated("id", keep=False)]
     if not dup.empty:
         print(f"ATTENZIONE: {dup['id'].nunique()} id compaiono in più di una generazione:")
