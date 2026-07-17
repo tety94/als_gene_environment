@@ -21,6 +21,7 @@ Behavior:
     output/table2/figures/empirical_p_g1_histogram.png
     output/table2/figures/observed_vs_expected_by_chromosome.png
     output/table2/figures/observed_vs_expected_by_chromosome_per_exposure.png
+    output/table2/figures/by_exposure/observed_vs_expected_chrom_<exposure>.png  (one per exposure)
     output/table2/table2_chromosome_enrichment_stats.csv
     output/table2/table2_chromosome_enrichment_by_exposure_stats.csv
 - Numeric formatting: p-values 3 significant digits, coefficients 2 decimals.
@@ -482,6 +483,12 @@ def _empty_placeholder_figure(path: Path, message: str) -> None:
     plt.close()
 
 
+def _slugify(text) -> str:
+    """Turn an exposure name into a filesystem-safe filename fragment."""
+    s = re.sub(r"[^0-9A-Za-z_\-]+", "_", str(text)).strip("_")
+    return s or "exposure"
+
+
 def _chrom_sort_key(ch):
     try:
         return (0, int(ch))
@@ -498,12 +505,11 @@ def _short_variant_label(variant: str) -> str:
 
 
 def _sig_annotation_text(sig_variants: list) -> str:
-    """Short label listing which variants are significant on a given bar."""
+    """Label listing which variants are significant on a given bar (always
+    names them, no numeric fallback)."""
     if not sig_variants:
         return ""
-    if len(sig_variants) <= 3:
-        return "\n".join(_short_variant_label(v) for v in sig_variants)
-    return f"{len(sig_variants)} significant"
+    return "\n".join(_short_variant_label(v) for v in sig_variants)
 
 
 def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
@@ -541,8 +547,8 @@ def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
 def _draw_chrom_bars(ax, merged: pd.DataFrame, title: str) -> None:
     """Draw one observed-vs-expected-per-chromosome panel on `ax`.
     Chromosomes with 0 observed significant variants still get a (zero-height)
-    bar. Chromosomes that DO have significant variants get a red star over the
-    observed bar plus a short label naming the variant(s)."""
+    bar. Chromosomes that DO have significant variants get the variant
+    name(s) printed above the observed bar."""
     if merged.empty:
         ax.text(0.5, 0.5, "No tested variants", ha="center", va="center", transform=ax.transAxes)
         ax.set_title(title, fontsize=10)
@@ -571,7 +577,6 @@ def _draw_chrom_bars(ax, merged: pd.DataFrame, title: str) -> None:
             continue
         has_annotation = True
         top = max(row["n_significant_observed"], row["expected"])
-        ax.plot(i - bar_w / 2, row["n_significant_observed"], marker="*", color="#C00000", markersize=9, zorder=5)
         ax.text(i, top + max(0.3, 0.05 * (top or 1)), _sig_annotation_text(sig_variants),
                 ha="center", va="bottom", fontsize=6, color="#C00000", rotation=90)
 
@@ -739,6 +744,19 @@ def compute_chromosome_enrichment_by_exposure(
     combined = pd.concat(all_rows, ignore_index=True)
     combined.to_csv(stats_path, index=False)
 
+    # One standalone figure per exposure, in addition to the combined grid below.
+    by_exposure_dir = out_dir / "figures" / "by_exposure"
+    by_exposure_dir.mkdir(parents=True, exist_ok=True)
+    individual_paths = []
+    for exposure, merged in per_exposure_tables.items():
+        indiv_path = by_exposure_dir / f"observed_vs_expected_chrom_{_slugify(exposure)}.png"
+        plt.figure(figsize=(max(6, 0.6 * len(merged)), 4.5))
+        _draw_chrom_bars(plt.gca(), merged, title=str(exposure))
+        plt.tight_layout()
+        plt.savefig(indiv_path, dpi=200)
+        plt.close()
+        individual_paths.append(indiv_path)
+
     n = len(per_exposure_tables)
     ncols = min(3, n)
     nrows = -(-n // ncols)  # ceil
@@ -758,6 +776,7 @@ def compute_chromosome_enrichment_by_exposure(
         "n_exposures_plotted": n,
         "per_exposure_csv": str(stats_path),
         "figure": str(fig_path),
+        "individual_figures": [str(p) for p in individual_paths],
     }
     return combined, summary
 
@@ -846,6 +865,8 @@ def main():
     print(f"Figures saved in: {FIG_DIR}")
     print(f"Chromosome enrichment CSV (pooled): {chrom_summary['per_chromosome_csv']}")
     print(f"Chromosome enrichment CSV (by exposure): {chrom_by_exposure_summary['per_exposure_csv']}")
+    print(f"Per-exposure figures ({chrom_by_exposure_summary['n_exposures_plotted']}): "
+          f"{FIG_DIR / 'by_exposure'}")
 
 
 if __name__ == "__main__":
