@@ -4,7 +4,9 @@ generate_table1.py
 
 Genera la Tabella 1 del paper (statistiche descrittive per due coorti) a partire da:
   - un CSV con i dati clinico-ambientali dei pazienti (una riga per id)
-  - un file parquet con la mappatura id -> generazione/coorte
+  - un CSV con la mappatura id -> generazione/coorte, generato da
+    build_cohort_mapping.py leggendo gli header dei VCF filtrati
+    (si evita gen.parquet, troppo pesante/instabile da caricare)
 
 Output (in OUTPUT_DIR):
   - table1_stats.csv         -> tabella statistiche "grezza", leggibile/riusabile
@@ -12,7 +14,8 @@ Output (in OUTPUT_DIR):
   - figures/*.png             -> boxplot/barplot di confronto tra le due coorti
 
 Uso:
-    python generate_table1.py
+    python build_cohort_mapping.py   # genera la mappatura id -> generazione
+    python generate_table1.py        # genera Tabella 1
 
 Modifica solo la sezione CONFIG qui sotto per adattarlo ai tuoi path/nomi colonna.
 """
@@ -45,25 +48,22 @@ warnings.filterwarnings("ignore")
 # ============================================================
 
 CSV_PATH = "/srv/python-projects/gene_environment_v2/data/componenti_ambientali_full.csv"
-PARQUET_PATH = "/mnt/cresla_prod/genome_datasets/merged_csv/gen.parquet"
 
-# Sorgente per la mappatura id -> coorte/generazione:
-#   "parquet" -> usa PARQUET_PATH (gen.parquet)
-#   "csv"     -> usa COHORT_MAPPING_CSV (es. generato da build_cohort_mapping.py
-#                 leggendo gli header dei VCF, utile se il parquet è corrotto/pesante)
-COHORT_SOURCE = "parquet"
+# Mappatura id -> coorte/generazione, generata da build_cohort_mapping.py
+# leggendo i sample id direttamente dagli header dei VCF (si evita di
+# passare per gen.parquet, troppo pesante/instabile da caricare).
 COHORT_MAPPING_CSV = "output/table1/id_generation_mapping.csv"
 
 OUTPUT_DIR = Path("output/table1")
 
-# Nome colonna id nel CSV e nel parquet (se diverso, imposta ID_COL_PARQUET)
+# Nome colonna id nel CSV clinico e nella mappatura coorte (se diverso, imposta ID_COL_MAPPING)
 ID_COL_CSV = "id"
-ID_COL_PARQUET = "id"
+ID_COL_MAPPING = "id"
 
-# Nome colonna nel parquet che identifica la coorte/generazione
+# Nome colonna nella mappatura coorte che identifica la coorte/generazione
 COHORT_COL = "generazione"
 
-# Se il parquet contiene più di 2 valori distinti in COHORT_COL, indica qui
+# Se la mappatura contiene più di 2 valori distinti in COHORT_COL, indica qui
 # ESATTAMENTE quali due valori vuoi confrontare in Tabella 1 (altrimenti lo
 # script si ferma e ti stampa i valori trovati per farti scegliere).
 # Esempio: COHORT_VALUES = ["gen1", "gen2"]
@@ -102,88 +102,33 @@ ALPHA = 0.05
 # ============================================================
 
 
-def read_parquet_robust(path):
-    """
-    pd.read_parquet può fallire con:
-      OSError: Could not open Parquet input source ... Exceeded size limit
-    Succede quando pyarrow deserializza il thrift metadata del file (tipico
-    con parquet scritti in tanti row-group/partizioni o con schema molto
-    ampio) e i limiti di default (thrift_string_size_limit /
-    thrift_container_size_limit) vengono superati.
-    Qui si prova prima con limiti alzati via pyarrow, poi con fastparquet
-    come ultima spiaggia.
-    """
-    import pyarrow.parquet as pq
-
-    try:
-        return pd.read_parquet(path)
-    except OSError as e:
-        if "size limit" not in str(e).lower():
-            raise
-        print("  -> limite thrift di default superato, riprovo con limiti alzati...")
-
-    try:
-        table = pq.read_table(
-            path,
-            thrift_string_size_limit=2_000_000_000,
-            thrift_container_size_limit=2_000_000_000,
-        )
-        return table.to_pandas()
-    except TypeError:
-        # versioni di pyarrow che non accettano questi kwarg su read_table:
-        # provo passandoli al ParquetFile
-        pf = pq.ParquetFile(
-            path,
-            thrift_string_size_limit=2_000_000_000,
-            thrift_container_size_limit=2_000_000_000,
-        )
-        return pf.read().to_pandas()
-    except OSError:
-        pass
-
-    print("  -> ancora fallito con pyarrow, provo engine fastparquet...")
-    try:
-        return pd.read_parquet(path, engine="fastparquet")
-    except ImportError:
-        sys.exit(
-            "ERRORE: impossibile leggere il parquet (limite thrift superato) e "
-            "'fastparquet' non è installato. Installa con: pip install fastparquet"
-        )
-    except Exception as e:
-        sys.exit(
-            f"ERRORE: impossibile leggere il parquet con nessun metodo disponibile.\n"
-            f"Ultimo errore: {e}\n"
-            f"Il file potrebbe essere corrotto o troncato: verificane l'integrità "
-            f"(es. `parquet-tools` o riscrivendolo dalla pipeline sorgente)."
-        )
-
-
 def load_data():
     print(f"Carico CSV: {CSV_PATH}")
     df = pd.read_csv(CSV_PATH)
     if ID_COL_CSV not in df.columns:
         sys.exit(f"ERRORE: colonna id '{ID_COL_CSV}' non trovata nel CSV. Colonne disponibili: {list(df.columns)}")
 
-    if COHORT_SOURCE == "csv":
-        print(f"Carico mappatura coorte da CSV: {COHORT_MAPPING_CSV}")
-        gen = pd.read_csv(COHORT_MAPPING_CSV)
-    else:
-        print(f"Carico parquet: {PARQUET_PATH}")
-        gen = read_parquet_robust(PARQUET_PATH)
+    print(f"Carico mappatura coorte da CSV: {COHORT_MAPPING_CSV}")
+    if not Path(COHORT_MAPPING_CSV).exists():
+        sys.exit(
+            f"ERRORE: {COHORT_MAPPING_CSV} non trovato.\n"
+            f"Genera prima la mappatura con: python build_cohort_mapping.py"
+        )
+    gen = pd.read_csv(COHORT_MAPPING_CSV)
 
-    if ID_COL_PARQUET not in gen.columns:
-        sys.exit(f"ERRORE: colonna id '{ID_COL_PARQUET}' non trovata nel parquet. Colonne disponibili: {list(gen.columns)}")
+    if ID_COL_MAPPING not in gen.columns:
+        sys.exit(f"ERRORE: colonna id '{ID_COL_MAPPING}' non trovata in {COHORT_MAPPING_CSV}. Colonne disponibili: {list(gen.columns)}")
     if COHORT_COL not in gen.columns:
-        sys.exit(f"ERRORE: colonna coorte '{COHORT_COL}' non trovata nel parquet. Colonne disponibili: {list(gen.columns)}")
+        sys.exit(f"ERRORE: colonna coorte '{COHORT_COL}' non trovata in {COHORT_MAPPING_CSV}. Colonne disponibili: {list(gen.columns)}")
 
-    gen = gen[[ID_COL_PARQUET, COHORT_COL]].drop_duplicates()
+    gen = gen[[ID_COL_MAPPING, COHORT_COL]].drop_duplicates()
 
     merged = df.merge(
-        gen, left_on=ID_COL_CSV, right_on=ID_COL_PARQUET, how="inner"
+        gen, left_on=ID_COL_CSV, right_on=ID_COL_MAPPING, how="inner"
     )
     n_lost = len(df) - len(merged)
     if n_lost > 0:
-        print(f"ATTENZIONE: {n_lost} pazienti del CSV non trovati nel parquet (esclusi dal merge).")
+        print(f"ATTENZIONE: {n_lost} pazienti del CSV non trovati nella mappatura coorte (esclusi dal merge).")
 
     return merged
 
