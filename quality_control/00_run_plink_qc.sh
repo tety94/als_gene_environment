@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# da lanciare così sudo bash quality_control/00_run_plink_qc.sh     /mnt/cresla_prod/genome_datasets/gen1     /mnt/cresla_prod/genome_datasets/gen2     /mnt/cresla_prod/genome_datasets/gen3     /mnt/cresla_prod/genome_datasets/qc_output
+
 # ============================================================================
 # 00_run_plink_qc.sh
 # ============================================================================
