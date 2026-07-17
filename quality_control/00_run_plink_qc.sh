@@ -14,28 +14,25 @@ set -euo pipefail
 # nell'ambiente conda "geneenv" che usi per gene_environment_v2 -- verifica
 # con: which plink2 bcftools
 #
+# NOVITA' rispetto alla versione precedente:
+#   - Step 1 (filtro + conversione pgen per batch/cromosoma) e' ora
+#     parallelizzato su fino a 16 worker con xargs -P, invece di essere
+#     sequenziale. Step 2-5 restano sequenziali perche' operano sul merge
+#     completo e non sono parallelizzabili in modo banale.
+#   - Tutto l'output (stdout+stderr) viene sia mostrato a schermo sia
+#     salvato su $OUT_DIR/logs/pipeline.log (via tee).
+#   - Ogni job di Step 1 scrive anche il proprio log dedicato in
+#     $OUT_DIR/logs/step1_<batch>_chr<N>.log, cosi' se qualcosa fallisce in
+#     parallelo sai subito quale batch/cromosoma e' stato.
+#
 # USO:
-#   ./00_run_plink_qc.sh [--use-filtered] <dir_vcf_1> [<dir_vcf_2> <dir_vcf_3> ...] <out_dir>
+#   ./00_run_plink_qc.sh [--use-filtered] [--jobs N] <dir_vcf_1> [<dir_vcf_2> ...] <out_dir>
 #
-# --use-filtered: se presente, lo script cerca *_filtered.vcf.gz dentro una
-#   sottocartella vcf_filtered/ di ciascuna directory data in input (es.
-#   gen1/vcf_filtered/gen1_onlycases_vcf_chr1_filtered.vcf.gz) e SALTA lo
-#   step di bcftools view -m2 -M2 --min-af, assumendo che il filtro sia
-#   gia' stato applicato a monte da gene_environment_v2. Usalo SOLO dopo
-#   aver verificato (vedi commento sotto) che il filtro a monte includa
-#   gia' bialleliche + una soglia MAF ragionevole; altrimenti lascia lo
-#   script senza questo flag cosi' il filtro MAF/bialleliche viene comunque
-#   applicato qui.
+# --use-filtered: vedi sotto (invariato rispetto a prima).
+# --jobs N: numero di worker paralleli per lo Step 1 (default 16).
 #
-# Esempio con i tuoi 3 batch, usando i VCF gia' filtrati:
-#   ./00_run_plink_qc.sh --use-filtered \
-#       /mnt/cresla_prod/genome_datasets/gen1 \
-#       /mnt/cresla_prod/genome_datasets/gen2 \
-#       /mnt/cresla_prod/genome_datasets/gen3 \
-#       /mnt/cresla_prod/genome_datasets/qc_output
-#
-# Esempio senza (rifa' il filtro MAF/bialleliche da zero sui VCF grezzi):
-#   ./00_run_plink_qc.sh \
+# Esempio con i tuoi 3 batch, VCF gia' filtrati, 16 worker:
+#   ./00_run_plink_qc.sh --use-filtered --jobs 16 \
 #       /mnt/cresla_prod/genome_datasets/gen1 \
 #       /mnt/cresla_prod/genome_datasets/gen2 \
 #       /mnt/cresla_prod/genome_datasets/gen3 \
@@ -46,22 +43,41 @@ set -euo pipefail
 # fase di merge, oppure -- se gli ID sono stati resi unici a valle -- il
 # controllo di relatedness qui sotto lo trovera' come kinship ~0.5 (falso
 # "gemello monozigote"). In entrambi i casi, PRIMA di procedere controlla
-# se gli ID campione si sovrappongono tra batch:
-#   for f in gen1 gen2 gen3; do
-#       bcftools query -l $DIR/$f/${f}_onlycases_vcf_chr1.vcf.gz
-#   done
-# e confronta le liste (es. con `comm` o in python/pandas) per capire se
-# hai overlap prima di lanciare la pipeline.
+# se gli ID campione si sovrappongono tra batch (fatto automaticamente
+# nello Step 0 qui sotto).
+#
+# NOTA SUL PARALLELISMO: attenzione a I/O e RAM. Ogni worker di Step 1
+# lancia bcftools view + plink2 su un VCF per cromosoma: con 16 worker
+# in parallelo il carico su disco (specialmente se /mnt/cresla_prod/ e'
+# uno storage di rete condiviso) puo' diventare il collo di bottiglia
+# reale, non la CPU. Se noti I/O wait altissimo o il server rallenta per
+# altri utenti, abbassa --jobs (es. 8).
 # ============================================================================
 
 USE_FILTERED=0
-if [ "${1:-}" == "--use-filtered" ]; then
-    USE_FILTERED=1
-    shift
-fi
+JOBS=16
+POSITIONAL=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --use-filtered)
+            USE_FILTERED=1
+            shift
+            ;;
+        --jobs)
+            JOBS="$2"
+            shift 2
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
 
 if [ "$#" -lt 2 ]; then
-    echo "Uso: $0 [--use-filtered] <dir_vcf_1> [<dir_vcf_2> ...] <out_dir>"
+    echo "Uso: $0 [--use-filtered] [--jobs N] <dir_vcf_1> [<dir_vcf_2> ...] <out_dir>"
     exit 1
 fi
 
@@ -69,14 +85,22 @@ ARGS=("$@")
 OUT_DIR="${ARGS[-1]}"
 VCF_DIRS=("${ARGS[@]:0:${#ARGS[@]}-1}")
 
-echo "Modalita': $([ $USE_FILTERED -eq 1 ] && echo 'USO VCF GIA FILTRATI (skip bcftools view)' || echo 'filtro MAF/bialleliche da zero')"
-
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" "$OUT_DIR/logs"
 cd "$OUT_DIR"
+
+# Da qui in poi tutto stdout+stderr va sia a schermo sia sul log principale.
+LOGFILE="$OUT_DIR/logs/pipeline.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+
+echo "==> Avvio pipeline: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Modalita': $([ $USE_FILTERED -eq 1 ] && echo 'USO VCF GIA FILTRATI (skip bcftools view)' || echo 'filtro MAF/bialleliche da zero')"
+echo "Worker paralleli per Step 1: $JOBS"
+echo "Log principale: $LOGFILE"
 
 echo "==> Verifica strumenti disponibili"
 command -v plink2 >/dev/null 2>&1 || { echo "ERRORE: plink2 non trovato nel PATH."; exit 1; }
 command -v bcftools >/dev/null 2>&1 || { echo "ERRORE: bcftools non trovato nel PATH."; exit 1; }
+command -v xargs >/dev/null 2>&1 || { echo "ERRORE: xargs non trovato nel PATH."; exit 1; }
 
 echo "==> Step 0: controllo sovrapposizione sample ID tra i batch (${VCF_DIRS[*]})"
 : > "$OUT_DIR/all_sample_ids.txt"
@@ -113,32 +137,47 @@ if [ "$USE_FILTERED" -eq 1 ]; then
 else
     echo "==> Step 1: filtro SNP bialleliche comuni (MAF >= 0.05) per cromosoma, per batch"
 fi
+echo "    (parallelizzato su $JOBS worker; log per singolo job in $OUT_DIR/logs/step1_*.log)"
+
 mkdir -p "$OUT_DIR/filtered"
 PGEN_LIST="$OUT_DIR/pgen_list.txt"
 : > "$PGEN_LIST"
 
-for d in "${VCF_DIRS[@]}"; do
+# ---------------------------------------------------------------------------
+# Funzione worker per un singolo batch/cromosoma. Deve essere una funzione
+# esportata (export -f) perche' xargs -P la lancia in sotto-shell separate.
+# Ogni chiamata scrive il proprio log dedicato, e in caso di successo
+# stampa il prefisso pgen su stdout (che noi raccogliamo per il pgen_list).
+# ---------------------------------------------------------------------------
+process_one() {
+    local d="$1" chr="$2" use_filtered="$3" out_dir="$4"
+    local batch vcf_in out_prefix log_file
     batch=$(basename "$d")
-    for chr in $(seq 1 22); do
-        if [ "$USE_FILTERED" -eq 1 ]; then
+    out_prefix="$out_dir/filtered/${batch}_chr${chr}"
+    log_file="$out_dir/logs/step1_${batch}_chr${chr}.log"
+
+    {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$batch] chr${chr}: avvio"
+        if [ "$use_filtered" -eq 1 ]; then
             vcf_in=$(ls "$d/vcf_filtered"/*chr${chr}_filtered.vcf.gz 2>/dev/null | head -n1)
         else
             vcf_in=$(ls "$d"/*chr${chr}.vcf.gz 2>/dev/null | head -n1)
         fi
+
         if [ -z "$vcf_in" ]; then
-            echo "  [skip] chr${chr} non trovato per $batch"
-            continue
+            echo "[skip] chr${chr} non trovato per $batch"
+            exit 0
         fi
-        out_prefix="$OUT_DIR/filtered/${batch}_chr${chr}"
-        if [ "$USE_FILTERED" -eq 1 ]; then
-            echo "  [$batch] chr${chr}: converto direttamente in pgen (nessun filtro aggiuntivo qui)"
+
+        if [ "$use_filtered" -eq 1 ]; then
+            echo "  converto direttamente in pgen (nessun filtro aggiuntivo qui)"
             plink2 --vcf "$vcf_in" \
                    --double-id \
                    --make-pgen \
                    --out "$out_prefix" \
                    --silent
         else
-            echo "  [$batch] chr${chr}: filtro + converto in pgen"
+            echo "  filtro + converto in pgen"
             bcftools view -m2 -M2 -v snps --min-af 0.05:minor "$vcf_in" -Oz -o "${out_prefix}.filt.vcf.gz"
             plink2 --vcf "${out_prefix}.filt.vcf.gz" \
                    --double-id \
@@ -146,9 +185,44 @@ for d in "${VCF_DIRS[@]}"; do
                    --out "$out_prefix" \
                    --silent
         fi
-        echo "$out_prefix" >> "$PGEN_LIST"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$batch] chr${chr}: completato"
+        # Riga marcatore: la raccogliamo dal chiamante per costruire pgen_list.txt
+        echo "PGEN_OUT:$out_prefix"
+    } > "$log_file" 2>&1
+
+    # Se il job e' andato a buon fine e ha prodotto un pgen, rilancia la riga
+    # marcatore anche su stdout del worker (fuori dal blocco loggato sopra),
+    # cosi' il processo padre puo' raccoglierla.
+    if [ -f "${out_prefix}.pgen" ]; then
+        echo "$out_prefix"
+    fi
+}
+export -f process_one
+
+# Genera la lista di job (batch x cromosoma 1..22) e lancia con xargs -P.
+JOBLIST="$OUT_DIR/logs/step1_joblist.txt"
+: > "$JOBLIST"
+for d in "${VCF_DIRS[@]}"; do
+    for chr in $(seq 1 22); do
+        echo "$d|$chr" >> "$JOBLIST"
     done
 done
+
+echo "  Totale job Step 1: $(wc -l < "$JOBLIST") (batch x 22 cromosomi)"
+
+cat "$JOBLIST" | xargs -P "$JOBS" -I{} bash -c '
+    IFS="|" read -r d chr <<< "{}"
+    process_one "$d" "$chr" "'"$USE_FILTERED"'" "'"$OUT_DIR"'"
+' > "$PGEN_LIST.raw"
+
+# Filtra eventuali righe vuote/rumorose e deduplica mantenendo l'ordine.
+grep -v '^\s*$' "$PGEN_LIST.raw" | sort -u > "$PGEN_LIST"
+rm -f "$PGEN_LIST.raw"
+
+n_ok=$(wc -l < "$PGEN_LIST")
+echo "  Job completati con pgen prodotto: $n_ok"
+echo "  Se il numero e' inferiore a quanto atteso, controlla i log in"
+echo "  $OUT_DIR/logs/step1_*.log per i cromosomi/batch mancanti (probabile [skip])."
 
 echo ""
 echo "==> Step 2: merge di tutti i file pgen (tutti i batch, tutti i cromosomi)"
@@ -190,9 +264,13 @@ plink2 --pfile "$OUT_DIR/merged_pruned" \
 echo "  Output: $OUT_DIR/pca.eigenvec, $OUT_DIR/pca.eigenval"
 
 echo ""
-echo "==> FATTO. File chiave per lo script di interpretazione python:"
+echo "==> FATTO: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "File chiave per lo script di interpretazione python:"
 echo "    - $OUT_DIR/king.kin0"
 echo "    - $OUT_DIR/pca.eigenvec"
+echo ""
+echo "Log completo di questa run: $LOGFILE"
+echo "Log per-job dello Step 1: $OUT_DIR/logs/step1_<batch>_chr<N>.log"
 echo ""
 echo "Prossimo step: lancia interpret_plink_output.py passando questi due file"
 echo "piu' i tuoi metadati di esposizione."
