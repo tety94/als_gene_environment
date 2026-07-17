@@ -26,6 +26,32 @@ Behavior:
     output/table2/table2_chromosome_enrichment_stats.csv
     output/table2/table2_chromosome_enrichment_by_exposure_stats.csv
 - Numeric formatting: p-values 3 significant digits, coefficients 2 decimals.
+
+Statistical model for the per-chromosome enrichment test (both the pooled
+"all exposures" version and the per-exposure version):
+    For a given chromosome (and, in the per-exposure analysis, a given
+    exposure), let
+        n = number of variants TESTED on that chromosome
+            (COUNT(*) FROM variant_results WHERE exposure=... AND
+             generation=... GROUP BY chromosome -- i.e. exactly the query
+             used by fetch_tested_variant_counts_by_chromosome)
+        k = number of those variants found SIGNIFICANT
+            (empirical_p_g1 < alpha)
+    Under the null hypothesis of no true chromosome-level enrichment,
+    empirical p-values are uniform on [0, 1], so a fraction `alpha` of the
+    n tested variants are expected to cross the significance threshold by
+    chance alone:
+        expected = n * alpha
+    The per-chromosome p-value is a one-sided ("greater") exact binomial
+    test:
+        binom_p = P(X >= k | X ~ Binomial(n, alpha))
+    i.e. we are testing for ENRICHMENT (more hits than chance would produce),
+    not for deficit. Within each table (per exposure, or pooled), binom_p is
+    BH-adjusted (binom_p_adj) across chromosomes.
+    NOTE: this replaces an earlier version of this script where the null
+    probability was estimated from the pooled significant/tested ratio
+    across the whole dataset -- the null is now simply the significance
+    threshold alpha itself, per the requested definition.
 """
 
 from __future__ import annotations
@@ -265,6 +291,83 @@ def add_figure_to_doc(doc: Document, fig_path: Path, caption: str, width_in: flo
     cap.runs[0].font.size = Pt(9)
 
 
+def add_pvalue_table_to_doc(
+    doc: Document,
+    df: pd.DataFrame,
+    title: Optional[str] = None,
+    caption: Optional[str] = None,
+    alpha: float = SIG_ALPHA_DEFAULT,
+) -> None:
+    """Add a compact chromosome-level enrichment table (chromosome, n_tested,
+    n_significant_observed, expected, binom_p, binom_p_adj) to a docx.
+    binom_p_adj values below `alpha` are highlighted, same convention as
+    add_table_to_doc.
+    """
+    cols = ["chromosome", "n_tested", "n_significant_observed", "expected", "binom_p", "binom_p_adj"]
+    labels = {
+        "chromosome": "Chromosome",
+        "n_tested": "N tested",
+        "n_significant_observed": "N significant (obs.)",
+        "expected": "Expected (n\u00b7\u03b1)",
+        "binom_p": "Binomial p",
+        "binom_p_adj": "Binomial p (BH-adj.)",
+    }
+
+    if title:
+        h = doc.add_heading(title, level=2)
+        h.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+
+    if df.empty:
+        doc.add_paragraph("No tested-variant data available for this exposure.")
+        return
+
+    table = doc.add_table(rows=1, cols=len(cols))
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    _set_table_borders(table)
+
+    hdr_cells = table.rows[0].cells
+    for i, col in enumerate(cols):
+        p = hdr_cells[i].paragraphs[0]
+        run = p.add_run(labels[col])
+        run.bold = True
+        run.font.size = Pt(10)
+        run.font.color.rgb = HEADER_FONT_COLOR
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        hdr_cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        _set_cell_bg(hdr_cells[i], HEADER_FILL)
+
+    for ridx, (_, row) in enumerate(df[cols].iterrows()):
+        cells = table.add_row().cells
+        shade = ZEBRA_FILL if ridx % 2 == 1 else "FFFFFF"
+        for i, col in enumerate(cols):
+            val = row[col]
+            if col in ("binom_p", "binom_p_adj", "expected"):
+                text = "{:.3g}".format(float(val)) if pd.notna(val) else ""
+            else:
+                text = str(val) if pd.notna(val) else ""
+            para = cells[i].paragraphs[0]
+            para.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT if col != "chromosome" else WD_PARAGRAPH_ALIGNMENT.LEFT
+            run = para.add_run(text)
+            run.font.size = Pt(9)
+            if col == "binom_p_adj" and _is_significant(val, alpha):
+                run.bold = True
+                run.font.color.rgb = SIG_FONT_COLOR
+            cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            _set_cell_bg(cells[i], shade)
+
+    first_tr = table.rows[0]._tr
+    trPr = first_tr.get_or_add_trPr()
+    tbl_header = OxmlElement("w:tblHeader")
+    tbl_header.set(qn("w:val"), "true")
+    trPr.append(tbl_header)
+
+    if caption:
+        cap = doc.add_paragraph(caption)
+        cap.runs[0].italic = True
+        cap.runs[0].font.size = Pt(9)
+
+
 # ---------------------------------------------------------------------------
 # Data access
 # ---------------------------------------------------------------------------
@@ -499,19 +602,23 @@ def _chrom_sort_key(ch):
         return (1, ch)
 
 
-def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
-    """Add expected/chi2-ready columns + BH-adjusted binomial p-values to a
-    per-chromosome table with n_tested / n_significant_observed columns."""
-    total_tested = merged["n_tested"].sum()
-    total_sig = merged["n_significant_observed"].sum()
-    if total_tested == 0:
-        merged["expected"] = 0.0
-        merged["binom_p"] = 1.0
-        merged["binom_p_adj"] = 1.0
-        return merged
+def _add_binomial_enrichment_stats(merged: pd.DataFrame, alpha: float) -> pd.DataFrame:
+    """Add expected/binomial-p columns to a per-chromosome table with
+    n_tested / n_significant_observed columns.
 
-    merged["expected"] = merged["n_tested"] * (total_sig / total_tested)
-    p_global = total_sig / total_tested
+    Null model: under H0 (no true chromosome-level enrichment), empirical
+    p-values are uniform on [0, 1], so a fraction `alpha` of the n_tested
+    variants on a chromosome are expected to cross the empirical_p_g1 < alpha
+    threshold purely by chance:
+        expected  = n_tested * alpha
+        binom_p   = P(X >= n_significant_observed | X ~ Binomial(n_tested, alpha))
+    (one-sided "greater" exact binomial test -- we're testing for enrichment).
+    binom_p_adj is the BH (fdr_bh) correction of binom_p across the rows of
+    this table (i.e. across chromosomes, within one exposure or pooled).
+    """
+    merged = merged.copy()
+    merged["expected"] = merged["n_tested"] * alpha
+
     binom_pvals = []
     for _, row in merged.iterrows():
         n, k = int(row["n_tested"]), int(row["n_significant_observed"])
@@ -519,10 +626,11 @@ def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
             binom_pvals.append(1.0)
             continue
         try:
-            binom_pvals.append(binomtest(k, n, p_global).pvalue)
+            binom_pvals.append(binomtest(k, n, alpha, alternative="greater").pvalue)
         except ValueError:
             binom_pvals.append(1.0)
     merged["binom_p"] = binom_pvals
+
     try:
         _, p_adj, _, _ = multipletests(merged["binom_p"].fillna(1.0).values, method="fdr_bh")
         merged["binom_p_adj"] = p_adj
@@ -549,7 +657,7 @@ def _draw_chrom_bars(ax, merged: pd.DataFrame, title: str) -> None:
     ax.bar([i - bar_w / 2 for i in xi], merged["n_significant_observed"], width=bar_w,
            label="Observed", color="#4472C4")
     ax.bar([i + bar_w / 2 for i in xi], merged["expected"], width=bar_w,
-           label="Expected", color="#ED7D31", alpha=0.85)
+           label="Expected (n\u00b7\u03b1)", color="#ED7D31", alpha=0.85)
     ax.set_xticks(list(xi))
     ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Count", fontsize=9)
@@ -568,11 +676,12 @@ def compute_chromosome_enrichment_global(
     Observed vs. expected significant variants *per chromosome*, pooling all
     exposures together. `tested_df` (exposure, chromosome, n_tested) is summed
     across exposure to get the total number of variants ever tested on each
-    chromosome -- that's the baseline "expected" is proportional to.
+    chromosome. Expected count of significant hits per chromosome is
+    n_tested * alpha (see module docstring for the null model), tested with
+    a one-sided binomial test per chromosome (BH-adjusted across chromosomes)
+    plus an overall chi-square goodness-of-fit test across chromosomes.
 
     Chromosomes with zero significant hits still appear (zero-height bar).
-    Bars with at least one significant variant are starred and labelled with
-    the variant(s) responsible.
     """
     fig_path = out_dir / "figures" / "observed_vs_expected_by_chromosome.png"
     stats_path = out_dir / "table2_chromosome_enrichment_stats.csv"
@@ -613,7 +722,7 @@ def compute_chromosome_enrichment_global(
         return merged, {"total_tested": 0, "total_significant": total_sig, "chi2_stat": None, "chi2_p": None,
                          "per_chromosome_csv": str(stats_path), "figure": str(fig_path)}
 
-    merged = _add_binomial_enrichment_stats(merged)
+    merged = _add_binomial_enrichment_stats(merged, alpha)
 
     mask_nonzero = merged["expected"] > 0
     chi2_stat, chi2_p = None, None
@@ -653,12 +762,17 @@ def compute_chromosome_enrichment_by_exposure(
 ):
     """
     Same idea as `compute_chromosome_enrichment_global`, but computed
-    separately for each exposure (its own tested-per-chromosome baseline, its
-    own observed significant variants), and rendered as one grid figure with
-    one panel per exposure. Exposures with no tested-variant rows for this
-    generation are skipped (nothing to compare against); exposures with
-    tested variants but zero significant hits still get a panel, with every
-    bar at zero height.
+    separately for each exposure (its own tested-per-chromosome baseline
+    from `tested_df`, its own observed significant variants), and rendered
+    as one grid figure with one panel per exposure plus one standalone
+    figure + CSV per exposure. Expected count and p-value per chromosome use
+    the alpha-null model described in the module docstring
+    (expected = n_tested * alpha; one-sided binomial test), BH-adjusted
+    across chromosomes within each exposure.
+
+    Exposures with no tested-variant rows for this generation are skipped
+    (nothing to compare against); exposures with tested variants but zero
+    significant hits still get a panel, with every bar at zero height.
     """
     fig_path = out_dir / "figures" / "observed_vs_expected_by_chromosome_per_exposure.png"
     stats_path = out_dir / "table2_chromosome_enrichment_by_exposure_stats.csv"
@@ -697,7 +811,7 @@ def compute_chromosome_enrichment_by_exposure(
         merged["sig_variants"] = merged["sig_variants"].apply(lambda v: v if isinstance(v, list) else [])
         merged["n_tested"] = merged["n_tested"].astype(int)
 
-        merged = _add_binomial_enrichment_stats(merged)
+        merged = _add_binomial_enrichment_stats(merged, alpha)
         merged = merged.sort_values(by="chromosome", key=lambda s: s.map(_chrom_sort_key))
         merged["exposure"] = exposure
 
@@ -716,7 +830,9 @@ def compute_chromosome_enrichment_by_exposure(
     combined.to_csv(stats_path, index=False)
 
     # One standalone figure AND one standalone p-value CSV per exposure, in
-    # addition to the combined grid/CSV below.
+    # addition to the combined grid/CSV below. This is the per-exposure,
+    # per-chromosome p-value CSV requested: chromosome, n_tested,
+    # n_significant_observed, expected (n_tested*alpha), binom_p, binom_p_adj.
     by_exposure_dir = out_dir / "figures" / "by_exposure"
     by_exposure_dir.mkdir(parents=True, exist_ok=True)
     individual_paths = []
@@ -747,7 +863,8 @@ def compute_chromosome_enrichment_by_exposure(
     for idx in range(n, nrows * ncols):
         r, c = divmod(idx, ncols)
         axes[r][c].axis("off")
-    fig.suptitle("Observed vs expected significant variants per chromosome, by exposure", fontsize=12)
+    fig.suptitle("Observed vs expected significant variants per chromosome, by exposure "
+                 "(expected = n_tested \u00d7 \u03b1)", fontsize=12)
     plt.tight_layout(rect=(0, 0, 1, 0.97))
     plt.savefig(fig_path, dpi=200)
     plt.close(fig)
@@ -758,6 +875,7 @@ def compute_chromosome_enrichment_by_exposure(
         "figure": str(fig_path),
         "individual_figures": [str(p) for p in individual_paths],
         "individual_pvalue_csvs": [str(p) for p in individual_csv_paths],
+        "per_exposure_tables": per_exposure_tables,
     }
     return combined, summary
 
@@ -771,7 +889,8 @@ def parse_args():
     p.add_argument("--generation", type=int, default=2,
                     help="Generation number used to pull tested-variant counts per exposure.")
     p.add_argument("--alpha", type=float, default=SIG_ALPHA_DEFAULT,
-                    help="Significance threshold for empirical_p_g1.")
+                    help="Significance threshold for empirical_p_g1, and the null probability "
+                         "used in the per-chromosome binomial enrichment test.")
     return p.parse_args()
 
 
@@ -800,7 +919,8 @@ def main():
     chrom_by_exposure_df, chrom_by_exposure_summary = compute_chromosome_enrichment_by_exposure(
         df, tested_df, alpha=args.alpha, out_dir=OUT_DIR
     )
-    print("Chromosome enrichment summary (by exposure):", chrom_by_exposure_summary)
+    print("Chromosome enrichment summary (by exposure):",
+          {k: v for k, v in chrom_by_exposure_summary.items() if k != "per_exposure_tables"})
 
     # --- Table 2 (top 10) ---
     doc_top10 = Document()
@@ -832,11 +952,37 @@ def main():
                        "Figure 3. Distribution of empirical_p_g1.")
     add_figure_to_doc(doc_full, FIG_DIR / "observed_vs_expected_by_chromosome.png",
                        "Figure 4. Observed vs expected significant variants per chromosome, all exposures pooled "
-                       f"(generation {args.generation}). Starred bars mark chromosomes with at least one "
-                       "significant variant; the label names it.")
+                       f"(generation {args.generation}). Expected = n_tested \u00d7 alpha (alpha = {args.alpha}); "
+                       "p-values from a one-sided binomial test, BH-adjusted across chromosomes.")
     add_figure_to_doc(doc_full, FIG_DIR / "observed_vs_expected_by_chromosome_per_exposure.png",
                        "Figure 5. Observed vs expected significant variants per chromosome, one panel per exposure "
-                       f"(generation {args.generation}).", width_in=6.5)
+                       f"(generation {args.generation}). Same alpha-null model as Figure 4, computed independently "
+                       "per exposure.", width_in=6.5)
+
+    # --- Per-exposure enrichment tables (chromosome-by-chromosome p-values) ---
+    per_exposure_tables = chrom_by_exposure_summary.get("per_exposure_tables", {})
+    if per_exposure_tables:
+        doc_full.add_heading("Per-exposure chromosome enrichment", level=1)
+        doc_full.add_paragraph(
+            f"For each exposure and chromosome: n_tested variants (COUNT(*) FROM variant_results "
+            f"WHERE exposure=... AND generation={args.generation} GROUP BY chromosome), the number "
+            f"found significant (empirical_p_g1 < {args.alpha}), the expected count under chance "
+            f"alone (n_tested \u00d7 {args.alpha}), and a one-sided binomial p-value (BH-adjusted "
+            "within each exposure). Adjusted p-values below alpha are highlighted."
+        )
+        for exposure, merged in per_exposure_tables.items():
+            add_pvalue_table_to_doc(
+                doc_full, merged,
+                title=f"Exposure: {exposure}",
+                caption=f"Chromosome-level enrichment for {exposure} (generation {args.generation}).",
+                alpha=args.alpha,
+            )
+            slug = _slugify(exposure)
+            add_figure_to_doc(
+                doc_full, FIG_DIR / "by_exposure" / f"observed_vs_expected_chrom_{slug}.png",
+                f"Observed vs expected significant variants per chromosome -- {exposure}.",
+                width_in=5.5,
+            )
 
     full_path = OUT_DIR / "Table2_full_supplementary.docx"
     doc_full.save(full_path)
