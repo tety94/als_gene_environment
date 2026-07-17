@@ -1,32 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-Generate Table 2 Word files and figures from the SQL store get_significant_results_table_2
-using the project's MySQL connection helpers (get_connection, cursor_scope).
+Generate Table 2 Word files and figures by calling the stored routine
+get_significant_results_table_2 via the project's MySQL connection helpers.
 
-README / Requirements:
+Usage (from project root):
+    python3 -m gene_environment.report.generate_table2
+
+Requirements:
     pip install pandas python-docx matplotlib seaborn mysql-connector-python regex
 
-Notes:
-- This script expects a module (e.g., db.py) that exposes `get_connection` and `cursor_scope`
-  as described by the user. Adjust the import path if needed.
-- The SQL SELECT is included exactly as provided by the user.
-- Set up your project's DB configuration (DBConfig / get_config) so that get_connection()
-  can obtain connections from the pool.
-- The script will:
-    * Query the database using the provided SQL.
-    * Drop gna.* columns (if present).
-    * Produce two Word documents:
-        - output/table2/Table2_top10.docx (top 10 rows, formatted for a paper)
-        - output/table2/Table2_full_supplementary.docx (all rows, for supplementary materials)
-    * Produce three figures in output/table2/figures:
-        - variants_per_chromosome.png
-        - genes_vs_variants_scatter.png
-        - empirical_p_g1_histogram.png
+Behavior:
+- Calls the stored routine `get_significant_results_table_2()` and uses the first
+  resultset returned.
+- Drops gna.* columns before producing outputs.
+- Produces:
+    output/table2/Table2_top10.docx
+    output/table2/Table2_full_supplementary.docx
+    output/table2/figures/variants_per_chromosome.png
+    output/table2/figures/genes_vs_variants_scatter.png
+    output/table2/figures/empirical_p_g1_histogram.png
+- Numeric formatting: p-values 3 significant digits, coefficients 2 decimals.
 """
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 from typing import List
@@ -37,34 +34,14 @@ import seaborn as sns
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-from gene_environment.db.connection import get_connection, cursor_scope
 
-# -------------------------
-# SQL exactly as provided
-# -------------------------
-SQL_QUERY = """
-select distinct 
-\tvrs1.exposure as exposure,
-    vrs1.variant,
-    vrs1.empirical_p as empirical_p_g1,
-    round(vrs1.obs_coef, 2) as obs_coef_g1,
-    vrs1.mutati as muted_g1,
-    vrs1.non_mutati as not_muted_g1,
-    vrs2.empirical_p as empirical_p_2,
-    round(vrs2.obs_coef, 2) as obs_coef_g2,
-    vrs2.mutati as muted_g2,
-    vrs2.non_mutati as not_muted_g2,
-\tgna.neuro_plausibility_score,
-\tgna.expressed_neurons
-"""
-
-# Output paths
+# Output directories
 OUT_DIR = Path("output/table2")
 FIG_DIR = OUT_DIR / "figures"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Columns to keep in Word tables (in this order)
+# Columns to include in Word tables (order)
 TABLE_COLUMNS = [
     "exposure",
     "variant",
@@ -78,27 +55,61 @@ TABLE_COLUMNS = [
     "not_muted_g2",
 ]
 
-# -------------------------
-# Helpers
-# -------------------------
-def fetch_query_to_dataframe(sql: str) -> pd.DataFrame:
+ASTORE_NAME = "get_significant_results_table_2"
+
+
+def call_stored_routine_to_df(astore_name: str, get_connection, cursor_scope) -> pd.DataFrame:
     """
-    Execute the SQL using the project's get_connection / cursor_scope helpers
-    and return a pandas DataFrame. Uses cursor(dictionary=True) so column names
-    are preserved.
+    Call the stored routine `astore_name()` and return a pandas DataFrame built
+    from the first resultset. Handles drivers that require iterating nextset().
     """
     rows: List[dict] = []
+    cols = None
+
     with get_connection() as conn:
         with cursor_scope(conn, dictionary=True) as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
-            # cur.description may be None for some drivers; dictionary=True gives keys
-    # If rows is a list of dicts, create DataFrame directly
+            try:
+                cur.execute(f"CALL {astore_name}()")
+            except Exception as e:
+                raise RuntimeError(f"Failed to CALL {astore_name}(). DB error: {e}") from e
+
+            # Fetch first resultset if present
+            try:
+                fetched = cur.fetchall()
+                if fetched:
+                    rows = fetched
+                    # dictionary=True ensures rows are dict-like
+                    # cur.description may be None when dictionary=True; rely on dict keys
+                else:
+                    # If empty, still try to detect columns from description
+                    if cur.description:
+                        cols = [d[0] for d in cur.description]
+            except Exception:
+                # Some drivers raise if no rows; ignore and try nextset handling below
+                rows = []
+
+            # Some stored routines return multiple resultsets; ensure we captured the first non-empty one
+            # Move through nextset() until we find rows or exhaust sets
+            try:
+                while (not rows) and cur.nextset():
+                    try:
+                        fetched = cur.fetchall()
+                        if fetched:
+                            rows = fetched
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                # nextset may not be supported; ignore
+                pass
+
     if not rows:
-        # Return empty DataFrame with expected columns
+        # Return empty DataFrame with expected columns to avoid downstream errors
         return pd.DataFrame(columns=TABLE_COLUMNS)
+
+    # rows is a list of dicts (dictionary=True). Build DataFrame.
     df = pd.DataFrame(rows)
-    # Normalize column names: strip whitespace and lower-case
+    # Normalize column names: strip whitespace
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     return df
 
@@ -124,7 +135,7 @@ def extract_chromosome(variant: str) -> str:
       - 1:12345_A/T
       - chrX:...
       - X:...
-    Returns a normalized chromosome string (numbers as-is, X/Y/MT uppercase).
+    Returns normalized chromosome string.
     """
     if pd.isna(variant):
         return "NA"
@@ -134,10 +145,8 @@ def extract_chromosome(variant: str) -> str:
     if m:
         chrom = m.group(1)
     else:
-        # fallback: split on non-alphanumeric
         chrom = re.split(r'[:_\-]', variant)[0]
     chrom = chrom.lower().lstrip("chr")
-    # Normalize alpha chromosomes to uppercase (X, Y, MT)
     if chrom.isalpha():
         chrom = chrom.upper()
     return chrom
@@ -157,7 +166,6 @@ def format_value_for_word(col: str, val) -> str:
         if col.startswith("obs_coef"):
             return "{:.2f}".format(float(val))
     except Exception:
-        # fallback to string
         return str(val)
     return str(val)
 
@@ -168,7 +176,7 @@ def add_table_to_doc(doc: Document, df: pd.DataFrame, title: str = None, caption
         h = doc.add_heading(title, level=2)
         h.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
 
-    # Ensure all required columns exist in df
+    # Ensure columns exist
     for c in TABLE_COLUMNS:
         if c not in df.columns:
             df[c] = pd.NA
@@ -193,33 +201,17 @@ def add_table_to_doc(doc: Document, df: pd.DataFrame, title: str = None, caption
         doc.add_paragraph(caption)
 
 
-# -------------------------
-# Main
-# -------------------------
-def main():
-    # 1) Load data from DB
-    print("Querying database...")
-    df = fetch_query_to_dataframe(SQL_QUERY)
-
-    # 2) Drop gna.* columns
-    df = drop_gna_columns(df)
-
-    # 3) Ensure expected columns exist (avoid KeyError later)
-    for c in TABLE_COLUMNS:
-        if c not in df.columns:
-            df[c] = pd.NA
-
-    # 4) Parse chromosome from variant
+def make_figures(df: pd.DataFrame):
+    """Create and save figures in FIG_DIR."""
+    # Parse chromosome
     df["chromosome"] = df["variant"].apply(lambda v: extract_chromosome(v) if pd.notna(v) else "NA")
 
-    # 5) Prepare aggregated data for figures
-    # variants per chromosome (unique variants)
+    # Aggregations
     variants_per_chrom = df.groupby("chromosome")["variant"].nunique().rename("n_variants").reset_index()
-    # unique genes (exposures) per chromosome
     genes_per_chrom = df.groupby("chromosome")["exposure"].nunique().rename("n_genes").reset_index()
     merged = pd.merge(variants_per_chrom, genes_per_chrom, on="chromosome", how="outer").fillna(0)
 
-    # Sort chromosomes: numeric first, then alpha (X,Y,MT,...)
+    # Sort chromosomes: numeric first then others
     def chrom_sort_key(ch):
         try:
             return (0, int(ch))
@@ -229,7 +221,7 @@ def main():
 
     sns.set(style="whitegrid")
 
-    # Figure 1: Bar plot - variants per chromosome
+    # Bar plot: variants per chromosome
     plt.figure(figsize=(10, 6))
     ax = sns.barplot(data=merged, x="chromosome", y="n_variants", color="C0")
     ax.set_xlabel("Chromosome")
@@ -241,7 +233,7 @@ def main():
     plt.savefig(variants_plot_path, dpi=300)
     plt.close()
 
-    # Figure 2: Scatter - genes vs variants per chromosome
+    # Scatter: genes vs variants per chromosome
     plt.figure(figsize=(8, 6))
     ax = sns.scatterplot(data=merged, x="n_genes", y="n_variants", s=100)
     for _, r in merged.iterrows():
@@ -255,7 +247,7 @@ def main():
     plt.savefig(scatter_path, dpi=300)
     plt.close()
 
-    # Figure 3: Histogram of empirical_p_g1 (optional if data present)
+    # Histogram: empirical_p_g1
     plt.figure(figsize=(8, 5))
     try:
         pvals = pd.to_numeric(df["empirical_p_g1"], errors="coerce").dropna()
@@ -271,14 +263,39 @@ def main():
         plt.savefig(hist_path, dpi=300)
         plt.close()
     else:
-        # Create a placeholder image indicating no data
         plt.text(0.5, 0.5, "No empirical_p_g1 data available", ha="center", va="center")
         plt.axis("off")
         plt.savefig(hist_path, dpi=300)
         plt.close()
 
-    # 6) Create Word documents
-    # Table 2: top 10
+
+def main():
+    # Import connection helpers here to avoid potential import-time circular issues
+    try:
+        from gene_environment.db.connection import get_connection, cursor_scope
+    except Exception as e:
+        raise ImportError(
+            "Could not import get_connection and cursor_scope from gene_environment.db.connection. "
+            "Ensure the package is importable and you run the script from the project root with: "
+            "python3 -m gene_environment.report.generate_table2"
+        ) from e
+
+    # 1) Call the astore and load results
+    print(f"Calling stored routine: {ASTORE_NAME}() ...")
+    df = call_stored_routine_to_df(ASTORE_NAME, get_connection, cursor_scope)
+
+    # 2) Drop gna.* columns if present
+    df = drop_gna_columns(df)
+
+    # 3) Ensure expected columns exist
+    for c in TABLE_COLUMNS:
+        if c not in df.columns:
+            df[c] = pd.NA
+
+    # 4) Create figures
+    make_figures(df)
+
+    # 5) Create Table 2 (top 10) Word document
     doc_top10 = Document()
     doc_top10.add_heading("Table 2. Significant variants (top 10)", level=1)
     caption = (
@@ -292,9 +309,8 @@ def main():
     top10_path = OUT_DIR / "Table2_top10.docx"
     doc_top10.save(top10_path)
 
-    # Supplementary: full results
+    # 6) Create Supplementary Word (full results)
     doc_full = Document()
-    # Add header text (simple approach)
     doc_full.add_heading("Supplementary Table: full results", level=1)
     doc_full.add_paragraph(
         "Full results from get_significant_results_table_2. All rows included. "
