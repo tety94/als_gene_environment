@@ -496,22 +496,6 @@ def _chrom_sort_key(ch):
         return (1, ch)
 
 
-def _short_variant_label(variant: str) -> str:
-    """'chr1:12345_A/T' -> '12345_A/T' (drop the chromosome part, we already
-    know it from the bar it's attached to)."""
-    if not isinstance(variant, str):
-        return str(variant)
-    return variant.split(":", 1)[-1] if ":" in variant else variant
-
-
-def _sig_annotation_text(sig_variants: list) -> str:
-    """Label listing which variants are significant on a given bar (always
-    names them, no numeric fallback)."""
-    if not sig_variants:
-        return ""
-    return "\n".join(_short_variant_label(v) for v in sig_variants)
-
-
 def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
     """Add expected/chi2-ready columns + BH-adjusted binomial p-values to a
     per-chromosome table with n_tested / n_significant_observed columns."""
@@ -547,8 +531,8 @@ def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
 def _draw_chrom_bars(ax, merged: pd.DataFrame, title: str) -> None:
     """Draw one observed-vs-expected-per-chromosome panel on `ax`.
     Chromosomes with 0 observed significant variants still get a (zero-height)
-    bar. Chromosomes that DO have significant variants get the variant
-    name(s) printed above the observed bar."""
+    bar. No in-plot highlighting of which variants are significant -- that
+    detail lives in the accompanying CSV (`sig_variants` column)."""
     if merged.empty:
         ax.text(0.5, 0.5, "No tested variants", ha="center", va="center", transform=ax.transAxes)
         ax.set_title(title, fontsize=10)
@@ -569,22 +553,6 @@ def _draw_chrom_bars(ax, merged: pd.DataFrame, title: str) -> None:
     ax.set_title(title, fontsize=10)
     ax.legend(fontsize=7)
     ax.set_ylim(bottom=0)
-
-    has_annotation = False
-    for i, (_, row) in enumerate(merged.iterrows()):
-        sig_variants = row.get("sig_variants") or []
-        if not sig_variants:
-            continue
-        has_annotation = True
-        top = max(row["n_significant_observed"], row["expected"])
-        ax.text(i, top + max(0.3, 0.05 * (top or 1)), _sig_annotation_text(sig_variants),
-                ha="center", va="bottom", fontsize=6, color="#C00000", rotation=90)
-
-    if has_annotation:
-        # Rotated text extends well above its anchor point and isn't picked
-        # up by matplotlib's autoscale, so reserve extra headroom manually.
-        _, top_ylim = ax.get_ylim()
-        ax.set_ylim(top=top_ylim * 1.6 + 0.5)
 
 
 def compute_chromosome_enrichment_global(
