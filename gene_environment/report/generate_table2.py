@@ -37,21 +37,30 @@ Statistical model for the per-chromosome enrichment test (both the pooled
              used by fetch_tested_variant_counts_by_chromosome)
         k = number of those variants found SIGNIFICANT
             (empirical_p_g1 < alpha)
-    Under the null hypothesis of no true chromosome-level enrichment,
-    empirical p-values are uniform on [0, 1], so a fraction `alpha` of the
-    n tested variants are expected to cross the significance threshold by
-    chance alone:
-        expected = n * alpha
+    The null model is PROPORTIONAL ALLOCATION: within the table being
+    analyzed (all chromosomes of one exposure, or all chromosomes pooled
+    across exposures), the overall observed significance rate is
+        p_rate = sum(k) / sum(n)   [i.e. total_significant / total_tested]
+    and each chromosome's expected count of significant hits, under a null
+    of "no chromosome-level concentration", is proportional to how much
+    testing was done there:
+        expected = n * p_rate
     The per-chromosome p-value is a one-sided ("greater") exact binomial
     test:
-        binom_p = P(X >= k | X ~ Binomial(n, alpha))
-    i.e. we are testing for ENRICHMENT (more hits than chance would produce),
-    not for deficit. Within each table (per exposure, or pooled), binom_p is
-    BH-adjusted (binom_p_adj) across chromosomes.
-    NOTE: this replaces an earlier version of this script where the null
-    probability was estimated from the pooled significant/tested ratio
-    across the whole dataset -- the null is now simply the significance
-    threshold alpha itself, per the requested definition.
+        binom_p = P(X >= k | X ~ Binomial(n, p_rate))
+    i.e. we are testing whether a chromosome concentrates more significant
+    hits than its share of testing volume would predict, not the raw
+    significance threshold alpha. Within each table (per exposure, or
+    pooled), binom_p is BH-adjusted (binom_p_adj) across chromosomes.
+    NOTE: an earlier version of this analysis used alpha itself as the null
+    probability (expected = n * alpha). That produced p-values of 1.0 across
+    every chromosome, because get_significant_results_table_2 already
+    returns a far more stringent subset than a naive
+    empirical_p_g1 < alpha filter would (the true significance rate in this
+    dataset is far below alpha, e.g. ~0.04% vs alpha = 5%), so alpha is not
+    a meaningful "by chance" baseline for these numbers. The proportional
+    model above is calibrated to the data instead and is the current,
+    correct version.
 """
 
 from __future__ import annotations
@@ -71,7 +80,7 @@ from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
-from scipy.stats import binomtest, chisquare
+from scipy.stats import binomtest
 from statsmodels.stats.multitest import multipletests
 
 # ---------------------------------------------------------------------------
@@ -308,7 +317,7 @@ def add_pvalue_table_to_doc(
         "chromosome": "Chromosome",
         "n_tested": "N tested",
         "n_significant_observed": "N significant (obs.)",
-        "expected": "Expected (n\u00b7\u03b1)",
+        "expected": "Expected (n\u00b7p_rate)",
         "binom_p": "Binomial p",
         "binom_p_adj": "Binomial p (BH-adj.)",
     }
@@ -602,22 +611,43 @@ def _chrom_sort_key(ch):
         return (1, ch)
 
 
-def _add_binomial_enrichment_stats(merged: pd.DataFrame, alpha: float) -> pd.DataFrame:
+def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
     """Add expected/binomial-p columns to a per-chromosome table with
     n_tested / n_significant_observed columns.
 
-    Null model: under H0 (no true chromosome-level enrichment), empirical
-    p-values are uniform on [0, 1], so a fraction `alpha` of the n_tested
-    variants on a chromosome are expected to cross the empirical_p_g1 < alpha
-    threshold purely by chance:
-        expected  = n_tested * alpha
-        binom_p   = P(X >= n_significant_observed | X ~ Binomial(n_tested, alpha))
-    (one-sided "greater" exact binomial test -- we're testing for enrichment).
-    binom_p_adj is the BH (fdr_bh) correction of binom_p across the rows of
-    this table (i.e. across chromosomes, within one exposure or pooled).
+    Null model: proportional allocation. Given the table's own totals
+    (summed across all its chromosome rows -- e.g. all chromosomes within
+    one exposure, or all chromosomes pooled across exposures), the overall
+    significance rate is
+        p_rate = sum(n_significant_observed) / sum(n_tested)
+    Under H0 (no chromosome-level concentration of hits), each chromosome's
+    expected count of significant hits is proportional to how much of it was
+    tested:
+        expected  = n_tested * p_rate
+        binom_p   = P(X >= n_significant_observed | X ~ Binomial(n_tested, p_rate))
+    (one-sided "greater" exact binomial test -- testing whether this
+    chromosome concentrates more hits than its share of testing volume would
+    predict). binom_p_adj is the BH (fdr_bh) correction of binom_p across the
+    rows of this table.
+
+    NOTE: this intentionally does NOT use the raw significance threshold
+    alpha as the null rate -- in this dataset the actual significance rate is
+    far below alpha (e.g. get_significant_results_table_2 already returns a
+    much more stringent subset than a naive empirical_p_g1 < 0.05 filter
+    would), so alpha itself is not a meaningful "by chance" baseline here.
     """
     merged = merged.copy()
-    merged["expected"] = merged["n_tested"] * alpha
+    total_tested = int(merged["n_tested"].sum())
+    total_sig = int(merged["n_significant_observed"].sum())
+
+    if total_tested == 0 or total_sig == 0:
+        merged["expected"] = 0.0
+        merged["binom_p"] = 1.0
+        merged["binom_p_adj"] = 1.0
+        return merged
+
+    p_rate = total_sig / total_tested
+    merged["expected"] = merged["n_tested"] * p_rate
 
     binom_pvals = []
     for _, row in merged.iterrows():
@@ -626,7 +656,7 @@ def _add_binomial_enrichment_stats(merged: pd.DataFrame, alpha: float) -> pd.Dat
             binom_pvals.append(1.0)
             continue
         try:
-            binom_pvals.append(binomtest(k, n, alpha, alternative="greater").pvalue)
+            binom_pvals.append(binomtest(k, n, p_rate, alternative="greater").pvalue)
         except ValueError:
             binom_pvals.append(1.0)
     merged["binom_p"] = binom_pvals
@@ -657,7 +687,7 @@ def _draw_chrom_bars(ax, merged: pd.DataFrame, title: str) -> None:
     ax.bar([i - bar_w / 2 for i in xi], merged["n_significant_observed"], width=bar_w,
            label="Observed", color="#4472C4")
     ax.bar([i + bar_w / 2 for i in xi], merged["expected"], width=bar_w,
-           label="Expected (n\u00b7\u03b1)", color="#ED7D31", alpha=0.85)
+           label="Expected (n\u00b7p_rate)", color="#ED7D31", alpha=0.85)
     ax.set_xticks(list(xi))
     ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Count", fontsize=9)
@@ -677,9 +707,9 @@ def compute_chromosome_enrichment_global(
     exposures together. `tested_df` (exposure, chromosome, n_tested) is summed
     across exposure to get the total number of variants ever tested on each
     chromosome. Expected count of significant hits per chromosome is
-    n_tested * alpha (see module docstring for the null model), tested with
-    a one-sided binomial test per chromosome (BH-adjusted across chromosomes)
-    plus an overall chi-square goodness-of-fit test across chromosomes.
+    n_tested * (total_significant / total_tested) -- the proportional null
+    model described in the module docstring -- tested with a one-sided
+    binomial test per chromosome, BH-adjusted across chromosomes.
 
     Chromosomes with zero significant hits still appear (zero-height bar).
     """
@@ -692,7 +722,7 @@ def compute_chromosome_enrichment_global(
         empty = pd.DataFrame(columns=["chromosome", "n_tested", "n_significant_observed",
                                        "expected", "binom_p", "binom_p_adj", "sig_variants"])
         empty.to_csv(stats_path, index=False)
-        return empty, {"total_tested": 0, "total_significant": 0, "overall_expected": None, "overall_binom_p": None,
+        return empty, {"total_tested": 0, "total_significant": 0, "overall_rate": None,
                         "per_chromosome_csv": str(stats_path), "figure": str(fig_path)}
 
     tested_by_chrom = tested_df.groupby("chromosome", as_index=False)["n_tested"].sum()
@@ -719,25 +749,18 @@ def compute_chromosome_enrichment_global(
         print("[warn] total tested variants is zero -- skipping enrichment stats.", file=sys.stderr)
         _empty_placeholder_figure(fig_path, "No tested variants for this generation")
         merged.to_csv(stats_path, index=False)
-        return merged, {"total_tested": 0, "total_significant": total_sig, "chi2_stat": None, "chi2_p": None,
+        return merged, {"total_tested": 0, "total_significant": total_sig, "overall_rate": None,
                          "per_chromosome_csv": str(stats_path), "figure": str(fig_path)}
 
-    merged = _add_binomial_enrichment_stats(merged, alpha)
+    merged = _add_binomial_enrichment_stats(merged)
 
-    # NOTE: a chi-square goodness-of-fit test *across chromosome categories*
-    # requires sum(observed) == sum(expected), which no longer holds now that
-    # expected = n_tested * alpha per chromosome (sum(expected) = total_tested
-    # * alpha, generally != total_sig). The per-chromosome question is already
-    # answered by the binomial tests above (one row per chromosome, BH-
-    # adjusted). The natural *overall* question -- "pooling all chromosomes,
-    # are there more significant hits than alpha alone would predict?" -- is
-    # a single one-sided binomial test on the totals.
-    overall_binom_stat = None
-    overall_binom_p = None
-    if total_tested > 0:
-        overall_binom_stat = float(total_tested * alpha)  # expected count, for reference
-        overall_binom_p = float(binomtest(total_sig, total_tested, alpha, alternative="greater").pvalue)
-
+    # NOTE: there is no meaningful "overall" p-value here beyond the
+    # per-chromosome binomial tests above. Under the proportional null model,
+    # expected is defined so that sum(expected) == sum(observed) by
+    # construction (expected = n_tested * (total_sig/total_tested)), so a
+    # pooled test on the totals would be tautological. The real answer to
+    # "is there chromosome-level concentration of hits" lives in the
+    # per-chromosome binom_p / binom_p_adj columns.
     merged = merged.sort_values(by="chromosome", key=lambda s: s.map(_chrom_sort_key))
     merged.to_csv(stats_path, index=False)
 
@@ -751,8 +774,7 @@ def compute_chromosome_enrichment_global(
     summary = {
         "total_tested": total_tested,
         "total_significant": total_sig,
-        "overall_expected": overall_binom_stat,
-        "overall_binom_p": overall_binom_p,
+        "overall_rate": (total_sig / total_tested) if total_tested else None,
         "per_chromosome_csv": str(stats_path),
         "figure": str(fig_path),
     }
@@ -771,9 +793,10 @@ def compute_chromosome_enrichment_by_exposure(
     from `tested_df`, its own observed significant variants), and rendered
     as one grid figure with one panel per exposure plus one standalone
     figure + CSV per exposure. Expected count and p-value per chromosome use
-    the alpha-null model described in the module docstring
-    (expected = n_tested * alpha; one-sided binomial test), BH-adjusted
-    across chromosomes within each exposure.
+    the proportional null model described in the module docstring
+    (expected = n_tested * (exposure's own total_significant/total_tested);
+    one-sided binomial test), BH-adjusted across chromosomes within each
+    exposure.
 
     Exposures with no tested-variant rows for this generation are skipped
     (nothing to compare against); exposures with tested variants but zero
@@ -816,7 +839,7 @@ def compute_chromosome_enrichment_by_exposure(
         merged["sig_variants"] = merged["sig_variants"].apply(lambda v: v if isinstance(v, list) else [])
         merged["n_tested"] = merged["n_tested"].astype(int)
 
-        merged = _add_binomial_enrichment_stats(merged, alpha)
+        merged = _add_binomial_enrichment_stats(merged)
         merged = merged.sort_values(by="chromosome", key=lambda s: s.map(_chrom_sort_key))
         merged["exposure"] = exposure
 
@@ -837,7 +860,8 @@ def compute_chromosome_enrichment_by_exposure(
     # One standalone figure AND one standalone p-value CSV per exposure, in
     # addition to the combined grid/CSV below. This is the per-exposure,
     # per-chromosome p-value CSV requested: chromosome, n_tested,
-    # n_significant_observed, expected (n_tested*alpha), binom_p, binom_p_adj.
+    # n_significant_observed, expected (n_tested * exposure's own significance
+    # rate), binom_p, binom_p_adj.
     by_exposure_dir = out_dir / "figures" / "by_exposure"
     by_exposure_dir.mkdir(parents=True, exist_ok=True)
     individual_paths = []
@@ -869,7 +893,7 @@ def compute_chromosome_enrichment_by_exposure(
         r, c = divmod(idx, ncols)
         axes[r][c].axis("off")
     fig.suptitle("Observed vs expected significant variants per chromosome, by exposure "
-                 "(expected = n_tested \u00d7 \u03b1)", fontsize=12)
+                 "(expected = n_tested \u00d7 exposure's own significance rate)", fontsize=12)
     plt.tight_layout(rect=(0, 0, 1, 0.97))
     plt.savefig(fig_path, dpi=200)
     plt.close(fig)
@@ -957,12 +981,14 @@ def main():
                        "Figure 3. Distribution of empirical_p_g1.")
     add_figure_to_doc(doc_full, FIG_DIR / "observed_vs_expected_by_chromosome.png",
                        "Figure 4. Observed vs expected significant variants per chromosome, all exposures pooled "
-                       f"(generation {args.generation}). Expected = n_tested \u00d7 alpha (alpha = {args.alpha}); "
-                       "p-values from a one-sided binomial test, BH-adjusted across chromosomes.")
+                       f"(generation {args.generation}). Expected = n_tested \u00d7 (total significant / total "
+                       "tested, pooled across all exposures); p-values from a one-sided binomial test, "
+                       "BH-adjusted across chromosomes.")
     add_figure_to_doc(doc_full, FIG_DIR / "observed_vs_expected_by_chromosome_per_exposure.png",
                        "Figure 5. Observed vs expected significant variants per chromosome, one panel per exposure "
-                       f"(generation {args.generation}). Same alpha-null model as Figure 4, computed independently "
-                       "per exposure.", width_in=6.5)
+                       f"(generation {args.generation}). Same proportional null model as Figure 4, but computed "
+                       "independently for each exposure (using that exposure's own significance rate).",
+                       width_in=6.5)
 
     # --- Per-exposure enrichment tables (chromosome-by-chromosome p-values) ---
     per_exposure_tables = chrom_by_exposure_summary.get("per_exposure_tables", {})
@@ -971,9 +997,11 @@ def main():
         doc_full.add_paragraph(
             f"For each exposure and chromosome: n_tested variants (COUNT(*) FROM variant_results "
             f"WHERE exposure=... AND generation={args.generation} GROUP BY chromosome), the number "
-            f"found significant (empirical_p_g1 < {args.alpha}), the expected count under chance "
-            f"alone (n_tested \u00d7 {args.alpha}), and a one-sided binomial p-value (BH-adjusted "
-            "within each exposure). Adjusted p-values below alpha are highlighted."
+            f"found significant (empirical_p_g1 < {args.alpha}), the expected count under a "
+            "proportional-allocation null (n_tested \u00d7 the exposure's own overall significance "
+            "rate, i.e. that exposure's total significant / total tested), and a one-sided binomial "
+            f"p-value testing chromosome-level concentration of hits (BH-adjusted within each "
+            f"exposure). Adjusted p-values below {args.alpha} are highlighted."
         )
         for exposure, merged in per_exposure_tables.items():
             add_pvalue_table_to_doc(
