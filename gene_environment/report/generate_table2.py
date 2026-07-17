@@ -22,6 +22,7 @@ Behavior:
     output/table2/figures/observed_vs_expected_by_chromosome.png
     output/table2/figures/observed_vs_expected_by_chromosome_per_exposure.png
     output/table2/figures/by_exposure/observed_vs_expected_chrom_<exposure>.png  (one per exposure)
+    output/table2/figures/by_exposure/pvalues_<exposure>.csv                    (one per exposure)
     output/table2/table2_chromosome_enrichment_stats.csv
     output/table2/table2_chromosome_enrichment_by_exposure_stats.csv
 - Numeric formatting: p-values 3 significant digits, coefficients 2 decimals.
@@ -58,12 +59,12 @@ FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 ASTORE_NAME = "get_significant_results_table_2"
 
-LAND_USE_LABELS = {
-    "seminativi_1500": "Arable land - 1500m buffer",
-    "vigneti_1500": "Vineyards - 1500m buffer",
-    "risaie_1500": "Rice paddies - 1500m buffer",
-}
-
+# Columns to include in Word tables (order).
+# NOTE: "empirical_p_2" (no "g") is kept exactly as in the original script.
+# Every other column follows the "_g1"/"_g2" convention, so this looks like it
+# could be a typo for "empirical_p_g2" -- please confirm against the real
+# astore output before I rename it, otherwise the column will silently come
+# back empty in the report.
 TABLE_COLUMNS = [
     "exposure",
     "variant",
@@ -334,46 +335,48 @@ def _normalize_chrom_label(chrom) -> str:
     return c
 
 
-def fetch_tested_variant_counts_by_exposure_and_chromosome(get_connection, cursor_scope, generation: int) -> pd.DataFrame:
+def fetch_tested_variant_counts_by_chromosome(get_connection, cursor_scope, exposure: str, generation: int) -> Dict[str, int]:
     """
-    Return a DataFrame [exposure, chromosome, n_tested] for the given
-    generation, for ALL exposures in one query:
-        SELECT exposure, chromosome, COUNT(*) AS c
+    Tested-variant counts per chromosome for a single exposure, mirroring:
+        SELECT chromosome, COUNT(*)
         FROM variant_results
-        WHERE generation = <generation>
-        GROUP BY exposure, chromosome
-
-    Returns an empty DataFrame (with the right columns) if no rows.
+        WHERE exposure = <exposure> AND generation = <generation>
+        GROUP BY chromosome
     """
     sql = (
-        "SELECT exposure, chromosome, COUNT(*) AS c "
+        "SELECT chromosome, COUNT(*) "
         "FROM variant_results "
-        "WHERE generation = %s "
-        "GROUP BY exposure, chromosome"
+        "WHERE exposure = %s AND generation = %s "
+        "GROUP BY chromosome"
     )
-    rows: List[dict] = []
+    counts: Dict[str, int] = {}
     with get_connection() as conn:
-        with cursor_scope(conn, dictionary=True) as cur:
-            cur.execute(sql, (generation,))
-            for r in cur.fetchall():
-                exposure = r.get("exposure")
-                chrom = r.get("chromosome")
-                cnt = r.get("c", 0)
-                if exposure is None or chrom is None:
+        with cursor_scope(conn) as cur:
+            cur.execute(sql, (exposure, generation))
+            for chrom, cnt in cur.fetchall():
+                if chrom is None:
                     continue
-                rows.append({
-                    "exposure": str(exposure),
-                    "chromosome": _normalize_chrom_label(chrom),
-                    "n_tested": int(cnt),
-                })
+                label = _normalize_chrom_label(chrom)
+                counts[label] = counts.get(label, 0) + int(cnt)
+    return counts
+
+
+def fetch_tested_variant_counts_for_exposures(get_connection, cursor_scope, exposures: List[str], generation: int) -> pd.DataFrame:
+    """
+    Run `fetch_tested_variant_counts_by_chromosome` once per exposure and
+    stack the results into a DataFrame [exposure, chromosome, n_tested].
+    Returns an empty DataFrame (with the right columns) if there are no
+    exposures or no rows come back for any of them.
+    """
+    rows: List[dict] = []
+    for exposure in exposures:
+        counts = fetch_tested_variant_counts_by_chromosome(get_connection, cursor_scope, exposure, generation)
+        for chrom, n_tested in counts.items():
+            rows.append({"exposure": exposure, "chromosome": chrom, "n_tested": n_tested})
 
     if not rows:
         return pd.DataFrame(columns=["exposure", "chromosome", "n_tested"])
-
-    out = pd.DataFrame(rows)
-    # Collapse duplicates that can appear if normalization merges two raw DB
-    # labels (e.g. "1" and "chr1" both -> "1").
-    return out.groupby(["exposure", "chromosome"], as_index=False)["n_tested"].sum()
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -712,18 +715,27 @@ def compute_chromosome_enrichment_by_exposure(
     combined = pd.concat(all_rows, ignore_index=True)
     combined.to_csv(stats_path, index=False)
 
-    # One standalone figure per exposure, in addition to the combined grid below.
+    # One standalone figure AND one standalone p-value CSV per exposure, in
+    # addition to the combined grid/CSV below.
     by_exposure_dir = out_dir / "figures" / "by_exposure"
     by_exposure_dir.mkdir(parents=True, exist_ok=True)
     individual_paths = []
+    individual_csv_paths = []
     for exposure, merged in per_exposure_tables.items():
-        indiv_path = by_exposure_dir / f"observed_vs_expected_chrom_{_slugify(exposure)}.png"
+        slug = _slugify(exposure)
+
+        indiv_path = by_exposure_dir / f"observed_vs_expected_chrom_{slug}.png"
         plt.figure(figsize=(max(6, 0.6 * len(merged)), 4.5))
-        _draw_chrom_bars(plt.gca(), merged, title=LAND_USE_LABELS[exposure])
+        _draw_chrom_bars(plt.gca(), merged, title=str(exposure))
         plt.tight_layout()
         plt.savefig(indiv_path, dpi=200)
         plt.close()
         individual_paths.append(indiv_path)
+
+        csv_cols = ["chromosome", "n_tested", "n_significant_observed", "expected", "binom_p", "binom_p_adj"]
+        indiv_csv_path = by_exposure_dir / f"pvalues_{slug}.csv"
+        merged[csv_cols].to_csv(indiv_csv_path, index=False)
+        individual_csv_paths.append(indiv_csv_path)
 
     n = len(per_exposure_tables)
     ncols = min(3, n)
@@ -731,7 +743,7 @@ def compute_chromosome_enrichment_by_exposure(
     fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.6 * nrows), squeeze=False)
     for idx, (exposure, merged) in enumerate(per_exposure_tables.items()):
         r, c = divmod(idx, ncols)
-        _draw_chrom_bars(axes[r][c], merged, title=LAND_USE_LABELS[exposure])
+        _draw_chrom_bars(axes[r][c], merged, title=str(exposure))
     for idx in range(n, nrows * ncols):
         r, c = divmod(idx, ncols)
         axes[r][c].axis("off")
@@ -745,6 +757,7 @@ def compute_chromosome_enrichment_by_exposure(
         "per_exposure_csv": str(stats_path),
         "figure": str(fig_path),
         "individual_figures": [str(p) for p in individual_paths],
+        "individual_pvalue_csvs": [str(p) for p in individual_csv_paths],
     }
     return combined, summary
 
@@ -776,7 +789,8 @@ def main():
 
     make_figures(df)
 
-    tested_df = fetch_tested_variant_counts_by_exposure_and_chromosome(get_connection, cursor_scope, args.generation)
+    exposures = sorted(df["exposure"].dropna().unique().tolist())
+    tested_df = fetch_tested_variant_counts_for_exposures(get_connection, cursor_scope, exposures, args.generation)
 
     chrom_stats_df, chrom_summary = compute_chromosome_enrichment_global(
         df, tested_df, alpha=args.alpha, out_dir=OUT_DIR
@@ -832,8 +846,8 @@ def main():
     print(f"Full supplementary Word: {full_path}")
     print(f"Figures saved in: {FIG_DIR}")
     print(f"Chromosome enrichment CSV (pooled): {chrom_summary['per_chromosome_csv']}")
-    print(f"Chromosome enrichment CSV (by exposure): {chrom_by_exposure_summary['per_exposure_csv']}")
-    print(f"Per-exposure figures ({chrom_by_exposure_summary['n_exposures_plotted']}): "
+    print(f"Chromosome enrichment CSV (by exposure, combined): {chrom_by_exposure_summary['per_exposure_csv']}")
+    print(f"Per-exposure figures + p-value CSVs ({chrom_by_exposure_summary['n_exposures_plotted']}): "
           f"{FIG_DIR / 'by_exposure'}")
 
 
