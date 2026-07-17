@@ -27,6 +27,12 @@ PESTICIDE_KEYWORDS = (
     "pesticide", "herbicide", "insecticide", "fungicide", "rodenticide",
     "chlorpyrifos", "glyphosate", "paraquat", "atrazine", "malathion",
     "permethrin", "carbaryl", "diazinon",
+
+    "ddt", "dichlorodiphenyltrichloroethane", "rotenone", "fipronil",
+    "2,4-d", "dieldrin", "endosulfan", "deltamethrin", "imidacloprid",
+    "endrin", "lindane", "aldrin", "chlordane", "heptachlor",
+    "organophosphate", "organochlorine", "carbamate",
+    "diquat", "metolachlor", "pyrethroid", "pyrethrin",
 )
 
 

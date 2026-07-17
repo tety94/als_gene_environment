@@ -285,19 +285,20 @@ def get_genes_to_annotate() -> list[str]:
             """)
             return [row[0] for row in cur.fetchall()]
 
-
 def upsert_gene_neuro_annotation(data: dict) -> None:
     sql = """
     INSERT INTO gene_neuro_annotation (
         gene_id, gene_symbol, gene_type, expressed_brain, brain_tissues,
         expressed_neurons, expressed_glia, cell_types, go_neuro_processes,
-        go_toxic_response, ctd_chemicals, ctd_neuro_diseases, 
+        go_toxic_response, ctd_chemicals, ctd_neuro_diseases,
+        ctd_neuro_disease_direct, ctd_neuro_disease_pesticide_mediated,
         als_panelapp_confidence, als_opentargets_score,
         neuro_plausibility_score
     ) VALUES (
         %(gene_id)s, %(gene_symbol)s, %(gene_type)s, %(expressed_brain)s, %(brain_tissues)s,
         %(expressed_neurons)s, %(expressed_glia)s, %(cell_types)s, %(go_neuro_processes)s,
-        %(go_toxic_response)s, %(ctd_chemicals)s, %(ctd_neuro_diseases)s, 
+        %(go_toxic_response)s, %(ctd_chemicals)s, %(ctd_neuro_diseases)s,
+        %(ctd_neuro_disease_direct)s, %(ctd_neuro_disease_pesticide_mediated)s,
         %(als_panelapp_confidence)s, %(als_opentargets_score)s,
         %(neuro_plausibility_score)s
     )
@@ -308,6 +309,8 @@ def upsert_gene_neuro_annotation(data: dict) -> None:
         cell_types=VALUES(cell_types), go_neuro_processes=VALUES(go_neuro_processes),
         go_toxic_response=VALUES(go_toxic_response), ctd_chemicals=VALUES(ctd_chemicals),
         ctd_neuro_diseases=VALUES(ctd_neuro_diseases),
+        ctd_neuro_disease_direct=VALUES(ctd_neuro_disease_direct),
+        ctd_neuro_disease_pesticide_mediated=VALUES(ctd_neuro_disease_pesticide_mediated),
         als_panelapp_confidence=VALUES(als_panelapp_confidence),
         als_opentargets_score=VALUES(als_opentargets_score),
         neuro_plausibility_score=VALUES(neuro_plausibility_score),
