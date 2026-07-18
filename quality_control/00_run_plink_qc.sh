@@ -385,7 +385,7 @@ else
 fi
 
 echo ""
-echo "==> Step 5: diagnostica missingness + filtro qualita' (--geno/--mind)"
+echo "==> Step 5: diagnostica missingness + filtro qualita' (--geno poi --mind)"
 echo "    bcftools merge fa l'unione dei siti tra batch: una variante presente"
 echo "    solo in 1-2 batch su 3 (o su 2, se ne usi meno) risulta genotipata"
 echo "    solo in quei campioni e mancante (missing) negli altri, pur avendo"
@@ -393,9 +393,18 @@ echo "    una MAF apparente perfettamente normale -- --maf da solo NON la"
 echo "    intercetta. Questo gonfia artificialmente il kinship stimato,"
 echo "    specialmente tra campioni di batch diversi."
 echo ""
-echo "    Prima applico il filtro con soglia default 0.05 (variante scartata"
-echo "    se mancante in >5% dei campioni; campione scartato se manca in >5%"
-echo "    delle varianti). Puoi cambiare le soglie con GENO_THRESH/MIND_THRESH"
+echo "    IMPORTANTE: --geno e --mind vanno applicati in DUE chiamate plink2"
+echo "    SEQUENZIALI, non in una sola. Se li lanci insieme, plink2 calcola la"
+echo "    missingness per campione (--mind) sul dataset ANCORA NON ripulito"
+echo "    dalle varianti sbilanciate tra batch: un intero batch puo' risultare"
+echo "    con missingness aggregata elevata (perche' 'manca' su tutte le"
+echo "    varianti chiamate solo nell'altro batch) e finire scartato quasi"
+echo "    per intero PRIMA che --geno abbia rimosso quelle varianti. Per"
+echo "    questo qui si applica prima --geno (pulisce le varianti), poi,"
+echo "    SUL DATASET GIA' RIPULITO, --mind (ora la missingness per campione"
+echo "    riflette la copertura reale, non l'artefatto batch)."
+echo ""
+echo "    Soglia default 0.05 per entrambi. Cambiabile con GENO_THRESH/MIND_THRESH"
 echo "    come variabili d'ambiente prima di lanciare lo script, es.:"
 echo "      GENO_THRESH=0.02 MIND_THRESH=0.05 ./00_run_plink_qc.sh ..."
 GENO_THRESH="${GENO_THRESH:-0.05}"
@@ -415,16 +424,40 @@ echo "  occhio invece di usare il default 0.05, guarda la distribuzione di"
 echo "  F_MISS in questi file (es. e' bimodale? un blocco di varianti intorno"
 echo "  a missing ~1/3 o ~1/2 e' la firma di un sito presente solo in alcuni batch)."
 
-if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/merged_qc.pgen" ] && [ -f "$OUT_DIR/merged_qc.pvar" ] && [ -f "$OUT_DIR/merged_qc.psam" ]; then
-    echo "  [skip, gia' presente] $OUT_DIR/merged_qc.pgen"
+echo ""
+echo "  -- Step 5a: rimuovo le varianti sbilanciate (--geno $GENO_THRESH) --"
+if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/merged_geno.pgen" ] && [ -f "$OUT_DIR/merged_geno.pvar" ] && [ -f "$OUT_DIR/merged_geno.psam" ]; then
+    echo "  [skip, gia' presente] $OUT_DIR/merged_geno.pgen"
 else
     plink2 --pfile "$OUT_DIR/merged_all" \
            --geno "$GENO_THRESH" \
+           --make-pgen \
+           --out "$OUT_DIR/merged_geno"
+fi
+
+echo ""
+echo "  -- Step 5b: rimuovo i campioni con copertura reale scarsa (--mind $MIND_THRESH), sul dataset gia' ripulito --"
+if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/merged_qc.pgen" ] && [ -f "$OUT_DIR/merged_qc.pvar" ] && [ -f "$OUT_DIR/merged_qc.psam" ]; then
+    echo "  [skip, gia' presente] $OUT_DIR/merged_qc.pgen"
+else
+    plink2 --pfile "$OUT_DIR/merged_geno" \
            --mind "$MIND_THRESH" \
            --make-pgen \
            --out "$OUT_DIR/merged_qc"
 fi
+
+n_samples_before=$(($(wc -l < "$OUT_DIR/merged_all.psam") - 1))
+n_samples_after=$(($(wc -l < "$OUT_DIR/merged_qc.psam") - 1))
+n_samples_dropped=$((n_samples_before - n_samples_after))
+echo "  Campioni prima del filtro --mind: $n_samples_before | dopo: $n_samples_after | scartati: $n_samples_dropped"
+if [ "$n_samples_dropped" -gt $((n_samples_before / 10)) ]; then
+    echo "  >>> ATTENZIONE: scartato piu' del 10% dei campioni per missingness."
+    echo "  >>> Controlla $OUT_DIR/merged_qc.log per capire se sono concentrati"
+    echo "  >>> in un batch specifico (possibile problema di copertura reale di"
+    echo "  >>> quel batch, non solo artefatto da merge) prima di proseguire."
+fi
 echo "  Dataset filtrato: $OUT_DIR/merged_qc (usato da qui in poi per pruning/kinship/PCA)"
+
 
 echo ""
 echo "==> Step 6: LD pruning (finestra $LD_WINDOW_SIZE, step $LD_STEP, r2 < $LD_R2_THRESHOLD)"
