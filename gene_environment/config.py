@@ -123,6 +123,24 @@ class Config:
     min_sample_size: int = field(default_factory=lambda: _env_int("MIN_SAMPLE_SIZE", 10))
     max_smd: float = field(default_factory=lambda: _env_float("MAX_SMD", 0.25))
 
+    # ---- PCA COVARIATES (correzione per struttura di popolazione) ----
+    # Le PC sono calcolate SEPARATAMENTE per generazione dalla pipeline QC
+    # (00_run_plink_qc.sh -> extract_pca_covariates.py) e usate come
+    # covariate di correzione (non di interazione) nell'OLS -- vedi
+    # gene_environment/utils/pca_utils.py e modeling.py. Di default ATTIVE:
+    # per disattivarle esplicitamente, USE_PCA_COVARIATES=false.
+    use_pca_covariates: bool = field(default_factory=lambda: _env_bool("USE_PCA_COVARIATES", True))
+    pca_n_components: int = field(default_factory=lambda: _env_int("PCA_N_COMPONENTS", 5))
+    # {generation} viene sostituito con cfg.generation COSI' COM'E' (int: 1,
+    # 2, 3 -- il prefisso "gen" e' gia' scritto nel template di default, non
+    # nel valore sostituito).
+    pca_covariates_path_template: str = field(
+        default_factory=lambda: _env(
+            "PCA_COVARIATES_PATH_TEMPLATE",
+            "/mnt/cresla_prod/genome_datasets/qc_output_gen{generation}/pca_covariates.csv",
+        )
+    )
+
     # ---- PERMUTATION ----
     n_perm: int = field(default_factory=lambda: _env_int("N_PERM", 500))
     n_perm_high: int = field(default_factory=lambda: _env_int("N_PERM_HIGH", 10000))

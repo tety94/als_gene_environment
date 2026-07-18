@@ -31,7 +31,7 @@ python interpret_plink_output.py \
     --eigenvec qc_output/pca.eigenvec \
     --metadata sample_metadata.csv \
     --exposure-col exposure_agri_score \
-    --pvalues gwas_results.csv --pvalue-col p \
+    --pvaluespvalues gwas_results.csv --pvalue-col p \
     --out-dir diagnostics_output
 """
 
@@ -91,19 +91,10 @@ def summarize_relatedness(kin_df, pi_hat_threshold):
 
 def correlate_pcs_with_exposure(eigenvec_df, metadata_df, exposure_col, n_pcs):
     from scipy.stats import pearsonr
-    print("Colonne eigenvec_df:", eigenvec_df.columns.tolist())
-    print("Colonne metadata_df:", metadata_df.columns.tolist())
-
-    print("\nEsempio valori IID (eigenvec):")
-    print(eigenvec_df["IID"].head())
-
-    print("\nEsempio valori id (metadata):")
-    print(metadata_df["id"].head())
 
     eigenvec_df["IID_clean"] = eigenvec_df["IID"].str.split("_").str[0]
     merged = eigenvec_df.merge(metadata_df, left_on="IID_clean", right_on="id", how="inner")
-    print("merged shape:", merged.shape)
-    print("NA exposure:", merged[exposure_col].isna().sum())
+
     n_matched = len(merged)
     n_meta = len(metadata_df)
     n_eig = len(eigenvec_df)

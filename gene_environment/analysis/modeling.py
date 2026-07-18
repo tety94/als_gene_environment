@@ -1,8 +1,21 @@
 """
 Core del test per singola variante: matching + regressione + permutation test
-+ (NOVITÀ) statistiche di differenza onset_age, tutto salvato insieme.
++ statistiche di differenza onset_age, tutto salvato insieme.
 
-BUG CRITICO trovato e corretto:
+NOVITA' (correzione per struttura di popolazione): il modello OLS include
+ora, DI DEFAULT, le prime N componenti principali (PCA) come covariate di
+correzione -- NON di interazione -- caricate per la generazione corrente
+(cfg.generation) da gene_environment/utils/pca_utils.py. Le colonne PCA
+sono popolate una volta per worker da `orchestrator.init_worker` in
+`global_covariate_cols` (stesso pattern di `global_df`), cosi' non serve
+ripassarle ad ogni submit al ProcessPoolExecutor.
+
+Per disattivarle: cfg.use_pca_covariates = False (env USE_PCA_COVARIATES=
+false) -> global_covariate_cols resta [] e il modello torna esattamente
+quello di prima (nessuna covariata aggiuntiva, ne' nel path smf.ols ne' nel
+fast path delle permutazioni).
+
+BUG CRITICO trovato e corretto (invariato dalla versione precedente):
   `rng = np.random.RandomState(RANDOM_STATE + (abs(hash(variant_col)) % 2_000_000))`
   `hash()` su una stringa in Python NON è stabile fra esecuzioni diverse del
   processo (randomizzazione dell'hash attivata di default dal 2012, PEP 456)
@@ -13,7 +26,7 @@ BUG CRITICO trovato e corretto:
   per un'analisi statistica. Corretto usando hashlib.md5 (hash stabile,
   deterministico, indipendente da PYTHONHASHSEED).
 
-ALTRE MODIFICHE:
+ALTRE MODIFICHE (invariate dalla versione precedente):
   - tqdm dentro ai worker di ProcessPoolExecutor produceva output confuso
     (decine di processi che scrivono barre di progresso sullo stesso
     terminale). Sostituito con log periodici (ogni N permutazioni) tramite
@@ -30,6 +43,15 @@ ALTRE MODIFICHE:
     stesso identico dataset usato per il modello) vengono calcolate qui,
     SUBITO, e restituite insieme al resto -> salvate a DB nella stessa riga,
     niente più script separato da rilanciare a posteriori.
+
+NOTA (non affrontata qui, vedi conversazione): cfg.covariates (es. "sex")
+esiste in config.py ma NON viene ancora usato in build_formula qui sotto
+(passato come lista vuota nel path "osservato" prima di questa modifica).
+Non l'ho unito automaticamente alle PCA in questo intervento perche' se
+"sex" fosse salvato come stringa non numerica romperebbe
+`assert_numeric_covariates` nel fast path per OGNI variante (il fast path
+non fa dummy-encoding come patsy) -- va verificato il dtype reale prima di
+aggiungerlo.
 """
 from __future__ import annotations
 
@@ -55,9 +77,11 @@ from gene_environment.logging_utils import get_logger
 
 log = get_logger(__name__)
 
-# Popolato dall'initializer del worker (vedi orchestrator.py) — evita di
-# passare/pickle-are il dataframe intero ad ogni submit.
+# Popolati dall'initializer del worker (vedi orchestrator.py) — evita di
+# passare/pickle-are il dataframe intero (e la lista di covariate) ad ogni
+# submit.
 global_df = None
+global_covariate_cols: list[str] = []
 
 
 def _stable_seed(base_seed: int, variant_col: str) -> int:
@@ -85,16 +109,16 @@ def _find_interaction_term(mod_params_index, variant_col: str) -> str | None:
 
 
 def _run_permutation_batch(
-    df_model, variant_col, X_scaled, Ecols, cfg, rng, n_perm, log_prefix
+    df_model, variant_col, X_scaled, Ecols, covariate_cols, cfg, rng, n_perm, log_prefix
 ):
     """Esegue n_perm permutazioni.
 
     FAST PATH (vedi fast_ols.py e matching.py): rispetto alla versione
     originale, che per ogni permutazione rifaceva da zero fit dello scaler +
     fit di NearestNeighbors + smf.ols(formula=...) con parsing patsy, qui:
-      - lo scaler sulle covariate è fittato UNA VOLTA fuori da questo loop
-        (le covariate non cambiano tra permutazioni, vedi
-        `precompute_scaled_covariates`) e passato come `X_scaled`;
+      - lo scaler sulle covariate di matching (Ecols) è fittato UNA VOLTA
+        fuori da questo loop (le covariate non cambiano tra permutazioni,
+        vedi `precompute_scaled_covariates`) e passato come `X_scaled`;
       - il matching usa cdist+argpartition su `X_scaled` invece di rifittare
         NearestNeighbors ad ogni chiamata (verificato: stessa selezione di
         vicini di sklearn, 0 mismatch su test);
@@ -103,6 +127,12 @@ def _run_permutation_batch(
         (verificato: stesso coefficiente, differenza ~1e-13).
     Risultato verificato numericamente equivalente all'originale; ~15-25x
     più veloce per permutazione nei benchmark.
+
+    NOTA: covariate_cols (es. le PC) NON entra nel matching (X_scaled resta
+    basato solo su Ecols, le esposizioni) -- entra SOLO nella design matrix
+    della regressione (C_values), come covariata di correzione additiva.
+    Matching e correzione di popolazione restano quindi due meccanismi
+    separati e componibili, coerentemente con build_formula.
     """
     betas = np.empty(n_perm)
     betas[:] = np.nan
@@ -110,6 +140,7 @@ def _run_permutation_batch(
     variant_values = df_model[variant_col].values
     y_values = df_model[cfg.target_col].values
     E_values = df_model[Ecols].values
+    C_values = df_model[covariate_cols].values if covariate_cols else None
     n_ecols = E_values.shape[1]
     inter_idx = interaction_column_index(n_ecols)
 
@@ -125,7 +156,8 @@ def _run_permutation_batch(
         if idx.shape[0] < cfg.min_sample_size:
             continue
 
-        beta = build_design_and_solve(perm_variant[idx], E_values[idx], y_values[idx])
+        C_idx = C_values[idx] if C_values is not None else None
+        beta = build_design_and_solve(perm_variant[idx], E_values[idx], y_values[idx], C_idx)
         if beta is None:
             continue
         betas[i] = beta[inter_idx]
@@ -139,6 +171,7 @@ def _run_permutation_batch(
 def process_single_variant(variant_col: str, variant_original: str, Ecols: list[str]) -> dict | None:
     cfg = get_config()
     df = global_df
+    covariate_cols = global_covariate_cols  # es. le PC, popolate da init_worker; [] se disattivate
 
     df = df[df[variant_col] != "."].copy()
     df[variant_col] = df[variant_col].astype(int)
@@ -165,7 +198,11 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     if n_treated < cfg.min_treated or n_control < cfg.min_treated:
         return _empty()
 
-    cols = [cfg.target_col, variant_col, "_match_variant"] + Ecols
+    # covariate_cols (le PC) entra qui nella selezione colonne: se un
+    # campione non ha PCA (merge fallito per quel IID, vedi pca_utils.py)
+    # viene scartato dal dropna() esattamente come per qualunque altra
+    # covariata mancante -- stesso trattamento, nessuna gestione speciale.
+    cols = [cfg.target_col, variant_col, "_match_variant"] + Ecols + covariate_cols
     df_model = df[cols].dropna()
     if df_model.shape[0] < cfg.min_sample_size:
         return _empty()
@@ -202,7 +239,11 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     if max_smd > cfg.max_smd:
         return _empty(max_smd=max_smd, onset=onset_dict)
 
-    formula = build_formula(cfg.target_col, variant_col, Ecols, [], matched_obs)
+    # covariate_cols (le PC) entra qui nella formula come termine additivo
+    # "+ PC1 + PC2 + ..." FUORI dalla moltiplicazione con variant -> corregge
+    # il modello senza introdurre interazioni variant:PCk (vedi
+    # build_formula e fast_ols.py per la struttura della design matrix).
+    formula = build_formula(cfg.target_col, variant_col, Ecols, covariate_cols, matched_obs)
     mod = smf.ols(formula=formula, data=matched_obs).fit()
     interaction_name = _find_interaction_term(mod.params.index, variant_col)
 
@@ -229,11 +270,12 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
 
     rng = np.random.RandomState(_stable_seed(cfg.random_state, variant_col))
 
-    # Scaler sulle covariate fittato UNA VOLTA per variante (non ad ogni
-    # permutazione, vedi fast_ols.py/matching.py). Calcolato solo qui, dopo
-    # il filtro min_obs_coef, per non sprecare lavoro sulle varianti che non
-    # arrivano comunque alla fase di permutazione.
-    assert_numeric_covariates(df_model[Ecols])
+    # Scaler sulle covariate di MATCHING (Ecols soltanto, non le PC) fittato
+    # UNA VOLTA per variante (non ad ogni permutazione, vedi
+    # fast_ols.py/matching.py). Calcolato solo qui, dopo il filtro
+    # min_obs_coef, per non sprecare lavoro sulle varianti che non arrivano
+    # comunque alla fase di permutazione.
+    assert_numeric_covariates(df_model[Ecols + covariate_cols])
     X_scaled = precompute_scaled_covariates(df_model, Ecols)
 
     # ======================================================
@@ -250,7 +292,7 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     for start in range(0, cfg.n_perm, check_every):
         n_batch = min(check_every, cfg.n_perm - start)
         batch = _run_permutation_batch(
-            df_model, variant_col, X_scaled, Ecols, cfg, rng, n_batch,
+            df_model, variant_col, X_scaled, Ecols, covariate_cols, cfg, rng, n_batch,
             log_prefix=f"[{variant_col}] LIGHT",
         )
         perm_betas_light.extend(batch.tolist())
@@ -278,7 +320,7 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     if not stopped_early and p_emp_light is not None and p_emp_light <= cfg.pvalue_threshold:
         n_additional = cfg.n_perm_high - cfg.n_perm
         perm_betas_additional = _run_permutation_batch(
-            df_model, variant_col, X_scaled, Ecols, cfg, rng, n_additional,
+            df_model, variant_col, X_scaled, Ecols, covariate_cols, cfg, rng, n_additional,
             log_prefix=f"[{variant_col}] HIGH",
         )
         perm_betas_final = np.concatenate([perm_betas_light, perm_betas_additional])

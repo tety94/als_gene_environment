@@ -53,9 +53,36 @@ def main() -> None:
         "--id-column-name", default="IID",
         help="nome da dare alla colonna identificativo campione nel CSV di output (default: IID)",
     )
+    parser.add_argument(
+        "--strip-doubled-id", action="store_true",
+        help=(
+            "se l'IID e' nel formato 'NOME_NOME' (le due meta' separate da underscore "
+            "sono identiche -- tipico quando nel VCF originale FamilyID=IndividualID), "
+            "lo riduce a 'NOME'. Non tocca gli ID dove le due meta' sono diverse (in quel "
+            "caso l'underscore fa probabilmente parte del nome vero e proprio)."
+        ),
+    )
     args = parser.parse_args()
 
     df = load_eigenvec(args.eigenvec)
+
+    if args.strip_doubled_id:
+        def _strip(iid: str) -> str:
+            if "_" in iid:
+                first, _, rest = iid.partition("_")
+                if rest == first:
+                    return first
+            return iid
+
+        stripped = df["IID"].apply(_strip)
+        n_changed = (stripped != df["IID"]).sum()
+        print(f"--strip-doubled-id: {n_changed}/{len(df)} ID nel formato NOME_NOME ridotti a NOME")
+        if n_changed < len(df):
+            print(
+                f"  ATTENZIONE: {len(df) - n_changed} ID NON modificati (le due meta' non "
+                f"coincidevano, o non contenevano underscore) -- controllali a mano se inattesi."
+            )
+        df["IID"] = stripped
 
     pc_cols = [f"PC{i}" for i in range(1, args.n_pcs + 1)]
     missing_pcs = [c for c in pc_cols if c not in df.columns]
