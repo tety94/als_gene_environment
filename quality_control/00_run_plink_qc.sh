@@ -30,9 +30,10 @@ set -euo pipefail
 #     Step 2: bcftools merge tra i batch, per ciascun cromosoma (parallelo)
 #     Step 3: bcftools concat dei 22 cromosomi -> un VCF genome-wide
 #     Step 4: UNA conversione plink2 --vcf ... --make-pgen
-#     Step 5: LD pruning
-#     Step 6: relatedness (KING)
-#     Step 7: PCA
+#     Step 5: diagnostica + filtro missingness (--geno/--mind) -> merged_qc
+#     Step 6: LD pruning
+#     Step 7: relatedness (KING)
+#     Step 8: PCA
 #
 # NOVITA' rispetto alla prima versione:
 #   - Step 1 e Step 2 sono parallelizzati con xargs -P (fino a 16 worker).
@@ -72,6 +73,19 @@ set -euo pipefail
 # --force: ignora tutti gli output gia' presenti e rifa' l'intera pipeline
 #   da zero, sovrascrivendo.
 #
+# PARAMETRI DI FILTRO (variabili d'ambiente, non flag -- default = quelli
+# gia' usati nel resto della pipeline gene_environment_v2):
+#   MAF_THRESHOLD   (default 0.01) soglia MAF, usata sia nel filtro
+#                   bcftools view di Step 1 (solo se NON --use-filtered)
+#                   sia nel pruning/estrazione di Step 6.
+#   LD_WINDOW_SIZE  (default 50)   dimensione finestra per --indep-pairwise.
+#   LD_STEP         (default 5)    step per --indep-pairwise.
+#   LD_R2_THRESHOLD (default 0.5)  soglia r2 per --indep-pairwise.
+#   GENO_THRESH     (default 0.05) soglia missingness per variante (Step 5).
+#   MIND_THRESH     (default 0.05) soglia missingness per campione (Step 5).
+# Esempio per cambiarli:
+#   MAF_THRESHOLD=0.01 LD_R2_THRESHOLD=0.5 ./00_run_plink_qc.sh --use-filtered ...
+#
 # Esempio con i tuoi 3 batch, VCF gia' filtrati, 16 worker:
 #   ./00_run_plink_qc.sh --use-filtered --jobs 16 \
 #       /mnt/cresla_prod/genome_datasets/gen1 \
@@ -88,11 +102,10 @@ set -euo pipefail
 # batch; un campione che non ha genotipo in un sito presente solo in un
 # altro batch viene riempito come mancante (./.) invece di essere escluso.
 # Con soglie MAF diverse o pipeline di chiamata leggermente diverse tra
-# batch questo puo' introdurre missingness non banale in alcuni siti. Il
-# filtro MAF >= 0.05 riapplicato allo Step 5 (dopo il merge) aiuta ma non
-# elimina la missingness sito-per-sito; se PCA/kinship sembrano strani,
-# vale la pena controllare $OUT_DIR/merged_all.log per il tasso di
-# missing genotype rate.
+# batch questo puo' introdurre missingness non banale in alcuni siti, che
+# gonfia artificialmente le stime di kinship. Per questo lo Step 5 applica
+# un filtro esplicito --geno/--mind (con report diagnostico) DOPO il merge
+# e PRIMA di pruning/kinship/PCA -- vedi commenti nello Step 5 piu' sotto.
 #
 # NOTA SUL PARALLELISMO: attenzione a I/O. Con storage di rete condiviso
 # (es. /mnt/cresla_prod/), 16 worker in parallelo possono saturare il
@@ -147,6 +160,17 @@ echo "Modalita': $([ $USE_FILTERED -eq 1 ] && echo 'USO VCF GIA FILTRATI (skip b
 echo "Worker paralleli: $JOBS"
 echo "Resume: $([ $FORCE -eq 1 ] && echo 'DISATTIVATO (--force: rifaccio tutto da zero)' || echo 'attivo (salto gli step il cui output esiste gia'"'"')')"
 echo "Log principale: $LOGFILE"
+
+# Parametri di filtro MAF/LD pruning, sovrascrivibili via variabili
+# d'ambiente. Default = gli stessi valori gia' usati nel resto della tua
+# pipeline (gene_environment_v2), per coerenza tra i due:
+#   MAF_THRESHOLD=0.01 LD_WINDOW_SIZE=50 LD_STEP=5 LD_R2_THRESHOLD=0.5
+MAF_THRESHOLD="${MAF_THRESHOLD:-0.01}"
+LD_WINDOW_SIZE="${LD_WINDOW_SIZE:-50}"
+LD_STEP="${LD_STEP:-5}"
+LD_R2_THRESHOLD="${LD_R2_THRESHOLD:-0.5}"
+export MAF_THRESHOLD LD_WINDOW_SIZE LD_STEP LD_R2_THRESHOLD
+echo "Filtro MAF: $MAF_THRESHOLD | LD pruning: finestra $LD_WINDOW_SIZE, step $LD_STEP, r2 < $LD_R2_THRESHOLD"
 
 echo "==> Verifica strumenti disponibili"
 command -v plink2 >/dev/null 2>&1 || { echo "ERRORE: plink2 non trovato nel PATH."; exit 1; }
@@ -229,8 +253,8 @@ process_one() {
             echo "  gia' filtrato: creo symlink (nessuna copia, nessun filtro aggiuntivo)"
             ln -sf "$(readlink -f "$vcf_in")" "$merge_vcf"
         else
-            echo "  filtro (bialleliche, MAF >= 0.05)"
-            bcftools view -m2 -M2 -v snps --min-af 0.05:minor "$vcf_in" -Oz -o "$merge_vcf"
+            echo "  filtro (bialleliche, MAF >= $MAF_THRESHOLD)"
+            bcftools view -m2 -M2 -v snps --min-af "${MAF_THRESHOLD}:minor" "$vcf_in" -Oz -o "$merge_vcf"
         fi
 
         echo "  indicizzo"
@@ -361,24 +385,66 @@ else
 fi
 
 echo ""
-echo "==> Step 5: LD pruning (finestra 50, step 5, r2 < 0.2 -- standard)"
-echo "    + filtro MAF >= 0.05 di sicurezza qui, indipendentemente dal filtro"
+echo "==> Step 5: diagnostica missingness + filtro qualita' (--geno/--mind)"
+echo "    bcftools merge fa l'unione dei siti tra batch: una variante presente"
+echo "    solo in 1-2 batch su 3 (o su 2, se ne usi meno) risulta genotipata"
+echo "    solo in quei campioni e mancante (missing) negli altri, pur avendo"
+echo "    una MAF apparente perfettamente normale -- --maf da solo NON la"
+echo "    intercetta. Questo gonfia artificialmente il kinship stimato,"
+echo "    specialmente tra campioni di batch diversi."
+echo ""
+echo "    Prima applico il filtro con soglia default 0.05 (variante scartata"
+echo "    se mancante in >5% dei campioni; campione scartato se manca in >5%"
+echo "    delle varianti). Puoi cambiare le soglie con GENO_THRESH/MIND_THRESH"
+echo "    come variabili d'ambiente prima di lanciare lo script, es.:"
+echo "      GENO_THRESH=0.02 MIND_THRESH=0.05 ./00_run_plink_qc.sh ..."
+GENO_THRESH="${GENO_THRESH:-0.05}"
+MIND_THRESH="${MIND_THRESH:-0.05}"
+echo "    Soglie in uso: --geno $GENO_THRESH  --mind $MIND_THRESH"
+
+if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/missingness.vmiss" ] && [ -f "$OUT_DIR/missingness.smiss" ]; then
+    echo "  [skip, gia' presente] $OUT_DIR/missingness.vmiss / .smiss"
+else
+    plink2 --pfile "$OUT_DIR/merged_all" \
+           --missing \
+           --out "$OUT_DIR/missingness"
+fi
+echo "  Report diagnostico (PRIMA del filtro): $OUT_DIR/missingness.vmiss (per variante),"
+echo "  $OUT_DIR/missingness.smiss (per campione). Se vuoi scegliere la soglia a"
+echo "  occhio invece di usare il default 0.05, guarda la distribuzione di"
+echo "  F_MISS in questi file (es. e' bimodale? un blocco di varianti intorno"
+echo "  a missing ~1/3 o ~1/2 e' la firma di un sito presente solo in alcuni batch)."
+
+if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/merged_qc.pgen" ] && [ -f "$OUT_DIR/merged_qc.pvar" ] && [ -f "$OUT_DIR/merged_qc.psam" ]; then
+    echo "  [skip, gia' presente] $OUT_DIR/merged_qc.pgen"
+else
+    plink2 --pfile "$OUT_DIR/merged_all" \
+           --geno "$GENO_THRESH" \
+           --mind "$MIND_THRESH" \
+           --make-pgen \
+           --out "$OUT_DIR/merged_qc"
+fi
+echo "  Dataset filtrato: $OUT_DIR/merged_qc (usato da qui in poi per pruning/kinship/PCA)"
+
+echo ""
+echo "==> Step 6: LD pruning (finestra $LD_WINDOW_SIZE, step $LD_STEP, r2 < $LD_R2_THRESHOLD)"
+echo "    + filtro MAF >= $MAF_THRESHOLD di sicurezza qui, indipendentemente dal filtro"
 echo "    applicato a monte nei VCF _filtered (PCA/kinship funzionano male"
 echo "    con varianti rare, quindi lo riapplichiamo comunque)."
 if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/pruned.prune.in" ]; then
     echo "  [skip, gia' presente] $OUT_DIR/pruned.prune.in"
 else
-    plink2 --pfile "$OUT_DIR/merged_all" \
-           --maf 0.05 \
-           --indep-pairwise 50 5 0.2 \
+    plink2 --pfile "$OUT_DIR/merged_qc" \
+           --maf "$MAF_THRESHOLD" \
+           --indep-pairwise "$LD_WINDOW_SIZE" "$LD_STEP" "$LD_R2_THRESHOLD" \
            --out "$OUT_DIR/pruned"
 fi
 
 if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/merged_pruned.pgen" ] && [ -f "$OUT_DIR/merged_pruned.pvar" ] && [ -f "$OUT_DIR/merged_pruned.psam" ]; then
     echo "  [skip, gia' presente] $OUT_DIR/merged_pruned.pgen"
 else
-    plink2 --pfile "$OUT_DIR/merged_all" \
-           --maf 0.05 \
+    plink2 --pfile "$OUT_DIR/merged_qc" \
+           --maf "$MAF_THRESHOLD" \
            --extract "$OUT_DIR/pruned.prune.in" \
            --make-pgen \
            --out "$OUT_DIR/merged_pruned"
@@ -388,7 +454,7 @@ n_pruned=$(wc -l < "$OUT_DIR/pruned.prune.in")
 echo "  SNP indipendenti dopo pruning: $n_pruned"
 
 echo ""
-echo "==> Step 6: relatedness (KING-robust kinship, via plink2)"
+echo "==> Step 7: relatedness (KING-robust kinship, via plink2)"
 if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/king.kin0" ]; then
     echo "  [skip, gia' presente] $OUT_DIR/king.kin0"
 else
@@ -399,7 +465,7 @@ fi
 echo "  Output: $OUT_DIR/king.kin0 (colonne: #FID1 ID1 FID2 ID2 NSNP HETHET IBS0 KINSHIP)"
 
 echo ""
-echo "==> Step 7: PCA (10 componenti)"
+echo "==> Step 8: PCA (10 componenti)"
 if [ "$FORCE" -ne 1 ] && [ -f "$OUT_DIR/pca.eigenvec" ]; then
     echo "  [skip, gia' presente] $OUT_DIR/pca.eigenvec"
 else
