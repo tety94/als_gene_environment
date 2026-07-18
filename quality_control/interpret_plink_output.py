@@ -93,14 +93,14 @@ def correlate_pcs_with_exposure(eigenvec_df, metadata_df, exposure_col, n_pcs):
     from scipy.stats import pearsonr
 
     merged = eigenvec_df.merge(metadata_df, left_on="IID", right_on="id", how="inner")
-    log("merged shape:", merged.shape)
-    log("NA exposure:", merged[exposure_col].isna().sum())
-    log("NA PCs:", merged[pc_cols].isna().sum().sum())
+    print("merged shape:", merged.shape)
+    print("NA exposure:", merged[exposure_col].isna().sum())
     n_matched = len(merged)
     n_meta = len(metadata_df)
     n_eig = len(eigenvec_df)
 
     pc_cols = [c for c in merged.columns if c.startswith("PC")][:n_pcs]
+    print("NA PCs:", merged[pc_cols].isna().sum().sum())
     exposure = merged[exposure_col].astype(float).values
 
     valid = ~np.isnan(exposure)
