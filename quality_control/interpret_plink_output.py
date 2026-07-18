@@ -91,6 +91,14 @@ def summarize_relatedness(kin_df, pi_hat_threshold):
 
 def correlate_pcs_with_exposure(eigenvec_df, metadata_df, exposure_col, n_pcs):
     from scipy.stats import pearsonr
+    print("Colonne eigenvec_df:", eigenvec_df.columns.tolist())
+    print("Colonne metadata_df:", metadata_df.columns.tolist())
+
+    print("\nEsempio valori IID (eigenvec):")
+    print(eigenvec_df["IID"].head())
+
+    print("\nEsempio valori id (metadata):")
+    print(metadata_df["id"].head())
 
     merged = eigenvec_df.merge(metadata_df, left_on="IID", right_on="id", how="inner")
     print("merged shape:", merged.shape)
