@@ -58,6 +58,16 @@ KING_THRESHOLDS = [
     (0.0442, "parente di 3o grado"),
 ]
 
+# Etichette inglesi parallele, usate SOLO per il testo del grafico (la
+# classificazione interna/CSV resta in italiano per non rompere i confronti
+# di stringa gia' usati altrove in questo file).
+KING_THRESHOLDS_LABELS_EN = {
+    "duplicato/gemello monozigote": "duplicate/monozygotic twin",
+    "parente di 1o grado": "1st-degree relative",
+    "parente di 2o grado": "2nd-degree relative",
+    "parente di 3o grado": "3rd-degree relative",
+}
+
 
 def classify_kinship(k: float) -> str:
     for threshold, label in KING_THRESHOLDS:
@@ -108,6 +118,16 @@ def summarize_kinship(df: pd.DataFrame, batch_map: dict, out_dir: Path) -> None:
         n = counts.get(label, 0)
         print(f"  {label:35s}: {n}")
 
+    # Tabella supplementare: stessa distribuzione ma su file, pronta per il paper.
+    order = [label for _, label in KING_THRESHOLDS] + ["non imparentati"]
+    counts_df = pd.DataFrame(
+        {"categoria": order, "n_coppie": [int(counts.get(c, 0)) for c in order]}
+    )
+    counts_df["pct_coppie"] = 100 * counts_df["n_coppie"] / counts_df["n_coppie"].sum()
+    counts_path = out_dir / "kinship_category_counts.csv"
+    counts_df.to_csv(counts_path, index=False)
+    print(f"  Tabella distribuzione salvata in: {counts_path}")
+
     # Tabella delle coppie sospette: parenti di 3o grado o piu' stretti.
     flagged = df[df["categoria"] != "non imparentati"].sort_values(
         "KINSHIP", ascending=False
@@ -147,14 +167,14 @@ def summarize_kinship(df: pd.DataFrame, batch_map: dict, out_dir: Path) -> None:
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.hist(df["KINSHIP"], bins=200, color="steelblue", edgecolor="none")
     ax.set_yscale("log")
-    ax.set_xlabel("KINSHIP (coefficiente KING-robust)")
-    ax.set_ylabel("numero di coppie (scala log)")
-    ax.set_title(f"Distribuzione kinship -- {len(df):,} coppie totali")
+    ax.set_xlabel("KINSHIP (KING-robust coefficient)")
+    ax.set_ylabel("N pairs (log scale)")
+    ax.set_title(f"Kinship distribution -- {len(df):,} total pairs")
     colors = ["red", "orange", "goldenrod", "green"]
     for (threshold, label), color in zip(KING_THRESHOLDS, colors):
         ax.axvline(threshold, color=color, linestyle="--", linewidth=1)
         ax.text(
-            threshold, ax.get_ylim()[1] * 0.9, label, rotation=90,
+            threshold, ax.get_ylim()[1] * 0.9, KING_THRESHOLDS_LABELS_EN.get(label, label), rotation=90,
             color=color, fontsize=8, ha="right", va="top",
         )
     fig.tight_layout()
@@ -248,8 +268,8 @@ def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, ou
         total = sum(eigenval)
         pct1 = 100 * eigenval[0] / total if total else float("nan")
         pct2 = 100 * eigenval[1] / total if total else float("nan")
-        xlabel = f"PC1 ({pct1:.1f}% varianza)"
-        ylabel = f"PC2 ({pct2:.1f}% varianza)"
+        xlabel = f"PC1 ({pct1:.1f}% variance)"
+        ylabel = f"PC2 ({pct2:.1f}% variance)"
     else:
         xlabel, ylabel = "PC1", "PC2"
 
@@ -265,13 +285,13 @@ def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, ou
                 f"corrispondente (ID non trovati nella mappa)."
             )
         for batch, group in df.groupby("batch", dropna=False):
-            label = batch if pd.notna(batch) else "batch sconosciuto"
+            label = batch if pd.notna(batch) else "unknown batch"
             ax.scatter(group["PC1"], group["PC2"], s=8, alpha=0.6, label=f"{label} (n={len(group)})")
         ax.legend(fontsize=8, loc="best")
-        title = "PCA colorata per batch -- cluster netti indicano batch effect"
+        title = "PCA colored by batch -- tight clusters indicate a batch effect"
     else:
         ax.scatter(df["PC1"], df["PC2"], s=8, alpha=0.6, color="steelblue")
-        title = "PCA (nessuna mappa batch disponibile)"
+        title = "PCA (no batch map available)"
 
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -288,8 +308,8 @@ def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, ou
         total = sum(eigenval)
         pct = [100 * e / total for e in eigenval] if total else eigenval
         ax2.bar(pcs, pct, color="slategray")
-        ax2.set_xlabel("componente principale")
-        ax2.set_ylabel("% varianza spiegata")
+        ax2.set_xlabel("principal component")
+        ax2.set_ylabel("% variance explained")
         ax2.set_title("Scree plot")
         ax2.set_xticks(pcs)
         fig2.tight_layout()
@@ -301,6 +321,7 @@ def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, ou
     # Check numerico semplice di batch effect: quanta varianza di PC1/PC2 e'
     # "spiegata" dall'appartenenza al batch (eta-squared, one-way ANOVA-like).
     if batch_map and "batch" in df.columns:
+        eta_rows = []
         for pc in ["PC1", "PC2"]:
             valid = df.dropna(subset=[pc, "batch"])
             if valid["batch"].nunique() < 2:
@@ -316,6 +337,15 @@ def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, ou
                 f"  Frazione di varianza di {pc} spiegata dal batch (eta^2): {eta_sq:.3f} "
                 f"({'ALTA -- possibile batch effect da correggere' if eta_sq > 0.1 else 'bassa'})"
             )
+            eta_rows.append({
+                "PC": pc,
+                "eta_squared": round(float(eta_sq), 4),
+                "batch_effect_alto": bool(eta_sq > 0.1),
+            })
+        if eta_rows:
+            eta_path = out_dir / "pca_batch_eta2.csv"
+            pd.DataFrame(eta_rows).to_csv(eta_path, index=False)
+            print(f"  Tabella eta^2 salvata in: {eta_path}")
 
 
 # ---------------------------------------------------------------------------

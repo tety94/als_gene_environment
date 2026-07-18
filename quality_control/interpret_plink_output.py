@@ -129,6 +129,39 @@ def genomic_inflation_factor(pvalues):
     return float(np.median(chi2_obs) / 0.4549364)
 
 
+def qq_plot(pvalues, out_path):
+    """
+    QQ-plot -log10(p) osservati vs attesi sotto H0 (uniforme). Complemento
+    visivo del lambda GC: un numero solo puo' nascondere inflazione
+    concentrata in coda (poche varianti fortemente devianti) che il QQ-plot
+    rende visibile a colpo d'occhio, come richiesto tipicamente in un paper.
+    """
+    if plt is None:
+        return None
+    p = np.asarray(pvalues, dtype=float)
+    p = p[~np.isnan(p)]
+    p = np.clip(p, 1e-300, 1)
+    p_sorted = np.sort(p)
+    n = len(p_sorted)
+    if n == 0:
+        return None
+    expected = -np.log10(np.arange(1, n + 1) / (n + 1))
+    observed = -np.log10(p_sorted)
+
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    ax.scatter(expected, observed, s=6, alpha=0.5, color="steelblue")
+    max_val = max(expected.max(), observed.max())
+    ax.plot([0, max_val], [0, max_val], color="red", linestyle="--", linewidth=1, label="expected (H0)")
+    ax.set_xlabel("expected -log10(p)")
+    ax.set_ylabel("observed -log10(p)")
+    ax.set_title("QQ-plot")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--kin0", required=True)
@@ -204,10 +237,10 @@ def main():
     if plt is not None and n_pairs > 0:
         plt.figure(figsize=(6, 4))
         plt.hist(kin_df["PI_HAT"], bins=80)
-        plt.axvline(args.pi_hat_threshold, color="red", linestyle="--", label="soglia")
-        plt.xlabel("PI_HAT (2 x KINSHIP plink2)")
-        plt.ylabel("numero di coppie")
-        plt.title("Distribuzione PI_HAT")
+        plt.axvline(args.pi_hat_threshold, color="red", linestyle="--", label="threshold")
+        plt.xlabel("PI_HAT (2 x plink2 KINSHIP)")
+        plt.ylabel("N pairs")
+        plt.title("PI_HAT distribution")
         plt.legend()
         plt.tight_layout()
         plt.savefig(out_dir / "pi_hat_distribution.png", dpi=150)
@@ -234,6 +267,15 @@ def main():
         flag = "  <-- notevole" if abs(row["pearson_r"]) > 0.2 and row["p_value"] < 0.05 else ""
         log(f"    {row['PC']}: r={row['pearson_r']:.4f}, p={row['p_value']:.2e}{flag}")
 
+    # Tabella supplementare per il paper (non solo testo di log): una riga
+    # per PC con r, p-value e flag di notevolezza, pronta da includere come
+    # tabella supplementare.
+    corr_table = pd.DataFrame(corr_per_pc)
+    corr_table["notevole"] = (corr_table["pearson_r"].abs() > 0.2) & (corr_table["p_value"] < 0.05)
+    corr_csv_path = out_dir / "pc_exposure_correlation.csv"
+    corr_table.to_csv(corr_csv_path, index=False)
+    log(f"[tabella: {corr_csv_path}]")
+
     log(f"\nR^2 (esposizione ~ {' + '.join(pc_cols)}): {r_squared:.4f} "
         f"({r_squared:.1%} varianza esposizione spiegata da ancestry)")
 
@@ -254,7 +296,7 @@ def main():
         plt.colorbar(sc, label=args.exposure_col)
         plt.xlabel(pc_cols[0])
         plt.ylabel(pc_cols[1])
-        plt.title("PC1 vs PC2 colorate per esposizione")
+        plt.title("PC1 vs PC2 colored by exposure")
         plt.tight_layout()
         plt.savefig(out_dir / "pca_vs_exposure.png", dpi=150)
         plt.close()
@@ -276,6 +318,13 @@ def main():
             log(">>> VERDETTO: lambda > 1.05, possibile stratificazione residua.")
         else:
             log(">>> VERDETTO: lambda entro range accettabile.")
+
+        qq_path = out_dir / "qq_plot.png"
+        saved = qq_plot(pvals, qq_path)
+        if saved:
+            log(f"[grafico: {qq_path}]")
+        elif plt is None:
+            log("  (matplotlib non disponibile, QQ-plot saltato)")
     else:
         log("Nessun --pvalues fornito, salto questo controllo.")
 
