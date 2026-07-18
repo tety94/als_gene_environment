@@ -190,28 +190,36 @@ are a starting point, not a final decision. Name the file per cohort
 
 ```bash
 # ============ DISCOVERY / VALIDATION (gen1) ============
+export METADATA=/srv/python-projects/gene_environment_v2/data/componenti_ambientali_full.csv
+
+# ============ DISCOVERY / VALIDATION (gen1) ============
 export OUT_DIR=/mnt/cresla_prod/genome_datasets/qc_output_gen1
 
-./00_run_plink_qc.sh --use-filtered --jobs 16 \
+bash ./00_run_plink_qc.sh --use-filtered --jobs 16 \
     /mnt/cresla_prod/genome_datasets/gen1 \
     "$OUT_DIR"
-./01_run_extra_qc_checks.sh "$OUT_DIR"
+bash ./01_run_extra_qc_checks.sh "$OUT_DIR"
 
 python3 qc_attrition_summary.py --qc-dir "$OUT_DIR" --out "$OUT_DIR/qc_attrition.csv"
 python3 qc_report.py --kin "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
     --eigenval "$OUT_DIR/pca.eigenval" \
     --vcf-dirs /mnt/cresla_prod/genome_datasets/gen1 --use-filtered \
     --out-dir "$OUT_DIR/qc_report"
-python3 interpret_plink_output.py --kin0 "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
-    --metadata sample_metadata_gen1.csv --exposure-col exposure_agri_score \
-    --out-dir "$OUT_DIR/diagnostics_output"
+
+# uno per ciascuna esposizione che usi nel modello
+for EXPOSURE in seminativi_1500 vigneti_1500 risaie_1500; do
+    python3 interpret_plink_output.py --kin0 "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
+        --metadata "$METADATA" --exposure-col "$EXPOSURE" \
+        --out-dir "$OUT_DIR/diagnostics_output_${EXPOSURE}"
+done
+
 python3 qc_supplementary_plots.py --qc-dir "$OUT_DIR" --out-dir "$OUT_DIR/supplementary_plots"
 python3 extract_pca_covariates.py --eigenvec "$OUT_DIR/pca.eigenvec" --n-pcs 10 \
     --strip-doubled-id --out "$OUT_DIR/pca_covariates.csv"
 
 python3 build_supplementary_report.py --qc-dir "$OUT_DIR" \
     --kinship-report-dir "$OUT_DIR/qc_report" \
-    --diagnostics-dir "$OUT_DIR/diagnostics_output" \
+    --diagnostics-dir "$OUT_DIR/diagnostics_output_seminativi_1500" \
     --attrition-csv "$OUT_DIR/qc_attrition.csv" \
     --supp-plots-dir "$OUT_DIR/supplementary_plots" \
     --out "$OUT_DIR/Supplementary_QC_Report_gen1.docx"
@@ -219,29 +227,34 @@ python3 build_supplementary_report.py --qc-dir "$OUT_DIR" \
 # ============ REPLICATION (gen2) ============
 export OUT_DIR=/mnt/cresla_prod/genome_datasets/qc_output_gen2
 
-./00_run_plink_qc.sh --use-filtered --jobs 16 \
+bash ./00_run_plink_qc.sh --use-filtered --jobs 16 \
     /mnt/cresla_prod/genome_datasets/gen2 \
     "$OUT_DIR"
-./01_run_extra_qc_checks.sh "$OUT_DIR"
+bash ./01_run_extra_qc_checks.sh "$OUT_DIR"
 
 python3 qc_attrition_summary.py --qc-dir "$OUT_DIR" --out "$OUT_DIR/qc_attrition.csv"
 python3 qc_report.py --kin "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
     --eigenval "$OUT_DIR/pca.eigenval" \
     --vcf-dirs /mnt/cresla_prod/genome_datasets/gen2 --use-filtered \
     --out-dir "$OUT_DIR/qc_report"
-python3 interpret_plink_output.py --kin0 "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
-    --metadata sample_metadata_gen2.csv --exposure-col exposure_agri_score \
-    --out-dir "$OUT_DIR/diagnostics_output"
+
+for EXPOSURE in seminativi_1500 vigneti_1500 risaie_1500; do
+    python3 interpret_plink_output.py --kin0 "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
+        --metadata "$METADATA" --exposure-col "$EXPOSURE" \
+        --out-dir "$OUT_DIR/diagnostics_output_${EXPOSURE}"
+done
+
 python3 qc_supplementary_plots.py --qc-dir "$OUT_DIR" --out-dir "$OUT_DIR/supplementary_plots"
 python3 extract_pca_covariates.py --eigenvec "$OUT_DIR/pca.eigenvec" --n-pcs 10 \
     --strip-doubled-id --out "$OUT_DIR/pca_covariates.csv"
 
 python3 build_supplementary_report.py --qc-dir "$OUT_DIR" \
     --kinship-report-dir "$OUT_DIR/qc_report" \
-    --diagnostics-dir "$OUT_DIR/diagnostics_output" \
+    --diagnostics-dir "$OUT_DIR/diagnostics_output_seminativi_1500" \
     --attrition-csv "$OUT_DIR/qc_attrition.csv" \
     --supp-plots-dir "$OUT_DIR/supplementary_plots" \
     --out "$OUT_DIR/Supplementary_QC_Report_gen2.docx"
+
 ```
 
 ---
