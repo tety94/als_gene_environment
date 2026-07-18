@@ -43,7 +43,6 @@ from gene_environment.db.repository import (
 )
 from gene_environment.logging_utils import configure_logging, get_logger
 from gene_environment.utils.id_utils import parse_variant_label
-from gene_environment.utils.pca_utils import load_pca_covariates, merge_pca_covariates
 from gene_environment.utils.stats_utils import add_fdr, volcano_plot
 from gene_environment.vcf_pipeline.build_dataset import load_and_prepare_data
 
@@ -62,21 +61,6 @@ def init_worker(temp_df_path: str, log_dir: str, covariate_cols: list[str]):
         os.getpid(), temp_df_path, covariate_cols or "nessuna",
     )
 
-
-def load_pca_covariate_columns(df, cfg):
-    """Se cfg.use_pca_covariates e' True, carica pca_covariates.csv per
-    cfg.generation e fa il merge in df. Ritorna (df_aggiornato,
-    lista_nomi_colonne_pc) -- lista vuota se le PCA sono disattivate."""
-    if not cfg.use_pca_covariates:
-        log.info("PCA disattivate (cfg.use_pca_covariates=False): nessuna covariata di popolazione nel modello.")
-        return df, []
-
-    pca_df = load_pca_covariates(
-        cfg.pca_covariates_path_template, cfg.generation, cfg.pca_n_components,
-    )
-    df, covariate_cols = merge_pca_covariates(df, pca_df)
-    log.info("PCA attive come covariate di correzione: %s (generazione=%s)", covariate_cols, cfg.generation)
-    return df, covariate_cols
 
 
 def run_parallel_processing(
@@ -127,9 +111,7 @@ def run_main_pipeline() -> None:
     start_time = datetime.now()
     log.info("Analisi iniziata alle %s", start_time)
 
-    df, variant_cols_safe, mapping, Ecols, variant_cols = load_and_prepare_data(cfg)
-
-    df, covariate_cols = load_pca_covariate_columns(df, cfg)
+    df, variant_cols_safe, mapping, Ecols, variant_cols, covariate_cols = load_and_prepare_data(cfg)
 
     with open(cfg.temp_df_path, "wb") as f:
         pickle.dump(df, f)

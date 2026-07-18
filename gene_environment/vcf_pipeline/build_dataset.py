@@ -1,24 +1,28 @@
 """
-Prepara il dataset finale (merge genetica + ambientale) usato dal modeling.
+Prepara il dataset finale (merge genetica + ambientale + PCA) usato dal modeling.
 
-Fix rispetto all'originale (data_loader.py):
-  - RIMOSSA la riga `df_env['id'] = df_env['id'] + '_' + df_env['id']`.
-    Era un workaround per far combaciare gli id del file ambientale con
-    quelli (duplicati) del file genetico. Ora la normalizzazione avviene con
-    `clean_sample_id` (utils/id_utils.py) applicata al file genetico, quindi
-    il file ambientale resta con i suoi id originali, senza trasformazioni
-    "magiche" difficili da ricordare/motivare a distanza di mesi.
-  - Log invece di print(), con gli stessi checkpoint temporali dell'originale.
-  - Validazione esplicita: se dopo il merge il numero di righe è 0, o la
-    percentuale di id non matchati è alta, viene loggato un WARNING chiaro
-    (prima si andava avanti in silenzio con un dataframe vuoto o quasi).
-  - `SettingWithCopyWarning` potenziale su `df_gen.rename` risolto passando
-    sempre per assegnazione esplicita.
+RISTRUTTURAZIONE (fix performance): il dataframe genetico (df_gen) ha
+~1.3M colonne. Ogni merge/rename che lo tocca ricostruisce l'intero
+BlockManager di pandas, quindi il costo NON dipende solo dalle righe ma
+da quante volte l'oggetto largo viene "rimescolato". La versione
+precedente lo toccava 3 volte (merge con env, merge con gen_map, merge
+con PCA in orchestrator.py) + un rename. Qui invece:
+
+  1. Tutte le parti "strette" (env, gen_map, PCA) vengono unite fra loro
+     PRIMA -- sono piccole, quindi economico farlo quante volte serve.
+  2. df_gen viene rinominato (safe names) una volta, subito dopo il
+     caricamento.
+  3. Un SOLO merge finale unisce il blocco di covariate strette con
+     df_gen.
+
+La logica di caricamento PCA (load_pca_covariates) resta in
+pca_utils.py ma viene chiamata da qui invece che dall'orchestrator, cosi'
+il merge con le PCA avviene sul dataframe stretto e non su quello largo.
+merge_pca_covariates (in pca_utils.py) non e' piu' usata.
 """
 from __future__ import annotations
 
 import os
-from datetime import datetime
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -27,23 +31,20 @@ from sklearn.preprocessing import StandardScaler
 from gene_environment.config import Config, get_config
 from gene_environment.logging_utils import get_logger
 from gene_environment.utils.id_utils import clean_sample_id
+from gene_environment.utils.pca_utils import load_pca_covariates, PCA_ID_COLUMN
 
 log = get_logger(__name__)
 
 NON_GEN_COLS = ["FID", "IID", "PAT", "MAT", "SEX", "PHENOTYPE", "id"]
 
 
-def load_and_prepare_data(cfg: Config | None = None):
-    cfg = cfg or get_config()
-
+def _load_genetic_data(cfg: Config) -> tuple[pd.DataFrame, list[str], dict, list[str]]:
     fmt = cfg.raw_file_format
     if fmt == "auto":
         fmt = "parquet" if cfg.raw_file.endswith(".parquet") else "csv"
 
     log.info("Carico file genetica da %s (formato=%s)", cfg.raw_file, fmt)
     if fmt == "parquet":
-        # Output diretto di build-matrix (vcf_to_parquet.py): l'id campione è
-        # già l'indice del DataFrame, non una colonna.
         df_gen = pq.ParquetFile(
             cfg.raw_file,
             thrift_string_size_limit=2_000_000_000,
@@ -62,6 +63,22 @@ def load_and_prepare_data(cfg: Config | None = None):
     variant_cols = [c for c in df_gen.columns if c not in NON_GEN_COLS]
     log.info("Colonne varianti individuate: %d", len(variant_cols))
 
+    # Rename a nomi "safe" (variant_i) subito: unico touch del frame largo
+    # per questa operazione, invece di farlo dopo altri merge.
+    safe = {g: f"variant_{i}" for i, g in enumerate(variant_cols)}
+    df_gen = df_gen.rename(columns=safe)
+    variant_cols_safe = list(safe.values())
+    mapping = {v: k for k, v in safe.items()}
+
+    return df_gen, variant_cols_safe, mapping, variant_cols
+
+
+def _build_narrow_covariates(cfg: Config, gen_ids: pd.Series) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """Costruisce il blocco 'stretto' (env + mappa generazione + PCA),
+    tutte operazioni economiche perche' i frame coinvolti sono piccoli.
+    gen_ids e' passato solo a scopo diagnostico (log di quanti id
+    combaciano), non viene mai fatto merge diretto con df_gen qui."""
+
     log.info("Carico file ambientale da %s", cfg.env_file)
     df_env = pd.read_csv(cfg.env_file, sep=cfg.sep, decimal=cfg.decimal)
     df_env["id"] = df_env["id"].astype(str)
@@ -70,28 +87,9 @@ def load_and_prepare_data(cfg: Config | None = None):
     if "onset_site" in df_env.columns:
         df_env["onset_site"] = df_env["onset_site"].astype("category")
 
-    log.info("Merge genetica <-> ambiente su 'id'")
-    df = pd.merge(df_env, df_gen, on="id", how="inner")
+    df = df_env
 
-    n_env, n_gen, n_merged = len(df_env), len(df_gen), len(df)
-    log.info("Righe ambiente=%d, genetica=%d, dopo merge (inner)=%d", n_env, n_gen, n_merged)
-    if n_merged == 0:
-        log.warning(
-            "Il merge ha prodotto 0 righe: nessun id in comune fra file ambientale e genetico. "
-            "Controlla il formato degli id (prefissi genN_, duplicazioni XXX_XXX ecc.)."
-        )
-    elif n_merged < 0.5 * min(n_env, n_gen):
-        log.warning(
-            "Il merge ha 'perso' più del 50%% delle righe attese (%d su min(%d,%d)): "
-            "verifica la coerenza degli id fra i due file.", n_merged, n_env, n_gen
-        )
-
-    # ---- Filtro per generazione, DOPO il join per id ----
-    # Il file ambientale può non avere alcuna colonna di generazione (caso comune:
-    # un unico ENV_FILE con tutti i pazienti, id come unica chiave di join). L'unica
-    # fonte affidabile della coorte di un paziente è allora il VCF da cui proviene il
-    # suo genotipo: build-matrix (vcf_to_parquet.py) produce una mappa id->generazione
-    # che qui viene usata per tenere i run per gen1/gen2/gen3 indipendenti.
+    # ---- Mappa id -> generazione ----
     map_path = cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv")
     if os.path.exists(map_path):
         gen_map = pd.read_csv(map_path, dtype={"id": str})
@@ -100,7 +98,7 @@ def load_and_prepare_data(cfg: Config | None = None):
         n_missing_map = df["generation"].isna().sum()
         if n_missing_map:
             log.warning(
-                "%d pazienti dopo il merge non sono presenti nella mappa id->generazione (%s): "
+                "%d pazienti non sono presenti nella mappa id->generazione (%s): "
                 "verranno esclusi dal run (generazione sconosciuta).", n_missing_map, map_path,
             )
         df = df[df["generation"] == cfg.generation].drop(columns=["generation"])
@@ -118,19 +116,13 @@ def load_and_prepare_data(cfg: Config | None = None):
     else:
         log.warning(
             "Nessuna mappa id->generazione trovata (%s) e nessuna ENV_GENERATION_COL configurata: "
-            "uso TUTTE le righe senza filtro per generazione. Se stai processando più coorti nello "
-            "stesso pool genotipico, esegui prima 'build-matrix' (genera la mappa automaticamente) "
-            "o imposta ENV_GENERATION_COL.", map_path,
+            "uso TUTTE le righe senza filtro per generazione.", map_path,
         )
 
-    if df.empty:
-        log.warning("Dataset vuoto dopo il filtro per generazione=%s: controlla mappa/colonna generazione.", cfg.generation)
-
-    log.info("Id unici post-merge/filtro: %d (righe totali: %d)", df["id"].nunique(), len(df))
     df = df.drop_duplicates("id")
 
+    # ---- Standardizzazione esposizione (sul frame stretto) ----
     df[cfg.target_col] = pd.to_numeric(df[cfg.target_col], errors="coerce")
-
     log.info("Standardizzazione dell'esposizione '%s' (standardize=%s)", cfg.exposure, cfg.standardize)
     Ecols = []
     df[cfg.exposure] = pd.to_numeric(df[cfg.exposure], errors="coerce")
@@ -140,10 +132,57 @@ def load_and_prepare_data(cfg: Config | None = None):
     else:
         Ecols.append(cfg.exposure)
 
-    log.info("Creo nomi 'safe' per le varianti (variant_i) per compatibilità con formule statsmodels")
-    safe = {g: f"variant_{i}" for i, g in enumerate(variant_cols)}
-    df = df.rename(columns=safe)
-    variant_cols_safe = list(safe.values())
-    mapping = {v: k for k, v in safe.items()}
+    # ---- PCA (frame stretto, merge economico) ----
+    covariate_cols: list[str] = []
+    if cfg.use_pca_covariates:
+        pca_df = load_pca_covariates(cfg.pca_covariates_path_template, cfg.generation, cfg.pca_n_components)
 
-    return df, variant_cols_safe, mapping, Ecols, variant_cols
+        if "id" in df.columns and PCA_ID_COLUMN not in df.columns:
+            n_match = df["id"].isin(pca_df[PCA_ID_COLUMN]).sum()
+            log.info("PCA: %d/%d id del blocco covariate trovano corrispondenza in IID.", n_match, len(df))
+            df = df.merge(pca_df, left_on="id", right_on=PCA_ID_COLUMN, how="left")
+        else:
+            df = df.merge(pca_df, on=PCA_ID_COLUMN, how="left")
+
+        covariate_cols = [c for c in pca_df.columns if c != PCA_ID_COLUMN]
+        n_missing = int(df[covariate_cols[0]].isna().sum())
+        if n_missing:
+            pct = 100 * n_missing / len(df)
+            log.warning(
+                "PCA: %d/%d campioni (%.1f%%) senza corrispondenza dopo il merge (blocco stretto).",
+                n_missing, len(df), pct,
+            )
+        else:
+            log.info("PCA: merge completato, tutti i %d campioni hanno le PC.", len(df))
+    else:
+        log.info("PCA disattivate (cfg.use_pca_covariates=False): nessuna covariata di popolazione.")
+
+    return df, Ecols, covariate_cols
+
+
+def load_and_prepare_data(cfg: Config | None = None):
+    cfg = cfg or get_config()
+
+    df_gen, variant_cols_safe, mapping, variant_cols = _load_genetic_data(cfg)
+
+    covariates, Ecols, covariate_cols = _build_narrow_covariates(cfg, df_gen["id"])
+
+    log.info("Merge finale (unico touch del dataframe genetico largo) su 'id'")
+    df = pd.merge(covariates, df_gen, on="id", how="inner")
+
+    n_cov, n_gen, n_merged = len(covariates), len(df_gen), len(df)
+    log.info("Righe covariate=%d, genetica=%d, dopo merge finale (inner)=%d", n_cov, n_gen, n_merged)
+    if n_merged == 0:
+        log.warning(
+            "Il merge finale ha prodotto 0 righe: nessun id in comune fra covariate e genetica. "
+            "Controlla il formato degli id (prefissi genN_, duplicazioni XXX_XXX ecc.)."
+        )
+    elif n_merged < 0.5 * min(n_cov, n_gen):
+        log.warning(
+            "Il merge finale ha 'perso' più del 50%% delle righe attese (%d su min(%d,%d)): "
+            "verifica la coerenza degli id fra i file.", n_merged, n_cov, n_gen
+        )
+
+    log.info("Id unici post-merge: %d (righe totali: %d)", df["id"].nunique(), len(df))
+
+    return df, variant_cols_safe, mapping, Ecols, variant_cols, covariate_cols
