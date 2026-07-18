@@ -68,15 +68,13 @@ def load_pca_covariates(path_template: str, generation: int, n_components: int) 
 
 
 def merge_pca_covariates(df: pd.DataFrame, pca_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """Merge left di df con le PCA sulla colonna PCA_ID_COLUMN.
+    """Merge (logico) di df con le PCA sulla colonna PCA_ID_COLUMN.
 
-    Logga quanti campioni restano SENZA PCA dopo il merge (mancata
-    corrispondenza di ID): quei campioni verranno comunque scartati piu'
-    avanti dal dropna() sulle colonne PC in process_single_variant, ma e'
-    importante accorgersene qui e non in silenzio -- puo' segnalare un
-    problema di formato ID (es. se pca_covariates.csv fosse stato
-    rigenerato per errore con --strip-doubled-id mentre il dataframe
-    principale usa ancora gli ID doppi, o viceversa).
+    NOTA PERFORMANCE: df ha ~1.3M colonne (una per variante), quindi un
+    pd.merge classico e' proibitivamente lento (deve ricostruire l'intero
+    BlockManager). Al suo posto: riallineiamo pca_df all'ordine degli IID
+    di df con reindex() (costa O(n_pc x n_righe), non O(n_colonne_totali))
+    e assegnamo le colonne PC direttamente via numpy.
     """
     pc_cols = [c for c in pca_df.columns if c != PCA_ID_COLUMN]
 
@@ -86,20 +84,32 @@ def merge_pca_covariates(df: pd.DataFrame, pca_df: pd.DataFrame) -> tuple[pd.Dat
             f"impossibile fare il merge con le PCA. Colonne disponibili: {list(df.columns)}"
         )
 
-    merged = df.merge(pca_df, on=PCA_ID_COLUMN, how="left", validate="many_to_one")
+    # controllo equivalente a validate="many_to_one": IID duplicati in pca_df
+    dup = pca_df[PCA_ID_COLUMN].duplicated()
+    if dup.any():
+        raise ValueError(
+            f"pca_covariates.csv contiene {dup.sum()} IID duplicati: "
+            "impossibile garantire many_to_one."
+        )
 
-    n_missing = int(merged[pc_cols[0]].isna().sum())
+    pca_indexed = pca_df.set_index(PCA_ID_COLUMN)
+    pca_aligned = pca_indexed.reindex(df[PCA_ID_COLUMN])
+
+    for c in pc_cols:
+        df[c] = pca_aligned[c].to_numpy()
+
+    n_missing = int(df[pc_cols[0]].isna().sum())
     if n_missing > 0:
-        pct = 100 * n_missing / len(merged)
+        pct = 100 * n_missing / len(df)
         log.warning(
             "PCA: %d/%d campioni (%.1f%%) senza corrispondenza dopo il merge "
             "(ID non trovato nel file PCA). Verranno esclusi dal modello per "
             "ogni variante che li coinvolge (dropna sulle colonne PC in "
             "process_single_variant). Se la percentuale e' alta, controlla "
             "il formato degli ID in entrambi i file.",
-            n_missing, len(merged), pct,
+            n_missing, len(df), pct,
         )
     else:
-        log.info("PCA: merge completato, tutti i %d campioni hanno le PC.", len(merged))
+        log.info("PCA: merge completato, tutti i %d campioni hanno le PC.", len(df))
 
-    return merged, pc_cols
+    return df, pc_cols
