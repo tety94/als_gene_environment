@@ -100,7 +100,8 @@ def correlate_pcs_with_exposure(eigenvec_df, metadata_df, exposure_col, n_pcs):
     print("\nEsempio valori id (metadata):")
     print(metadata_df["id"].head())
 
-    merged = eigenvec_df.merge(metadata_df, left_on="IID", right_on="id", how="inner")
+    eigenvec_df["IID_clean"] = eigenvec_df["IID"].str.split("_").str[0]
+    merged = eigenvec_df.merge(metadata_df, left_on="IID_clean", right_on="id", how="inner")
     print("merged shape:", merged.shape)
     print("NA exposure:", merged[exposure_col].isna().sum())
     n_matched = len(merged)
