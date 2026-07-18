@@ -16,8 +16,8 @@ INPUT
 -----
 --kin0        file king.kin0 prodotto da: plink2 --make-king-table
 --eigenvec    file pca.eigenvec prodotto da: plink2 --pca 10
---metadata    csv/parquet con colonne: sample_id, <exposure-col>
-              (sample_id deve combaciare con la colonna IID di plink2)
+--metadata    csv/parquet con colonne: id, <exposure-col>
+              (id deve combaciare con la colonna IID di plink2)
 --exposure-col nome della colonna esposizione nei metadati
 --pvalues     opzionale: csv/parquet con colonna p-value da un tuo scan
 --pvalue-col  nome colonna p-value (default: p)
@@ -92,7 +92,7 @@ def summarize_relatedness(kin_df, pi_hat_threshold):
 def correlate_pcs_with_exposure(eigenvec_df, metadata_df, exposure_col, n_pcs):
     from scipy.stats import pearsonr
 
-    merged = eigenvec_df.merge(metadata_df, left_on="IID", right_on="sample_id", how="inner")
+    merged = eigenvec_df.merge(metadata_df, left_on="IID", right_on="id", how="inner")
     n_matched = len(merged)
     n_meta = len(metadata_df)
     n_eig = len(eigenvec_df)
@@ -192,8 +192,8 @@ def main():
         metadata_df = pd.read_csv(args.metadata)
     else:
         metadata_df = pd.read_parquet(args.metadata)
-    if "sample_id" not in metadata_df.columns:
-        log(f"ERRORE: colonna 'sample_id' non trovata in {args.metadata}. "
+    if "id" not in metadata_df.columns:
+        log(f"ERRORE: colonna 'id' non trovata in {args.metadata}. "
             f"Colonne trovate: {list(metadata_df.columns)}")
         return
 
@@ -259,7 +259,7 @@ def main():
 
     log(f"Campioni in eigenvec: {n_eig} | in metadata: {n_meta} | matchati: {n_matched}")
     if n_matched < min(n_eig, n_meta) * 0.9:
-        log("  ATTENZIONE: match basso tra sample_id metadata e IID plink2. "
+        log("  ATTENZIONE: match basso tra id metadata e IID plink2. "
             "Controlla la convenzione di naming (es. FID_IID vs IID puro).")
 
     log("\nCorrelazione (Pearson) PC vs esposizione:")

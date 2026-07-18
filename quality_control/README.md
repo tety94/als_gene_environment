@@ -25,7 +25,6 @@ Merges batches, filters, LD-prunes, computes kinship and PCA.
 ./00_run_plink_qc.sh --use-filtered --jobs 16 \
     /mnt/cresla_prod/genome_datasets/gen1 \
     /mnt/cresla_prod/genome_datasets/gen2 \
-    /mnt/cresla_prod/genome_datasets/gen3 \
     "$OUT_DIR"
 ```
 
