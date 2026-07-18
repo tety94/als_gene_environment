@@ -83,8 +83,23 @@ set -euo pipefail
 #   LD_R2_THRESHOLD (default 0.5)  soglia r2 per --indep-pairwise.
 #   GENO_THRESH     (default 0.05) soglia missingness per variante (Step 5).
 #   MIND_THRESH     (default 0.05) soglia missingness per campione (Step 5).
+#   EXCLUDE_ID_PREFIXES (default vuoto) prefissi ID campione da ESCLUDERE
+#                   completamente dalla pipeline QC (kinship, PCA, ecc.),
+#                   comma-separated, es. "ACH" o "ACH,XYZ". Stesso nome e
+#                   stesso scopo della variabile EXCLUDE_ID_PREFIXES gia'
+#                   usata in config.py per gene_reduction.py/filter_vcf.py:
+#                   se nella pipeline gene_environment_v2 questi campioni
+#                   vengono esclusi PRIMA di arrivare al modello (perche'
+#                   assenti dal file di esposizione, o per qualunque altro
+#                   motivo), vanno esclusi anche qui -- altrimenti kinship,
+#                   missingness e PCA vengono calcolati su una coorte piu'
+#                   ampia di quella che l'analisi userà davvero, con numeri
+#                   (dimensione campione, percentuali) che non corrispondono
+#                   a quelli che finiranno nel paper. Applicato per batch,
+#                   basandosi sui sample ID del VCF chr1 di quel batch.
 # Esempio per cambiarli:
 #   MAF_THRESHOLD=0.01 LD_R2_THRESHOLD=0.5 ./00_run_plink_qc.sh --use-filtered ...
+#   EXCLUDE_ID_PREFIXES=ACH ./00_run_plink_qc.sh --use-filtered ...
 #
 # Esempio con i tuoi 3 batch, VCF gia' filtrati, 16 worker:
 #   ./00_run_plink_qc.sh --use-filtered --jobs 16 \
@@ -169,8 +184,14 @@ MAF_THRESHOLD="${MAF_THRESHOLD:-0.01}"
 LD_WINDOW_SIZE="${LD_WINDOW_SIZE:-50}"
 LD_STEP="${LD_STEP:-5}"
 LD_R2_THRESHOLD="${LD_R2_THRESHOLD:-0.5}"
-export MAF_THRESHOLD LD_WINDOW_SIZE LD_STEP LD_R2_THRESHOLD
+EXCLUDE_ID_PREFIXES="${EXCLUDE_ID_PREFIXES:-}"
+export MAF_THRESHOLD LD_WINDOW_SIZE LD_STEP LD_R2_THRESHOLD EXCLUDE_ID_PREFIXES
 echo "Filtro MAF: $MAF_THRESHOLD | LD pruning: finestra $LD_WINDOW_SIZE, step $LD_STEP, r2 < $LD_R2_THRESHOLD"
+if [ -n "$EXCLUDE_ID_PREFIXES" ]; then
+    echo "Esclusione campioni per prefisso ID: $EXCLUDE_ID_PREFIXES"
+else
+    echo "Esclusione campioni per prefisso ID: nessuna (EXCLUDE_ID_PREFIXES non impostato)"
+fi
 
 echo "==> Verifica strumenti disponibili"
 command -v plink2 >/dev/null 2>&1 || { echo "ERRORE: plink2 non trovato nel PATH."; exit 1; }
@@ -180,6 +201,7 @@ command -v xargs >/dev/null 2>&1 || { echo "ERRORE: xargs non trovato nel PATH."
 echo "==> Step 0: controllo sovrapposizione sample ID tra i batch (${VCF_DIRS[*]})"
 : > "$OUT_DIR/all_sample_ids.txt"
 for d in "${VCF_DIRS[@]}"; do
+    batch=$(basename "$d")
     if [ "$USE_FILTERED" -eq 1 ]; then
         search_dir="$d/vcf_filtered"
         first_vcf=$(ls "$search_dir"/*chr1_filtered.vcf.gz 2>/dev/null | head -n1)
@@ -193,13 +215,36 @@ for d in "${VCF_DIRS[@]}"; do
     fi
     n_samples=$(bcftools query -l "$first_vcf" | wc -l)
     n_dup=$(bcftools query -l "$first_vcf" | sort | uniq -d | wc -l)
-    echo "  $d -> $n_samples campioni (chr1), $n_dup ID duplicati interni"
-    bcftools query -l "$first_vcf" >> "$OUT_DIR/all_sample_ids.txt"
+
+    # File di esclusione per QUESTO batch: un ID per riga, usato sia qui
+    # (per il conteggio/overlap) sia in Step 1 (process_one) per escludere
+    # fisicamente questi campioni dai VCF prima del merge.
+    exclude_file="$OUT_DIR/exclude_samples_${batch}.txt"
+    : > "$exclude_file"
+    if [ -n "$EXCLUDE_ID_PREFIXES" ]; then
+        pattern=""
+        IFS=',' read -ra PREFIXES <<< "$EXCLUDE_ID_PREFIXES"
+        for p in "${PREFIXES[@]}"; do
+            pattern="${pattern}^${p}|"
+        done
+        pattern="${pattern%|}"
+        bcftools query -l "$first_vcf" | grep -E "$pattern" > "$exclude_file" || true
+    fi
+    n_excluded=$(wc -l < "$exclude_file")
+    n_kept=$((n_samples - n_excluded))
+
+    if [ "$n_excluded" -gt 0 ]; then
+        echo "  $d -> $n_samples campioni (chr1), $n_dup ID duplicati interni, $n_excluded esclusi per prefisso ($EXCLUDE_ID_PREFIXES) -> $n_kept nella coorte QC"
+    else
+        echo "  $d -> $n_samples campioni (chr1), $n_dup ID duplicati interni"
+    fi
+
+    bcftools query -l "$first_vcf" | grep -vxFf "$exclude_file" >> "$OUT_DIR/all_sample_ids.txt" || true
 done
 n_total=$(wc -l < "$OUT_DIR/all_sample_ids.txt")
 n_unique=$(sort -u "$OUT_DIR/all_sample_ids.txt" | wc -l)
 n_overlap=$((n_total - n_unique))
-echo "  Totale ID (somma batch): $n_total | ID unici: $n_unique | overlap: $n_overlap"
+echo "  Totale ID nella coorte QC, post-esclusione (somma batch): $n_total | ID unici: $n_unique | overlap: $n_overlap"
 if [ "$n_overlap" -gt 0 ]; then
     echo "  >>> ATTENZIONE: $n_overlap sample ID si ripetono tra i batch."
     echo "  >>> Se sono lo stesso paziente genotipizzato piu' volte, deduplica"
@@ -224,11 +269,12 @@ echo "    (parallelizzato su $JOBS worker; log per singolo job in $OUT_DIR/logs/
 # ---------------------------------------------------------------------------
 process_one() {
     local d="$1" chr="$2" use_filtered="$3" out_dir="$4" force="$5"
-    local batch vcf_in out_prefix log_file merge_vcf
+    local batch vcf_in out_prefix log_file merge_vcf exclude_file exclude_args
     batch=$(basename "$d")
     out_prefix="$out_dir/filtered/${batch}_chr${chr}"
     merge_vcf="${out_prefix}.merge_input.vcf.gz"
     log_file="$out_dir/logs/step1_${batch}_chr${chr}.log"
+    exclude_file="$out_dir/exclude_samples_${batch}.txt"
 
     if [ "$force" -ne 1 ] && [ -f "$merge_vcf" ] && [ -f "${merge_vcf}.tbi" ]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$batch] chr${chr}: [skip, gia' presente]" >> "$log_file"
@@ -249,12 +295,33 @@ process_one() {
             exit 0
         fi
 
+        # Esclusione campioni per prefisso ID (EXCLUDE_ID_PREFIXES, vedi Step
+        # 0): se il file esiste e NON e' vuoto, passiamo -S ^file a bcftools
+        # in ENTRAMBE le modalita' (filtrato/non filtrato) -- altrimenti
+        # questi campioni resterebbero nel VCF passato al merge nonostante
+        # siano esclusi dalla pipeline gene_environment_v2 a valle, con la
+        # coorte QC (kinship/PCA/missingness) piu' ampia di quella
+        # effettivamente analizzata dal modello.
+        exclude_args=()
+        if [ -s "$exclude_file" ]; then
+            exclude_args=(-S "^${exclude_file}")
+        fi
+
         if [ "$use_filtered" -eq 1 ]; then
-            echo "  gia' filtrato: creo symlink (nessuna copia, nessun filtro aggiuntivo)"
-            ln -sf "$(readlink -f "$vcf_in")" "$merge_vcf"
+            if [ "${#exclude_args[@]}" -eq 0 ]; then
+                echo "  gia' filtrato: creo symlink (nessuna copia, nessun filtro aggiuntivo)"
+                ln -sf "$(readlink -f "$vcf_in")" "$merge_vcf"
+            else
+                echo "  gia' filtrato, ma escludo $(wc -l < "$exclude_file") campioni per prefisso ID (bcftools view -S)"
+                bcftools view "${exclude_args[@]}" "$vcf_in" -Oz -o "$merge_vcf"
+            fi
         else
-            echo "  filtro (bialleliche, MAF >= $MAF_THRESHOLD)"
-            bcftools view -m2 -M2 -v snps --min-af "${MAF_THRESHOLD}:minor" "$vcf_in" -Oz -o "$merge_vcf"
+            if [ "${#exclude_args[@]}" -eq 0 ]; then
+                echo "  filtro (bialleliche, MAF >= $MAF_THRESHOLD)"
+            else
+                echo "  filtro (bialleliche, MAF >= $MAF_THRESHOLD), escludo $(wc -l < "$exclude_file") campioni per prefisso ID"
+            fi
+            bcftools view -m2 -M2 -v snps --min-af "${MAF_THRESHOLD}:minor" "${exclude_args[@]}" "$vcf_in" -Oz -o "$merge_vcf"
         fi
 
         echo "  indicizzo"
