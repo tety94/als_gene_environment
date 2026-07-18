@@ -256,6 +256,10 @@ def main():
     corr_per_pc, r_squared, n_matched, n_meta, n_eig, merged, pc_cols = correlate_pcs_with_exposure(
         eigenvec_df, metadata_df, args.exposure_col, args.n_pcs
     )
+    log("merged shape:", merged.shape)
+    log("NA exposure:", merged[exposure_col].isna().sum())
+    log("NA PCs:", merged[pc_cols].isna().sum().sum())
+
 
     log(f"Campioni in eigenvec: {n_eig} | in metadata: {n_meta} | matchati: {n_matched}")
     if n_matched < min(n_eig, n_meta) * 0.9:
