@@ -115,7 +115,7 @@ def run_replication_on_significant_variants(
             variant_cols_safe, mapping, Ecols, variant_cols = pickle.load(f)
     else:
         log.info("Costruisco il dataset per generation=%d (non trovato o force_rebuild_dataset=True)", target_generation)
-        df, variant_cols_safe, mapping, Ecols, variant_cols = load_and_prepare_data(target_cfg)
+        df, variant_cols_safe, mapping, Ecols, variant_cols, covariate_cols = load_and_prepare_data(target_cfg)
         with open(df_path, "wb") as f:
             pickle.dump(df, f)
         with open(meta_path, "wb") as f:
