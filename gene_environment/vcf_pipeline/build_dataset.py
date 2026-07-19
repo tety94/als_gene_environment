@@ -82,8 +82,13 @@ def _build_narrow_covariates(cfg: Config, gen_ids: pd.Series) -> tuple[pd.DataFr
     log.info("Carico file ambientale da %s", cfg.env_file)
     df_env = pd.read_csv(cfg.env_file, sep=cfg.sep, decimal=cfg.decimal)
     df_env["id"] = df_env["id"].astype(str)
+    SEX_ENCODING = {"M": 1, "F": 0}
     if "sex" in df_env.columns:
-        df_env["sex"] = df_env["sex"].astype("category")
+        unmapped = set(df_env["sex"].dropna().unique()) - set(SEX_ENCODING.keys())
+        if unmapped:
+            raise ValueError(f"'sex': valori non riconosciuti {unmapped}, aggiorna SEX_ENCODING in {__name__}")
+        df_env["sex"] = df_env["sex"].map(SEX_ENCODING).astype(float)
+        log.info("sex codificata con %s", SEX_ENCODING)
     if "onset_site" in df_env.columns:
         df_env["onset_site"] = df_env["onset_site"].astype("category")
 
@@ -157,6 +162,19 @@ def _build_narrow_covariates(cfg: Config, gen_ids: pd.Series) -> tuple[pd.DataFr
     else:
         log.info("PCA disattivate (cfg.use_pca_covariates=False): nessuna covariata di popolazione.")
 
+    if "sex" in df.columns:
+        n_missing_sex = int(df["sex"].isna().sum())
+        if n_missing_sex:
+            pct = 100 * n_missing_sex / len(df)
+            log.warning("sex: %d/%d campioni (%.1f%%) senza valore, verranno esclusi da dropna().", n_missing_sex,
+                        len(df), pct)
+        else:
+            log.info("sex: nessun valore mancante su %d campioni.", len(df))
+        covariate_cols = covariate_cols + ["sex"]
+    else:
+        log.warning("Colonna 'sex' non trovata nel file ambientale: covariata non aggiunta.")
+
+    log.info("Covariate di correzione usate nel modello: %s", covariate_cols or "nessuna")
     return df, Ecols, covariate_cols
 
 
