@@ -175,6 +175,7 @@ def _build_narrow_covariates(cfg: Config, gen_ids: pd.Series) -> tuple[pd.DataFr
         log.warning("Colonna 'sex' non trovata nel file ambientale: covariata non aggiunta.")
 
     log.info("Covariate di correzione usate nel modello: %s", covariate_cols or "nessuna")
+    print(df.columns)
     return df, Ecols, covariate_cols
 
 
