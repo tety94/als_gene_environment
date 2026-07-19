@@ -45,6 +45,8 @@ Ordine consigliato di esecuzione:
                                già in DB (nessun ricalcolo)
   7. assign-genes             Assegna il gene Ensembl alle varianti significative
   8. annotate-genes           Arricchisce i geni con annotazioni neuro (CTD/GO)
+  9. recalculate-final        Ricalcolo a 10000 perm delle varianti significative in
+                               entrambe le coorti, con tutti i beta (JSON) — dopo assign-genes
 
 Gli step 4 e 5 possono essere ripetuti quante volte serve durante il run di
 "run-model" (es. da cron), per avere sempre uno snapshot aggiornato delle
@@ -77,6 +79,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("assign-genes", help="Assegna il gene Ensembl alle varianti significative")
     sub.add_parser("annotate-genes", help="Annotazioni neuro sui geni")
     sub.add_parser("pipeline-order", help="Stampa l'ordine consigliato degli step")
+
+    p_final = sub.add_parser(
+        "recalculate-final",
+        help="Ricalcolo ad alta precisione (10000 perm di default) delle varianti significative in entrambe le coorti, con tutti i beta salvati in JSON",
+    )
+    p_final.add_argument("--exposure", type=str, default=None, help="Default: config.exposure")
+    p_final.add_argument("--n-perm", type=int, default=10000, help="Numero di permutazioni (default: 10000)")
+    p_final.add_argument("--force-rebuild-dataset", action="store_true")
 
     args = parser.parse_args(argv)
 
@@ -129,6 +139,14 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "annotate-genes":
         from gene_environment.gene_annotation.annotate_genes import run_annotate_gene_neuro_info
         run_annotate_gene_neuro_info()
+
+    elif args.command == "recalculate-final":
+        from gene_environment.analysis.run_final_recalc import run_final_recalculation
+        run_final_recalculation(
+            exposure=args.exposure,
+            n_perm=args.n_perm,
+            force_rebuild_dataset=args.force_rebuild_dataset,
+        )
 
     else:
         parser.print_help()

@@ -122,3 +122,12 @@ def assert_numeric_covariates(E_df) -> None:
             f"fast_ols richiede covariate numeriche, trovate non numeriche: {non_numeric}. "
             "Il fast path non fa dummy-encoding come patsy: servirebbe il path smf.ols originale."
         )
+
+def design_column_names(variant_col: str, Ecols: list[str], covariate_cols: list[str]) -> list[str]:
+    """Nomi nello stesso ordine di build_design_and_solve:
+    [intercept, variant, E_1..E_p, variant:E_1..variant:E_p, C_1..C_q]"""
+    names = ["Intercept", variant_col]
+    names += list(Ecols)
+    names += [f"{variant_col}:{e}" for e in Ecols]
+    names += list(covariate_cols)
+    return names

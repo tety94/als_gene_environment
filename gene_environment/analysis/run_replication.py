@@ -72,6 +72,7 @@ def run_replication_on_significant_variants(
 ) -> None:
     cfg = get_config()
     configure_logging(cfg.log_dir)
+    df, variant_cols_safe, mapping, Ecols, variant_cols, covariate_cols = load_and_prepare_data(cfg)
 
     exposure = exposure if exposure is not None else cfg.exposure
     alpha = alpha if alpha is not None else cfg.pvalue_threshold
@@ -161,8 +162,9 @@ def run_replication_on_significant_variants(
     random.shuffle(variants_to_run_safe)
 
     start_time = datetime.now()
+    # run_replication.py, in fondo a run_replication_on_significant_variants()
     run_parallel_processing(
-        variants_to_run_safe, mapping, Ecols, target_cfg,
+        variants_to_run_safe, mapping, Ecols, covariate_cols, target_cfg,  # <-- covariate_cols mancava
         description=f"replication gen{source_generation}->gen{target_generation} ({len(variants_to_run_safe)} varianti)",
     )
     log.info("Replication run completato in %s", datetime.now() - start_time)

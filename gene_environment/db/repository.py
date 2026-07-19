@@ -25,6 +25,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+import json
 
 from gene_environment.config import get_config
 from gene_environment.db.connection import get_connection, cursor_scope
@@ -113,6 +114,7 @@ SET
     onset_effect_size = %(onset_effect_size)s,
     onset_low_power = %(onset_low_power)s,
     onset_method = %(onset_method)s,
+    full_model_json = %(full_model_json)s,
     completed = 1
 WHERE variant = %(variant)s AND exposure = %(exposure)s AND generation = %(generation)s AND test = %(test)s
 """
@@ -123,7 +125,7 @@ def _row_to_params(res: dict, exposure: str, generation: int, test: str) -> dict
     chrom, pos, mutation = variant.split("_", 2) if variant.count("_") >= 2 else (None, None, None)
     onset = res.get("onset") or {}
 
-    return {
+    params = {
         "gene": None,
         "chromosome": chrom,
         "position": int(pos) if pos is not None else None,
@@ -152,6 +154,10 @@ def _row_to_params(res: dict, exposure: str, generation: int, test: str) -> dict
         "generation": generation,
         "test": test,
     }
+
+    full_model = res.get("full_model")
+    params["full_model_json"] = json.dumps(full_model) if full_model is not None else None
+    return params
 
 
 def save_variant_result(conn, res: dict, exposure: str, generation: int, test: str) -> None:

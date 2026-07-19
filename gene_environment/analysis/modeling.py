@@ -108,41 +108,27 @@ def _find_interaction_term(mod_params_index, variant_col: str) -> str | None:
     return None
 
 
+from gene_environment.analysis.fast_ols import (
+    assert_numeric_covariates,
+    build_design_and_solve,
+    design_column_names,          # nuovo import
+    interaction_column_index,
+)
+
 def _run_permutation_batch(
-    df_model, variant_col, X_scaled, Ecols, covariate_cols, cfg, rng, n_perm, log_prefix
+    df_model, variant_col, X_scaled, Ecols, covariate_cols, cfg, rng, n_perm, log_prefix,
+    full_beta: bool = False,
 ):
-    """Esegue n_perm permutazioni.
-
-    FAST PATH (vedi fast_ols.py e matching.py): rispetto alla versione
-    originale, che per ogni permutazione rifaceva da zero fit dello scaler +
-    fit di NearestNeighbors + smf.ols(formula=...) con parsing patsy, qui:
-      - lo scaler sulle covariate di matching (Ecols) è fittato UNA VOLTA
-        fuori da questo loop (le covariate non cambiano tra permutazioni,
-        vedi `precompute_scaled_covariates`) e passato come `X_scaled`;
-      - il matching usa cdist+argpartition su `X_scaled` invece di rifittare
-        NearestNeighbors ad ogni chiamata (verificato: stessa selezione di
-        vicini di sklearn, 0 mismatch su test);
-      - il coefficiente di interazione è risolto via design matrix numpy +
-        lstsq invece che tramite l'intero Model object di statsmodels
-        (verificato: stesso coefficiente, differenza ~1e-13).
-    Risultato verificato numericamente equivalente all'originale; ~15-25x
-    più veloce per permutazione nei benchmark.
-
-    NOTA: covariate_cols (es. le PC) NON entra nel matching (X_scaled resta
-    basato solo su Ecols, le esposizioni) -- entra SOLO nella design matrix
-    della regressione (C_values), come covariata di correzione additiva.
-    Matching e correzione di popolazione restano quindi due meccanismi
-    separati e componibili, coerentemente con build_formula.
-    """
-    betas = np.empty(n_perm)
-    betas[:] = np.nan
-
     variant_values = df_model[variant_col].values
     y_values = df_model[cfg.target_col].values
     E_values = df_model[Ecols].values
     C_values = df_model[covariate_cols].values if covariate_cols else None
     n_ecols = E_values.shape[1]
+    q = 0 if C_values is None else C_values.shape[1]
+    n_cols = 2 + 2 * n_ecols + q
     inter_idx = interaction_column_index(n_ecols)
+
+    betas = np.full((n_perm, n_cols) if full_beta else (n_perm,), np.nan)
 
     for i in range(n_perm):
         perm_variant = rng.permutation(variant_values)
@@ -160,15 +146,21 @@ def _run_permutation_batch(
         beta = build_design_and_solve(perm_variant[idx], E_values[idx], y_values[idx], C_idx)
         if beta is None:
             continue
-        betas[i] = beta[inter_idx]
+
+        if full_beta:
+            betas[i, :] = beta
+        else:
+            betas[i] = beta[inter_idx]
 
         if (i + 1) % 500 == 0:
             log.debug("%s: %d/%d permutazioni completate", log_prefix, i + 1, n_perm)
 
+    if full_beta:
+        valid = ~np.isnan(betas[:, 0])
+        return betas[valid]
     return betas[~np.isnan(betas)]
 
-
-def process_single_variant(variant_col: str, variant_original: str, Ecols: list[str]) -> dict | None:
+def process_single_variant(variant_col: str, variant_original: str, Ecols: list[str],  full_beta: bool = False) -> dict | None:
     cfg = get_config()
     df = global_df
     covariate_cols = global_covariate_cols  # es. le PC, popolate da init_worker; [] se disattivate
@@ -253,6 +245,51 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     obs_coef = float(mod.params[interaction_name])
     n_treated_matched = int(matched_obs["_match_variant"].sum())
     n_control_matched = int((matched_obs["_match_variant"] == 0).sum())
+
+    if full_beta:
+        col_names = design_column_names(variant_col, Ecols, covariate_cols)
+        obs_vec = np.array([mod.params.get(name, np.nan) for name in col_names])
+
+        X_scaled = precompute_scaled_covariates(df_model, Ecols)
+        assert_numeric_covariates(df_model[Ecols + covariate_cols])
+
+        perm_matrix = _run_permutation_batch(
+            df_model, variant_col, X_scaled, Ecols, covariate_cols, cfg,
+            np.random.RandomState(_stable_seed(cfg.random_state, variant_col)),
+            cfg.n_perm, log_prefix=f"[{variant_col}] FULL", full_beta=True,
+        )
+
+        if perm_matrix.shape[0] == 0:
+            full_model = {name: {"obs": safe_val(o), "perm_mean": None, "perm_std": None, "p_emp": None}
+                          for name, o in zip(col_names, obs_vec)}
+        else:
+            perm_mean = perm_matrix.mean(axis=0)
+            perm_std = perm_matrix.std(axis=0)
+            p_emp = (np.abs(perm_matrix) >= np.abs(obs_vec)).mean(axis=0)
+            full_model = {
+                name: {
+                    "obs": safe_val(o), "perm_mean": safe_val(m),
+                    "perm_std": safe_val(s), "p_emp": safe_val(p),
+                }
+                for name, o, m, s, p in zip(col_names, obs_vec, perm_mean, perm_std, p_emp)
+            }
+
+        interaction_name = _find_interaction_term(mod.params.index, variant_col)
+        inter_stats = full_model.get(interaction_name, {})
+
+        return {
+            "variant": variant_original,
+            "n_treated": int(matched_obs["_match_variant"].sum()),
+            "n_control": int((matched_obs["_match_variant"] == 0).sum()),
+            "obs_coef": inter_stats.get("obs"),
+            "perm_mean": inter_stats.get("perm_mean"),
+            "perm_std": inter_stats.get("perm_std"),
+            "p_emp": inter_stats.get("p_emp"),
+            "max_smd": max_smd,
+            "iterations": cfg.n_perm,
+            "onset": onset_dict,
+            "full_model": full_model,
+        }
 
     if abs(obs_coef) < cfg.min_obs_coef:
         return {

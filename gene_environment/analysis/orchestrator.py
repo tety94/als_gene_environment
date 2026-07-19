@@ -64,7 +64,7 @@ def init_worker(temp_df_path: str, log_dir: str, covariate_cols: list[str]):
 
 
 def run_parallel_processing(
-    variants: list[str], mapping: dict, Ecols: list[str], covariate_cols: list[str], cfg, description: str = "",
+    variants: list[str], mapping: dict, Ecols: list[str], covariate_cols: list[str], cfg, description: str = "", full_beta: bool = False,
 ) -> None:
     log.info("Avvio processi paralleli: %s (%d varianti, %d worker)", description, len(variants), cfg.max_workers)
 
@@ -76,7 +76,7 @@ def run_parallel_processing(
         initializer=init_worker,
         initargs=(cfg.temp_df_path, cfg.log_dir, covariate_cols),
     ) as ex:
-        futures = {ex.submit(modeling.process_single_variant, g, mapping[g], Ecols): g for g in variants}
+        futures = {ex.submit(modeling.process_single_variant, g, mapping[g], Ecols, full_beta): g for g in variants}
 
         for fut in as_completed(futures):
             variant_name = futures[fut]
@@ -128,6 +128,7 @@ def run_main_pipeline() -> None:
 
     run_parallel_processing(
         variants_to_run, mapping, Ecols, covariate_cols, cfg, description="run con permutazioni adattive",
+        full_beta = False,
     )
 
     results_df = load_variant_results(cfg.exposure, cfg.n_perm_high)
