@@ -43,7 +43,7 @@ def load_pca_covariates(path_template: str, generation: int, n_components: int) 
     """
     path = path_template.format(generation=generation)
     df = pd.read_csv(path)
-
+    print(df.head(2))
     if PCA_ID_COLUMN not in df.columns:
         raise ValueError(
             f"Colonna '{PCA_ID_COLUMN}' non trovata in {path}. "
