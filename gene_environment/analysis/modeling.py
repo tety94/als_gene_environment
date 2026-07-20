@@ -73,6 +73,7 @@ from gene_environment.analysis.matching import (
 )
 from gene_environment.analysis.onset_age_stats import compute_onset_age_result
 from gene_environment.config import get_config
+from gene_environment.db.repository import safe_val
 from gene_environment.logging_utils import get_logger
 
 log = get_logger(__name__)
