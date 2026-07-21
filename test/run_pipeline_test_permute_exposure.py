@@ -8,45 +8,48 @@ appaiato (matched_obs), e si ricalcola il coefficiente di interazione ad
 ogni permutazione con lo stesso fast path (build_design_and_solve) usato
 dalla pipeline.
 
-CORREZIONE AL MATCHING (stessa di run_pipeline_test.py, vedi quel file per
-la spiegazione completa del problema): il matching nearest-neighbor della
-pipeline collassa quando la covariata di matching (esposizione
-standardizzata) ha una grande massa di valori identici (qui ~40% dei
-pazienti a esposizione=0), perché il gruppo "base" resta intero ma il
-gruppo "other" viene deduplicato ai soli vicini unici. Qui, tratto
-l'esposizione=0 come strato a pareggio esatto (tutti dentro, nessun NN
-necessario) e faccio nearest-neighbor matching SOLO sulla parte continua
-(>0), usando le funzioni REALI della pipeline (match_control_units)
-ristrette a quel sottoinsieme. In questo script il matching si fa UNA SOLA
-VOLTA per variante (il campione appaiato resta fisso, si permuta solo
-l'esposizione al suo interno), quindi la correzione è più semplice che in
-run_pipeline_test.py (lì va rifatta ad ogni permutazione).
+*** RICHIEDE che il TUO gene_environment/analysis/matching.py sia già stato
+aggiornato con la correzione tie-aware (vedi matching_PATCHED.py) -- qui il
+matching osservato usa direttamente match_control_units, non più una
+stratificazione manuale come nella versione precedente di questo file. ***
 
 IMPORTANTE (vedi discussione nella conversazione): le due strategie di
 permutazione (genotipo vs esposizione) testano nulli leggermente diversi e
-NON devono produrre p-value identici in generale — vedi docstring di
+NON devono produrre p-value identici in generale -- vedi docstring di
 run_pipeline_test.py per il dettaglio.
 
-** AVVISO — LIMITE STATISTICO VERIFICATO **: testando a N=1000 (vs N=600),
+** AVVISO -- LIMITE STATISTICO VERIFICATO **: testando a N=1000 (vs N=600),
 questo approccio (permutare l'esposizione dentro un campione appaiato
 FISSO) ha mostrato un tasso di falsi positivi inflazionato: 8/47 varianti
 nulle (17%) risultate "significative" a p<=0.05, contro un 5% atteso
-(binomial test p=0.002 — statisticamente anomalo, non rumore campionario,
+(binomial test p=0.002 -- statisticamente anomalo, non rumore campionario,
 riprodotto identico su più run indipendenti con la stessa configurazione).
 Nello stesso identico dataset, run_pipeline_test.py (che permuta il
 GENOTIPO e rifà il matching ad ogni permutazione, cioè il disegno REALE
-della pipeline) resta ben calibrato: 0/47 falsi positivi. Causa probabile:
-il campione appaiato non è una selezione casuale rispetto all'esposizione
-(il matching dipende congiuntamente da genotipo ed esposizione), quindi
-permutare l'esposizione ENTRO quel campione fissato non garantisce
-l'ipotesi di scambiabilità che il test di permutazione richiede — a N più
-alti il matching seleziona sottoinsiemi più strutturati, amplificando il
-problema. CONCLUSIONE: questo script NON è un test statisticamente valido
-per trarre conclusioni — usalo solo a scopo esplorativo/diagnostico, non
+della pipeline) resta ben calibrato: 0/47 falsi positivi.
+AGGIORNAMENTO dopo il passaggio al matching multivariato (Ecols +
+covariate_cols, esposizione+sesso+PC insieme): il problema si presenta
+ANCHE a N=600 (non solo a N=1000 come nella versione mono-variata): 9/60
+falsi positivi (15%, binomial test p=0.003). Il matching multivariato rende
+il campione appaiato ancora più "strutturato" (selezionato in funzione
+congiunta di più variabili), quindi la violazione di scambiabilità
+descritta sotto si accentua.
+Causa probabile: il campione appaiato non è una selezione casuale rispetto
+all'esposizione (il matching dipende congiuntamente da genotipo, esposizione
+e covariate), quindi permutare l'esposizione ENTRO quel campione fissato
+non garantisce l'ipotesi di scambiabilità che il test di permutazione
+richiede. CONCLUSIONE: questo script NON è un test statisticamente valido
+per trarre conclusioni -- usalo solo a scopo esplorativo/diagnostico, non
 come alternativa intercambiabile a run_pipeline_test.py. Per validare la
 pipeline, fai riferimento a run_pipeline_test.py.
-"""
 
+COME LANCIARLO (gira da TE, non da questa chat):
+  1. Metti questo file nella cartella ROOT del repo (stesso livello della
+     cartella "gene_environment/"), o cambia REPO_ROOT qui sotto.
+  2. Esegui prima gen_fake_data.py, poi (opzionale, per confronto)
+     run_pipeline_test.py.
+  3. python run_pipeline_test_permute_exposure.py
+"""
 from __future__ import annotations
 
 import os
@@ -76,7 +79,7 @@ os.environ.update({
     "SEP": ",",
     "TEMP_DF_PATH": os.path.join(WORK_DIR, "temp_df_perm_e.pkl"),
     "LOG_DIR": os.path.join(WORK_DIR, "logs"),
-    "MATCH_K": "3",   # default di config.py — funziona bene UNA VOLTA stratificato lo zero
+    "MATCH_K": "3",   # default di config.py -- ora sufficiente col matching corretto
     "MIN_TREATED": "5",
     "MIN_SAMPLE_SIZE": "10",
     "MAX_SMD": "0.25",
@@ -104,19 +107,9 @@ print("Carico e preparo il dataset (stesso codice usato in produzione)...")
 df, variant_cols_safe, mapping, Ecols, variant_cols, covariate_cols = load_and_prepare_data(cfg)
 print(f"Righe: {len(df)} | Esposizione: {Ecols} | Covariate: {covariate_cols}")
 
-RAW_EXPOSURE_COL = cfg.exposure
-
-
-def match_observed_stratified(d_model: pd.DataFrame, treat_col: str, k: int) -> pd.DataFrame | None:
-    zero_mask = d_model[RAW_EXPOSURE_COL] == 0
-    d0 = d_model[zero_mask]
-    d_pos = d_model[~zero_mask]
-    if d_pos.empty:
-        return d0 if not d0.empty else None
-    matched_pos = match_control_units(d_pos, treat_col, k=k, covariates_for_matching=Ecols)
-    if matched_pos is None:
-        return d0 if not d0.empty else None
-    return pd.concat([d0, matched_pos], ignore_index=True)
+# Matching osservato su Ecols + covariate_cols (esposizione + sesso + PC
+# insieme), coerente con la correzione applicata a modeling.py.
+MATCH_COLS = Ecols + covariate_cols
 
 
 def process_variant_permute_exposure(variant_col, variant_original, rng):
@@ -129,17 +122,18 @@ def process_variant_permute_exposure(variant_col, variant_original, rng):
     if n_treated < cfg.min_treated or n_control < cfg.min_treated:
         return None
 
-    cols = [cfg.target_col, variant_col, "_match_variant", RAW_EXPOSURE_COL] + Ecols + covariate_cols
+    cols = [cfg.target_col, variant_col, "_match_variant"] + MATCH_COLS
     d_model = d[cols].dropna()
     if d_model.shape[0] < cfg.min_sample_size:
         return None
 
-    # ---- matching stratificato, calcolato UNA VOLTA (osservato) ----
-    matched_obs = match_observed_stratified(d_model, "_match_variant", cfg.match_k)
+    # ---- matching osservato: funzione REALE della pipeline (patchata),
+    # calcolato UNA VOLTA ----
+    matched_obs = match_control_units(d_model, "_match_variant", k=cfg.match_k, covariates_for_matching=MATCH_COLS)
     if matched_obs is None or matched_obs.shape[0] < cfg.min_sample_size:
         return None
 
-    smd_results = check_balance(matched_obs, "_match_variant", Ecols)
+    smd_results = check_balance(matched_obs, "_match_variant", MATCH_COLS)
     max_smd = max(smd_results.values()) if smd_results else 1
     if max_smd > cfg.max_smd:
         return None
@@ -153,7 +147,7 @@ def process_variant_permute_exposure(variant_col, variant_original, rng):
     obs_coef = float(mod.params[interaction_name])
 
     # ---- permutazioni: si mescola SOLO l'esposizione, dentro il gruppo
-    # appaiato osservato (fisso), non il genotipo. ----
+    # appaiato osservato (fisso), non il genotipo, non sesso/PC. ----
     variant_values = matched_obs[variant_col].values.astype(float)
     y_values = matched_obs[cfg.target_col].values
     E_values = matched_obs[Ecols].values.astype(float)
