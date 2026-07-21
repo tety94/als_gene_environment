@@ -2,7 +2,7 @@
 
 /data
 /logs
-
+/gene_environment/logs
 .idea
 
 /output

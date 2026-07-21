@@ -222,20 +222,26 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     )
     onset_dict = onset_result.__dict__ if onset_result is not None else None
 
-    matched_obs = match_control_units(df_model, "_match_variant", k=cfg.match_k, covariates_for_matching=Ecols)
+    matched_obs = match_control_units(
+        df_model, "_match_variant", k=cfg.match_k, covariates_for_matching=Ecols + covariate_cols
+    )
     if matched_obs is None or matched_obs.shape[0] < cfg.min_sample_size:
         return _empty(onset=onset_dict)
 
-    smd_results = check_balance(matched_obs, "_match_variant", Ecols)
+    smd_results = check_balance(matched_obs, "_match_variant", Ecols + covariate_cols)
     max_smd = max(smd_results.values()) if smd_results else 1
 
     if max_smd > cfg.max_smd:
         return _empty(max_smd=max_smd, onset=onset_dict)
 
-    # covariate_cols (le PC) entra qui nella formula come termine additivo
-    # "+ PC1 + PC2 + ..." FUORI dalla moltiplicazione con variant -> corregge
-    # il modello senza introdurre interazioni variant:PCk (vedi
-    # build_formula e fast_ols.py per la struttura della design matrix).
+    # covariate_cols (sesso, PC) entra qui nella formula come termine
+    # additivo "+ sex + PC1 + PC2 + ..." FUORI dalla moltiplicazione con
+    # variant -> corregge il modello senza introdurre interazioni
+    # variant:covariata (vedi build_formula e fast_ols.py per la struttura
+    # della design matrix). Le stesse covariate sono usate ANCHE nel
+    # matching sopra (covariates_for_matching=Ecols + covariate_cols): il
+    # matching bilancia esposizione, sesso e struttura di popolazione
+    # insieme tra portatori e non portatori, non la sola esposizione.
     formula = build_formula(cfg.target_col, variant_col, Ecols, covariate_cols, matched_obs)
     mod = smf.ols(formula=formula, data=matched_obs).fit()
     interaction_name = _find_interaction_term(mod.params.index, variant_col)
@@ -251,7 +257,7 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
         col_names = design_column_names(variant_col, Ecols, covariate_cols)
         obs_vec = np.array([mod.params.get(name, np.nan) for name in col_names])
 
-        X_scaled = precompute_scaled_covariates(df_model, Ecols)
+        X_scaled = precompute_scaled_covariates(df_model, Ecols + covariate_cols)
         assert_numeric_covariates(df_model[Ecols + covariate_cols])
 
         perm_matrix = _run_permutation_batch(
@@ -308,13 +314,16 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
 
     rng = np.random.RandomState(_stable_seed(cfg.random_state, variant_col))
 
-    # Scaler sulle covariate di MATCHING (Ecols soltanto, non le PC) fittato
-    # UNA VOLTA per variante (non ad ogni permutazione, vedi
-    # fast_ols.py/matching.py). Calcolato solo qui, dopo il filtro
+    # Scaler sulle covariate di MATCHING (Ecols + covariate_cols, cioè
+    # esposizione + sesso + PC insieme) fittato UNA VOLTA per variante (non
+    # ad ogni permutazione, vedi fast_ols.py/matching.py). Deve usare lo
+    # STESSO insieme di colonne usato per il matching osservato sopra,
+    # altrimenti la matrice scalata qui non sarebbe comparabile a quella
+    # usata per ottenere matched_obs. Calcolato solo qui, dopo il filtro
     # min_obs_coef, per non sprecare lavoro sulle varianti che non arrivano
     # comunque alla fase di permutazione.
     assert_numeric_covariates(df_model[Ecols + covariate_cols])
-    X_scaled = precompute_scaled_covariates(df_model, Ecols)
+    X_scaled = precompute_scaled_covariates(df_model, Ecols + covariate_cols)
 
     # ======================================================
     # PERMUTAZIONI LIGHT, con futility check adattivo:

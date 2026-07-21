@@ -76,9 +76,20 @@ def match_control_units(
         return None
 
     nn = NearestNeighbors(n_neighbors=k_used).fit(X_other.values)
-    _, indices = nn.kneighbors(X_base.values)
+    distances, _ = nn.kneighbors(X_base.values)
 
-    selected_other_pos = np.unique(indices.flatten())
+    # Gestione dei pareggi: se più punti "other" sono alla STESSA distanza
+    # del k-esimo vicino (es. una massa di valori identici nella covariata
+    # di matching, come una categoria "non esposto" numericamente
+    # consistente), li si include TUTTI, non solo i primi k trovati.
+    # Comportamento standard nella letteratura sul matching (es. R MatchIt).
+    # Senza questo, np.unique(indices.flatten()) troncava arbitrariamente i
+    # pareggi a k rappresentanti, sbilanciando sistematicamente il campione
+    # appaiato ogni volta che la covariata aveva molti valori ripetuti — e
+    # peggiorando, non migliorando, all'aumentare del numero di pazienti.
+    kth_dist = distances[:, -1]
+    D_full = cdist(X_base.values, X_other.values)
+    selected_other_pos = np.unique(np.where(D_full <= kth_dist[:, None] + 1e-9)[1])
     other_idx = X_other.index[selected_other_pos]
 
     matched_other = df_matching.loc[other_idx]
@@ -115,11 +126,9 @@ def match_control_units_indices(
     albero ad ogni chiamata) usa `cdist` + `argpartition` su una matrice di
     covariate GIA' scalata (vedi `precompute_scaled_covariates`).
 
-    Verificato numericamente equivalente a NearestNeighbors (stessi vicini
-    selezionati su 500 permutazioni di test, 0 mismatch) — misurato ~3x più
-    veloce a parità di scaler già cachato, e senza il costo del refit dello
-    scaler ad ogni chiamata (quello lo si evita a monte, con
-    `precompute_scaled_covariates`).
+    Gestisce i pareggi come `match_control_units` (vedi commento lì): se più
+    punti "other" sono alla stessa distanza del k-esimo vicino, li include
+    tutti, non solo i primi k trovati da argpartition.
 
     Ritorna (matched_base_idx, matched_other_idx): array di POSIZIONI
     intere in `X_scaled`/`labels` (non indici pandas), oppure None se un
@@ -142,7 +151,8 @@ def match_control_units_indices(
 
     D = cdist(X_scaled[base], X_scaled[other])
     idx_part = np.argpartition(D, k_used - 1, axis=1)[:, :k_used]
-    selected_other = np.unique(other[idx_part.flatten()])
+    kth_dist = np.take_along_axis(D, idx_part, axis=1).max(axis=1)
+    selected_other = np.unique(np.where(D <= kth_dist[:, None] + 1e-9)[1])
 
     return base, selected_other
 
