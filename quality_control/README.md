@@ -207,7 +207,7 @@ python3 qc_report.py --kin "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenve
     --out-dir "$OUT_DIR/qc_report"
 
 # uno per ciascuna esposizione che usi nel modello
-for EXPOSURE in seminativi_1500 vigneti_1500 risaie_1500; do
+for EXPOSURE in seminativi_500 vigneti_500 risaie_500 seminativi_1000 vigneti_1000 risaie_1000 seminativi_1500 vigneti_1500 risaie_1500; do
     python3 interpret_plink_output.py --kin0 "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
         --metadata "$METADATA" --exposure-col "$EXPOSURE" \
         --out-dir "$OUT_DIR/diagnostics_output_${EXPOSURE}"
@@ -238,7 +238,7 @@ python3 qc_report.py --kin "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenve
     --vcf-dirs /mnt/cresla_prod/genome_datasets/gen2 --use-filtered \
     --out-dir "$OUT_DIR/qc_report"
 
-for EXPOSURE in seminativi_1500 vigneti_1500 risaie_1500; do
+for EXPOSURE in seminativi_500 vigneti_500 risaie_500 seminativi_1000 vigneti_1000 risaie_1000 seminativi_1500 vigneti_1500 risaie_1500; do
     python3 interpret_plink_output.py --kin0 "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
         --metadata "$METADATA" --exposure-col "$EXPOSURE" \
         --out-dir "$OUT_DIR/diagnostics_output_${EXPOSURE}"

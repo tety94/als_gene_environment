@@ -6,3 +6,6 @@
 .idea
 
 /output
+
+/test/fake_data
+/test/logs
