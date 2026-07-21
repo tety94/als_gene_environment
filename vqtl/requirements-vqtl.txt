@@ -1,0 +1,29 @@
+# Dipendenze del modulo vqtl.
+#
+# Rispetto al requirements.txt del vecchio progetto vqtl_pipeline, NON
+# servono più (perché vqtl non legge più i VCF direttamente, li legge
+# gene_environment a monte):
+#   - cyvcf2      (parsing VCF diretto, sostituito da RAW_FILE/build_dataset)
+#   - pysnptools  (idem)
+#   - dask        (non usato: i chunk vengono parallelizzati con joblib, come
+#                  nel resto di gene_environment)
+#   - pyyaml      (non serve più un config.yaml separato)
+#
+# Il resto di gene_environment richiede già pandas/numpy/scipy/scikit-learn/
+# joblib/matplotlib/pyarrow/python-dotenv: qui sono elencate comunque per
+# completezza, piu' le due librerie che gene_environment non usa ma che
+# servono solo a vqtl (statsmodels per QuantReg/OLS/Logit, seaborn per i
+# box/scatter plot del report, tabulate per le tabelle markdown del report).
+numpy>=1.26
+pandas>=2.0
+pyarrow>=14.0
+scipy>=1.11
+statsmodels>=0.14
+scikit-learn>=1.3
+matplotlib>=3.8
+seaborn>=0.13
+joblib>=1.3
+tabulate>=0.9
+python-docx>=1.1
+python-dotenv>=1.0
+mysql-connector-python>=8.0
