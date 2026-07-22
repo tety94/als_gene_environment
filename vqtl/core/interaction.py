@@ -24,7 +24,7 @@ from joblib import Parallel, delayed
 from gene_environment.logging_utils import get_logger
 
 from vqtl.config import VqtlConfig
-from vqtl.core.data import VqtlDataset
+from vqtl.core.data import VqtlDataset, dosage_matrix
 
 log = get_logger(__name__)
 
@@ -99,7 +99,7 @@ def run_interaction_tests(
         safe_col = inv_mapping.get(snp_id)
         if safe_col is None:
             continue
-        dosage = dataset.df[safe_col].to_numpy(dtype=float)
+        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # bugfix: gestisce i "." (genotipo mancante) come NaN, come fa scan.py
         for exp_raw, exp_std_col in dataset.exposure_std_cols.items():
             if (snp_id, exp_raw) in done_keys:
                 continue

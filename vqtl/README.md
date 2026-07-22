@@ -57,7 +57,7 @@ QC e PCA vere con `plink2` (`00_run_plink_qc.sh` -> `extract_pca_covariates.py`)
 il cui output (`pca_covariates.csv`, uno per generazione) e' gia' il
 `PCA_COVARIATES_PATH_TEMPLATE` che `gene_environment` stesso usa come
 covariata di correzione. `vqtl/core/data.py` carica le stesse PCA reali con
-`gene_environment.analysis.pca_utils.load_pca_covariates` invece di
+`gene_environment.utils.pca_utils.load_pca_covariates` invece di
 ricalcolarne una versione piu' debole.
 
 **Una sola config, non due.** Il vecchio `config/config.yaml` duplicava a

@@ -7,10 +7,7 @@ statistica rispetto al progetto originale (vedi README storico, sezione 4):
   2. Per ogni SNP e ogni tau in cfg.taus: quantile regression di R su
      dosage a tau e a tau+0.5; beta_diff(tau) = beta_{tau+0.5} - beta_{tau}.
   3. beta_QI = media_tau(beta_diff(tau)) (effetto quantile-integrato).
-  4. SE(beta_QI): "asymptotic" (default, delta method sulle SE per-tau di
-     QuantReg) o "bootstrap" (resampling, piu' accurato ma piu' costoso --
-     usato di regola solo sui top loci allo Step 7, non qui).
-  5. Z = beta_QI / SE, P da normale standard (2 code).
+  4. SE(beta_QI): due modalita' disponibili via cfg.se_method.
 
 UNICA differenza rispetto all'originale: il dosaggio arriva da una colonna
 del DataFrame gia' costruito da `core.data.load_vqtl_dataset` (quindi gia'
@@ -20,10 +17,41 @@ iterazione sui VCF qui dentro. Le colonne vengono processate in chunk e
 parallelizzate con joblib esattamente come prima (`cfg.n_jobs`,
 `cfg.chunk_size`), passando ai worker solo il sotto-blocco numpy del chunk
 (non l'intero DataFrame) per lo stesso motivo di efficienza dell'originale.
+
+=== NOTA SU se_method (rivisto dopo audit, vedi CHANGELOG_VQTL_BUGFIX.md) ===
+
+In origine "asymptotic" combinava le SE per-tau di QuantReg con una formula
+delta-method (mean(ses), o mean(ses)/sqrt(n_taus)): ENTRAMBE le varianti
+si sono rivelate sbagliate, perche' le n_taus stime beta_diff(tau) NON sono
+indipendenti -- sono tutte fit sugli STESSI identici dati (stesso dosaggio,
+stesso residuo), solo su quantili diversi e spesso ravvicinati (default
+0.05,0.10,...,0.45: 9 tau, passo 0.05). Trattarle come indipendenti (dividere
+per sqrt(n_taus)) sottostima la SE (lambda_GC >> 1, troppo liberale);
+ignorare la correlazione senza dividere affatto (mean(ses)) la sovrastima
+(lambda_GC << 1, troppo conservativo). Verificato empiricamente su dati
+sintetici con ground truth nota: un bootstrap (resampling per-soggetto, che
+non fa alcuna assunzione di indipendenza fra tau) da' lambda_GC ~1 sullo
+stesso identico pool nullo, a conferma che il problema era nella formula,
+non nei dati.
+
+Non esiste una formula chiusa semplice per la SE corretta senza stimare la
+covarianza reale fra le stime per-tau (richiederebbe il sandwich asintotico
+congiunto del processo di quantile regression, non banale da implementare
+qui). La soluzione adottata: se_method="asymptotic" ora esegue un
+mini-bootstrap (VQTL_ASYMPTOTIC_BOOTSTRAP_K repliche, default 50 -- molto
+meno del bootstrap "pieno" usato per la validazione allo Step 7, ma
+sufficiente per una SE calibrata correttamente) invece della vecchia
+formula delta-method. Il nome del parametro resta "asymptotic" per non
+rompere la configurazione esistente (VQTL_SE_METHOD nel .env), ma la
+computazione sottostante e' cambiata. se_method="bootstrap" resta
+disponibile per un bootstrap piu' robusto (VQTL_BOOTSTRAP_K, default 200,
+usato tipicamente solo sui top loci allo Step 7 per costo computazionale).
 """
 from __future__ import annotations
 
+import threading
 import time
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -31,6 +59,7 @@ import statsmodels.api as sm
 from joblib import Parallel, delayed
 from scipy import stats
 from statsmodels.regression.quantile_regression import QuantReg
+from statsmodels.tools.sm_exceptions import IterationLimitWarning
 
 from gene_environment.logging_utils import get_logger
 
@@ -47,6 +76,41 @@ log = get_logger(__name__)
 QR_MAX_ITER = 100
 QR_P_TOL = 1e-3
 
+# ============================================================
+# Contatori di convergenza (diagnostica). ATTENZIONE: sono in-process --
+# con Parallel(backend="loky") ogni worker e' un processo separato, quindi
+# questi contatori nel processo principale NON riflettono cio' che accade
+# nei worker paralleli. Affidabili solo con n_jobs=1 (uso previsto: script
+# di debug), oppure se in futuro vengono aggregati esplicitamente dal
+# valore di ritorno di _process_chunk invece che da uno stato globale.
+# ============================================================
+
+_convergence_lock = threading.Lock()
+_convergence_stats = {"tau_fits_attempted": 0, "tau_fits_discarded": 0, "variants_all_nan": 0}
+
+
+def reset_convergence_stats() -> None:
+    with _convergence_lock:
+        for k in _convergence_stats:
+            _convergence_stats[k] = 0
+
+
+def get_convergence_stats() -> dict:
+    with _convergence_lock:
+        return dict(_convergence_stats)
+
+
+def _record_tau_fit(discarded: bool) -> None:
+    with _convergence_lock:
+        _convergence_stats["tau_fits_attempted"] += 1
+        if discarded:
+            _convergence_stats["tau_fits_discarded"] += 1
+
+
+def _record_variant_all_nan() -> None:
+    with _convergence_lock:
+        _convergence_stats["variants_all_nan"] += 1
+
 
 def residualize(y: np.ndarray, covariates: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Residualizza y sulle covariate (OLS). Pubblica (non piu' _residualize)
@@ -62,9 +126,11 @@ def residualize(y: np.ndarray, covariates: np.ndarray) -> tuple[np.ndarray, np.n
 
 
 def _beta_qi_single(dosage: np.ndarray, resid: np.ndarray, taus: list[float]) -> tuple[float, int]:
-    """Solo beta_QI (usata per il resampling bootstrap, dove serve rifittare
-    da zero ad ogni replica e non ha senso portarsi dietro le SE asintotiche
-    di ogni singola replica)."""
+    """Solo beta_QI: un fit per tau e uno per tau+0.5, media dei diffs.
+    Usata sia dal bootstrap "pieno" (resampling per-soggetto, K ripetizioni
+    di questa funzione) sia dal mini-bootstrap di se_method="asymptotic"
+    (vedi _beta_qi_and_asymptotic_se) -- stessa routine, contesti diversi
+    di chiamata, nessuna duplicazione della logica di fit."""
     ok = ~np.isnan(dosage) & ~np.isnan(resid)
     d, r = dosage[ok], resid[ok]
     if len(np.unique(d)) < 2 or len(d) < 20:
@@ -73,47 +139,70 @@ def _beta_qi_single(dosage: np.ndarray, resid: np.ndarray, taus: list[float]) ->
     diffs = []
     for tau in taus:
         try:
-            b_lo = QuantReg(r, X).fit(q=tau, max_iter=QR_MAX_ITER, p_tol=QR_P_TOL).params[1]
-            b_hi = QuantReg(r, X).fit(q=tau + 0.5, max_iter=QR_MAX_ITER, p_tol=QR_P_TOL).params[1]
-            diffs.append(b_hi - b_lo)
-        except Exception:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", IterationLimitWarning)
+                fit_lo = QuantReg(r, X).fit(q=tau, max_iter=QR_MAX_ITER, p_tol=QR_P_TOL)
+                fit_hi = QuantReg(r, X).fit(q=tau + 0.5, max_iter=QR_MAX_ITER, p_tol=QR_P_TOL)
+            diffs.append(fit_hi.params[1] - fit_lo.params[1])
+            _record_tau_fit(discarded=False)
+        except (IterationLimitWarning, Exception):
+            _record_tau_fit(discarded=True)
             continue
     if not diffs:
+        _record_variant_all_nan()
         return np.nan, int(ok.sum())
     return float(np.mean(diffs)), int(ok.sum())
 
 
-def _beta_qi_and_asymptotic_se(dosage: np.ndarray, resid: np.ndarray, taus: list[float]) -> tuple[float, float, int]:
-    """Come _beta_qi_single, ma ricava beta_QI E la SE asintotica dagli
-    STESSI fit QuantReg (un fit per tau e uno per tau+0.5, non due round
-    separati) -- dimezza il numero di QuantReg fit rispetto a chiamare
-    _beta_qi_single e poi rifittare per le SE, che era il comportamento
-    precedente per il metodo 'asymptotic' (default). Con lo scan genoma-wide
-    questo e' il percorso piu' usato, quindi e' li' che conviene ottimizzare."""
+def _beta_qi_and_asymptotic_se(
+    dosage: np.ndarray, resid: np.ndarray, taus: list[float], mini_bootstrap_k: int, seed: int,
+) -> tuple[float, float, int]:
+    """beta_QI (fit sui dati originali, un fit per tau e uno per tau+0.5 --
+    invariato) + SE stimata via mini-bootstrap (mini_bootstrap_k repliche di
+    _beta_qi_single su resampling per-soggetto), non piu' via combinazione
+    delle SE asintotiche per-tau di QuantReg -- vedi nota nel docstring del
+    modulo sul perche' la vecchia formula delta-method era sistematicamente
+    distorta (le stime per-tau sono correlate, non indipendenti)."""
     ok = ~np.isnan(dosage) & ~np.isnan(resid)
     d, r = dosage[ok], resid[ok]
     if len(np.unique(d)) < 2 or len(d) < 20:
         return np.nan, np.nan, int(ok.sum())
     X = sm.add_constant(d)
-    diffs, ses = [], []
+    diffs = []
     for tau in taus:
         try:
-            fit_lo = QuantReg(r, X).fit(q=tau, max_iter=QR_MAX_ITER, p_tol=QR_P_TOL)
-            fit_hi = QuantReg(r, X).fit(q=tau + 0.5, max_iter=QR_MAX_ITER, p_tol=QR_P_TOL)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", IterationLimitWarning)
+                fit_lo = QuantReg(r, X).fit(q=tau, max_iter=QR_MAX_ITER, p_tol=QR_P_TOL)
+                fit_hi = QuantReg(r, X).fit(q=tau + 0.5, max_iter=QR_MAX_ITER, p_tol=QR_P_TOL)
             diffs.append(fit_hi.params[1] - fit_lo.params[1])
-            ses.append(np.sqrt(fit_lo.bse[1] ** 2 + fit_hi.bse[1] ** 2))
-        except Exception:
+            _record_tau_fit(discarded=False)
+        except (IterationLimitWarning, Exception):
+            _record_tau_fit(discarded=True)
             continue
     if not diffs:
+        _record_variant_all_nan()
         return np.nan, np.nan, int(ok.sum())
     beta_qi = float(np.mean(diffs))
-    se = float(np.mean(ses)) / np.sqrt(len(ses)) if ses else np.nan
+
+    # SE via mini-bootstrap (resampling per-soggetto, K piccolo per restare
+    # veloce genoma-wide) invece della vecchia combinazione delle SE
+    # asintotiche per-tau.
+    n = len(d)
+    rng = np.random.default_rng(seed)
+    boot = np.empty(mini_bootstrap_k)
+    for b in range(mini_bootstrap_k):
+        idx = rng.integers(0, n, n)
+        bqi, _ = _beta_qi_single(d[idx], r[idx], taus)
+        boot[b] = bqi if not np.isnan(bqi) else 0.0
+    se = float(np.nanstd(boot, ddof=1))
+
     return beta_qi, se, int(ok.sum())
 
 
 def _process_chunk(
     chunk_idx: int, dosage_chunk: np.ndarray, col_names: list[str], resid: np.ndarray, taus: list[float],
-    se_method: str, bootstrap_k: int, min_maf: float, min_call_rate: float, seed: int,
+    se_method: str, bootstrap_k: int, asymptotic_bootstrap_k: int, min_maf: float, min_call_rate: float, seed: int,
 ) -> tuple[int, list[dict]]:
     """Ritorna SEMPRE una riga per ogni variante del chunk (mai un "buco"):
     una variante scartata dai filtri MAF/call-rate o per cui QuantReg non
@@ -149,7 +238,13 @@ def _process_chunk(
                         boot[b] = bqi if not np.isnan(bqi) else 0.0
                     se = float(np.nanstd(boot, ddof=1))
             else:
-                beta_qi, se, n_used = _beta_qi_and_asymptotic_se(dosage, resid, taus)
+                # "asymptotic": mini-bootstrap interno, vedi
+                # _beta_qi_and_asymptotic_se. seed derivato da (seed, j) per
+                # restare deterministico per variante indipendentemente
+                # dall'ordine di elaborazione del chunk.
+                beta_qi, se, n_used = _beta_qi_and_asymptotic_se(
+                    dosage, resid, taus, asymptotic_bootstrap_k, seed=seed * 100_003 + j,
+                )
 
             if np.isnan(beta_qi) or se is None or np.isnan(se) or se == 0:
                 rows.append({"variant_safe": col, "status": "done", "n": int(n_used) if n_used else None,
@@ -180,6 +275,7 @@ def _scan_fingerprint(vcfg: VqtlConfig, cols: list[str]) -> dict:
         "taus": vcfg.taus,
         "se_method": vcfg.se_method,
         "bootstrap_k": vcfg.bootstrap_k,
+        "asymptotic_bootstrap_k": getattr(vcfg, "asymptotic_bootstrap_k", None),
         "min_maf": vcfg.min_maf,
         "min_call_rate": vcfg.min_call_rate,
     }
@@ -187,6 +283,7 @@ def _scan_fingerprint(vcfg: VqtlConfig, cols: list[str]) -> dict:
 
 def run_vqtl_scan(
     dataset: VqtlDataset, vcfg: VqtlConfig, target_col: str, generation: int, force: bool = False,
+    variant_subset: list[str] | None = None,
 ) -> pd.DataFrame:
     """Scan vQTL genoma-wide, con stato persistito a DB (vqtl_scan_results,
     vedi vqtl/db/repository.py e db/schema.sql) invece che su file: un
@@ -196,14 +293,25 @@ def run_vqtl_scan(
     job del cluster ucciso, ecc.), al riavvio le varianti gia' 'done' non
     vengono ripetute -- si riparte da dove si era interrotto, non da zero.
     `force=True` (da --force in cli.py) ripulisce tutto e riparte da capo
-    anche se la fingerprint corrisponde."""
+    anche se la fingerprint corrisponde.
+
+    `variant_subset` (colonne "safe", vedi VqtlDataset.variant_cols):
+    restringe lo scan a un elenco esplicito di varianti invece che a
+    dataset.variant_cols per intero -- e' il parametro che cli.py passa da
+    `--significant-only` (via select_variants_from_significant_results).
+    None (default) = scan genoma-wide completo, comportamento invariato."""
     from vqtl.db import repository as repo
 
     y_col = f"{target_col}_z"
-    cols = dataset.variant_cols
+    cols = dataset.variant_cols if variant_subset is None else variant_subset
+    if variant_subset is not None:
+        log.info("Scan vQTL limitato a un subset esplicito di %d varianti (--significant-only).", len(cols))
+
+    asymptotic_bootstrap_k = getattr(vcfg, "asymptotic_bootstrap_k", 50)
     log.info(
-        "Step 3 - scan vQTL: %d varianti, taus=%s, se_method=%s, n_jobs=%s, chunk_size=%s",
-        len(cols), vcfg.taus, vcfg.se_method, vcfg.n_jobs, vcfg.chunk_size,
+        "Step 3 - scan vQTL: %d varianti, taus=%s, se_method=%s (asymptotic_bootstrap_k=%s, bootstrap_k=%s), "
+        "n_jobs=%s, chunk_size=%s",
+        len(cols), vcfg.taus, vcfg.se_method, asymptotic_bootstrap_k, vcfg.bootstrap_k, vcfg.n_jobs, vcfg.chunk_size,
     )
 
     covariates = dataset.df[dataset.covariate_cols].to_numpy(dtype=float) if dataset.covariate_cols else np.zeros((len(dataset.df), 0))
@@ -255,7 +363,7 @@ def run_vqtl_scan(
         gen = Parallel(n_jobs=vcfg.n_jobs, backend="loky", return_as="generator_unordered")(
             delayed(_process_chunk)(
                 i, dosage_matrix(dataset, chunk_cols), chunk_cols, resid, vcfg.taus,
-                vcfg.se_method, vcfg.bootstrap_k, vcfg.min_maf, vcfg.min_call_rate, seed=i,
+                vcfg.se_method, vcfg.bootstrap_k, asymptotic_bootstrap_k, vcfg.min_maf, vcfg.min_call_rate, seed=i,
             )
             for i, chunk_cols in enumerate(chunks)
         )

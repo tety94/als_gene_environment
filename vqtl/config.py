@@ -107,8 +107,10 @@ class VqtlConfig:
             "VQTL_TAUS", "0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45"
         )
     )
-    se_method: str = field(default_factory=lambda: _env("VQTL_SE_METHOD", "asymptotic"))
+    # se_method: str = field(default_factory=lambda: _env("VQTL_SE_METHOD", "asymptotic"))
+    se_method: str = field(default_factory=lambda: _env("VQTL_SE_METHOD", "bootstrap"))
     bootstrap_k: int = field(default_factory=lambda: _env_int("VQTL_BOOTSTRAP_K", 200))
+    asymptotic_bootstrap_k: int = field(default_factory=lambda: _env_int("VQTL_ASYMPTOTIC_BOOTSTRAP_K", 50))
     chunk_size: int = field(default_factory=lambda: _env_int("VQTL_CHUNK_SIZE", 2000))
     # Default: cfg.max_workers (stesso parallelismo del resto della pipeline,
     # niente terzo parametro da tenere sincronizzato a mano). -1 = tutti i core.

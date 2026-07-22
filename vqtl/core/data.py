@@ -45,10 +45,9 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-from gene_environment.analysis.pca_utils import load_pca_covariates
 from gene_environment.config import Config
 from gene_environment.logging_utils import get_logger
-from gene_environment.utils.id_utils import clean_sample_id, parse_variant_label
+from gene_environment.utils.id_utils import parse_variant_label
 from gene_environment.vcf_pipeline.build_dataset import load_and_prepare_data
 
 from vqtl.config import VqtlConfig
@@ -115,7 +114,7 @@ def load_vqtl_dataset(
         "Carico dataset vQTL (generazione=%s) da RAW_FILE=%s + ENV_FILE=%s",
         ge_cfg.generation, ge_cfg.raw_file, ge_cfg.env_file,
     )
-    df, variant_cols, mapping, _ecols_default, _variant_cols_real = load_and_prepare_data(ge_cfg)
+    df, variant_cols, mapping, _ecols_default, _variant_cols_real, _covariate_cols_default = load_and_prepare_data(ge_cfg)
     log.info("Dataset caricato: %d campioni, %d varianti", len(df), len(variant_cols))
 
     # ---- Esposizioni: gene_environment standardizza solo cfg.exposure di
@@ -146,32 +145,29 @@ def load_vqtl_dataset(
     # condiviso con il resto della pipeline.
     df, covariate_cols = _dummy_encode(df, list(vcfg.covariates))
 
-    # ---- PCA reali (quality_control), non quelle "fatte in casa" ----
+    # ---- PCA reali (quality_control) ----
+    # NON vanno ricaricate/riunite qui: gene_environment.vcf_pipeline.
+    # build_dataset.load_and_prepare_data le unisce GIA' al dataframe (dentro
+    # _build_narrow_covariates, quando cfg.use_pca_covariates e' true) prima
+    # di ritornarlo -- df ha gia' le colonne PC1..PC<n> a questo punto. Un
+    # secondo merge con lo stesso nome colonna produrrebbe PC1_x/PC1_y
+    # invece di PC1 (pandas rinomina le colonne sovrapposte non-chiave),
+    # facendo fallire tutto il codice a valle che si aspetta "PC1" ecc. Ci
+    # limitiamo quindi a riconoscere le colonne gia' presenti.
     if ge_cfg.use_pca_covariates:
-        pca_df = load_pca_covariates(
-            ge_cfg.pca_covariates_path_template, ge_cfg.generation, ge_cfg.pca_n_components,
-        )
-        # NOTA IMPORTANTE su formato ID: pca_covariates.csv contiene la
-        # colonna "IID" nel formato "grezzo" prodotto da plink (osservato
-        # nella forma doppia "NOME_NOME", vedi il commento su PCA_ID_COLUMN
-        # in pca_utils.py), mentre il dataframe principale qui ha gia' la
-        # colonna "id" ripulita/deduplicata da `clean_sample_id`
-        # (load_and_prepare_data la applica all'indice del file genetico).
-        # Un merge diretto "IID"->"id" senza normalizzare non farebbe
-        # match quasi nessun campione ("NOME_NOME" != "NOME"). Percio' qui
-        # applichiamo la STESSA `clean_sample_id` gia' usata dal resto della
-        # pipeline anche alla colonna IID delle PCA, invece di introdurre
-        # una logica di normalizzazione diversa/nuova.
-        pca_df = pca_df.rename(columns={"IID": "id"})
-        pca_df["id"] = pca_df["id"].astype(str).map(clean_sample_id)
-        pc_cols = [c for c in pca_df.columns if c != "id"]
-        n_before = len(df)
-        df = df.merge(pca_df, on="id", how="left", validate="many_to_one")
-        n_missing_pca = int(df[pc_cols[0]].isna().sum()) if pc_cols else 0
+        pc_cols = [f"PC{i}" for i in range(1, ge_cfg.pca_n_components + 1)]
+        missing_pc = [c for c in pc_cols if c not in df.columns]
+        if missing_pc:
+            raise ValueError(
+                f"USE_PCA_COVARIATES=true ma {missing_pc} non sono nel dataset gia' "
+                f"costruito da load_and_prepare_data (atteso: gia' unite li'). "
+                f"Colonne disponibili: {list(df.columns)}"
+            )
+        n_missing_pca = int(df[pc_cols[0]].isna().sum())
         if n_missing_pca:
             log.warning(
-                "%d/%d campioni senza PCA dopo il merge (esclusi a valle dai dropna per-modello).",
-                n_missing_pca, n_before,
+                "%d/%d campioni senza PCA (mancanza gia' emersa nel merge di load_and_prepare_data).",
+                n_missing_pca, len(df),
             )
         covariate_cols = covariate_cols + pc_cols
         log.info("PCA attive come covariate di correzione: %s", pc_cols)

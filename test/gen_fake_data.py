@@ -1,7 +1,25 @@
 """
-Genera un dataset sintetico (genetica + ambiente + PC di popolazione) con un
-effetto di interazione gene x esposizione INIETTATO A PRIORI su un piccolo
-sottoinsieme di varianti "causali", e nessun effetto sulle varianti "nulle".
+Genera un dataset sintetico (genetica + ambiente + PC di popolazione) con:
+
+  1. un effetto di interazione gene x esposizione INIETTATO A PRIORI su un
+     piccolo sottoinsieme di varianti "causali" G×E (CAUSAL_VARIANTS),
+  2. un effetto puramente di VARIANZA (nessun mean-shift) su un piccolo
+     sottoinsieme di varianti "vQTL pure" (PURE_VARIANCE_VARIANTS) --
+     serve a testare lo scan vQTL (Step 3, QUAIL/regressione quantile),
+     che e' pensato per individuare eteroschedasticita' genotipo-dipendente
+     anche in ASSENZA di un'interazione G×E,
+  3. nessun effetto sulle varianti "nulle".
+
+Un unico generatore serve sia al test della pipeline gene_environment
+(matching + OLS + permutation test) sia al test della pipeline vqtl
+(scan + filter + interaction + rge_het + robustness/permutation): le 5
+varianti G×E sono controlli positivi per entrambe le pipeline (producono
+comunque eteroschedasticita' via l'esposizione continua, quindi sono
+segnali vQTL genuini anche loro, solo di un tipo diverso rispetto alle 2
+vQTL pure). Il ground truth scritto in output riporta sia lo schema
+"is_causal" (gene_environment) sia lo schema "effect_type" (vqtl), cosi'
+entrambi gli script di test possono leggere lo stesso file senza modifiche
+reciproche.
 
 onset_age: tarata per assomigliare a una distribuzione di età d'esordio SLA
 sporadica (mediana ~60 anni, SD ~10, range 30-85).
@@ -9,10 +27,11 @@ sporadica (mediana ~60 anni, SD ~10, range 30-85).
 exposure_env: ~40% dei pazienti non esposti (valore 0), i restanti con un
 punteggio di esposizione cumulativa continuo, right-skewed, in (0, 100].
 
-Obiettivo: verificare che la pipeline (matching + OLS + permutation test)
-recuperi correttamente le varianti causali (basso p_emp, segno del
-coefficiente coerente con quello iniettato) e NON segnali sistematicamente
-le varianti nulle come significative.
+Obiettivo: verificare che le pipeline recuperino correttamente le varianti
+causali (G×E: basso p_emp e segno del coefficiente coerente con quello
+iniettato; vQTL pure: eteroschedasticita' per dosaggio senza interazione
+significativa) e NON segnalino sistematicamente le varianti nulle come
+significative.
 """
 from __future__ import annotations
 
@@ -24,8 +43,14 @@ import pandas as pd
 
 RNG_SEED = 12345
 
-N_PATIENTS = 600
-N_NULL_VARIANTS = 60
+# N_PATIENTS/N_NULL_VARIANTS piu' ampi rispetto alla versione originale
+# gene_environment-only (600/60): un pool nullo piccolo rende instabile la
+# stima di lambda_GC (mediana di Z^2 su tutte le varianti scansionate, vedi
+# vqtl/core/filter_candidates.py:genomic_inflation) richiesta dal test vqtl.
+# Un pool piu' grande non cambia la logica del test gene_environment, lo
+# rende solo un po' piu' lento.
+N_PATIENTS = 700
+N_NULL_VARIANTS = 300
 
 # variant_label -> (beta_interaction, beta_main)  [effetto vero iniettato]
 # beta_interaction è l'effetto per unità di esposizione STANDARDIZZATA, per
@@ -38,6 +63,16 @@ CAUSAL_VARIANTS = {
     "4_4000004_T_C": (3.2, -0.5),    # interazione moderata, positiva
     "5_5000005_A_T": (-5.0, 1.0),    # interazione forte, negativa
 }
+
+# variant_label -> {dosaggio: sd del rumore aggiuntivo a quel dosaggio}.
+# Effetto SOLO sulla varianza (media zero ad ogni dosaggio): un vQTL "puro",
+# che il test di interazione G×E NON deve rilevare (nessun beta_I atteso),
+# a differenza delle varianti in CAUSAL_VARIANTS sopra. Costruito
+# esplicitamente (non come dict literal) per chiarezza sulla progressione
+# della sd col dosaggio.
+PURE_VARIANCE_VARIANTS: dict[str, dict[int, float]] = {}
+PURE_VARIANCE_VARIANTS["7_7000001_A_G"] = {0: 3.0, 1: 8.0, 2: 15.0}   # varianza CRESCE col dosaggio
+PURE_VARIANCE_VARIANTS["7_7000002_C_T"] = {0: 14.0, 1: 8.0, 2: 3.0}   # varianza DECRESCE col dosaggio (segno opposto)
 
 # Cartella di output: relativa a questo file, non alla cwd da cui lo lanci.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -58,6 +93,9 @@ def stream(label: str) -> np.random.Generator:
     seed = int(digest[:8], 16)
     return np.random.default_rng(seed)
 
+
+def _sd_from_dosage(dosage_numeric: np.ndarray, sd_by_dosage: dict[int, float]) -> np.ndarray:
+    return np.array([sd_by_dosage[int(round(d))] for d in dosage_numeric])
 
 
 def main():
@@ -94,9 +132,11 @@ def main():
     # ---- genotipi: uno stream indipendente PER VARIANTE, seedato sul suo
     # nome -- la MAF e il genotipo di ciascuna variante (comprese le
     # causali) non dipendono da N_PATIENTS ne' dalle altre varianti. ----
-    variant_labels = list(CAUSAL_VARIANTS.keys()) + [
-        f"{6 + (i // 200)}_{9_000_000 + i}_A_G" for i in range(N_NULL_VARIANTS)
-    ]
+    variant_labels = (
+        list(CAUSAL_VARIANTS.keys())
+        + list(PURE_VARIANCE_VARIANTS.keys())
+        + [f"{6 + (i // 200)}_{9_000_000 + i}_A_G" for i in range(N_NULL_VARIANTS)]
+    )
 
     geno = {}
     maf_used = {}
@@ -130,10 +170,19 @@ def main():
         + noise
     )
 
+    # ---- effetto G×E (mean-shift) ----
     for lab, (beta_inter, beta_main) in CAUSAL_VARIANTS.items():
         dosage = geno[lab]
         dosage_numeric = np.array([0.0 if v == "." else float(v) for v in dosage])
         onset_age = onset_age + beta_main * dosage_numeric + beta_inter * dosage_numeric * exposure_std_approx
+
+    # ---- effetto vQTL puro (solo varianza, media zero) ----
+    for lab, sd_by_dosage in PURE_VARIANCE_VARIANTS.items():
+        dosage = geno[lab]
+        dosage_numeric = np.array([0.0 if v == "." else float(v) for v in dosage])
+        rng_var_effect = stream(f"variance_effect:{lab}")
+        sd_i = _sd_from_dosage(dosage_numeric, sd_by_dosage)
+        onset_age = onset_age + rng_var_effect.normal(0, sd_i, size=n)
 
     onset_age = np.clip(onset_age, 30, 85)  # range d'esordio SLA plausibile
 
@@ -147,9 +196,10 @@ def main():
     df_env.to_csv(os.path.join(OUT_DIR, "env.csv"), index=False)
 
     # ---- file genetico ----
-    df_gen = pd.DataFrame({"id": ids})
-    for lab in variant_labels:
-        df_gen[lab] = geno[lab]
+    df_gen = pd.concat(
+        [pd.Series(ids, name="id")] + [pd.Series(geno[lab], name=lab) for lab in variant_labels],
+        axis=1,
+    )
     df_gen.to_csv(os.path.join(OUT_DIR, "genetic.csv"), index=False)
 
     # ---- PC di popolazione (covariate di correzione, non di interazione) ----
@@ -173,20 +223,52 @@ def main():
         print(f"  PC{i}: {pct:.1f}%")
 
     # ---- ground truth per il confronto a valle ----
+    # Schema unito: "is_causal"/"true_beta_interaction"/"true_beta_main"
+    # (usato dal test gene_environment) + "effect_type"/"sd_dosage*" (usato
+    # dal test vqtl) nello stesso file, cosi' entrambi gli script leggono
+    # ground_truth.csv senza bisogno di generatori separati.
     truth_rows = []
     for lab in variant_labels:
-        beta_inter, beta_main = CAUSAL_VARIANTS.get(lab, (0.0, 0.0))
-        truth_rows.append({
-            "variant": lab,
-            "is_causal": lab in CAUSAL_VARIANTS,
-            "true_beta_interaction": beta_inter,
-            "true_beta_main": beta_main,
-            "maf": maf_used[lab],
-        })
+        if lab in CAUSAL_VARIANTS:
+            beta_inter, beta_main = CAUSAL_VARIANTS[lab]
+            truth_rows.append({
+                "variant": lab,
+                "is_causal": True,
+                "effect_type": "gxe_meanshift",
+                "true_beta_interaction": beta_inter,
+                "true_beta_main": beta_main,
+                "sd_dosage0": np.nan, "sd_dosage1": np.nan, "sd_dosage2": np.nan,
+                "maf": maf_used[lab],
+            })
+        elif lab in PURE_VARIANCE_VARIANTS:
+            sdd = PURE_VARIANCE_VARIANTS[lab]
+            truth_rows.append({
+                "variant": lab,
+                "is_causal": True,
+                "effect_type": "pure_variance",
+                "true_beta_interaction": 0.0,
+                "true_beta_main": 0.0,
+                "sd_dosage0": sdd[0], "sd_dosage1": sdd[1], "sd_dosage2": sdd[2],
+                "maf": maf_used[lab],
+            })
+        else:
+            truth_rows.append({
+                "variant": lab,
+                "is_causal": False,
+                "effect_type": "no_effect",
+                "true_beta_interaction": 0.0,
+                "true_beta_main": 0.0,
+                "sd_dosage0": np.nan, "sd_dosage1": np.nan, "sd_dosage2": np.nan,
+                "maf": maf_used[lab],
+            })
     pd.DataFrame(truth_rows).to_csv(os.path.join(OUT_DIR, "ground_truth.csv"), index=False)
 
     print(f"Pazienti: {n}")
-    print(f"Varianti totali: {len(variant_labels)} ({len(CAUSAL_VARIANTS)} causali, {N_NULL_VARIANTS} nulle)")
+    print(
+        f"Varianti totali: {len(variant_labels)} "
+        f"({len(CAUSAL_VARIANTS)} G×E causali, {len(PURE_VARIANCE_VARIANTS)} vQTL pure, "
+        f"{N_NULL_VARIANTS} nulle)"
+    )
     print(f"onset_age: media={onset_age.mean():.1f}, sd={onset_age.std():.1f}")
     print(f"File scritti in {OUT_DIR}/")
 

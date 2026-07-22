@@ -48,7 +48,7 @@ from scipy import stats
 from gene_environment.logging_utils import get_logger
 
 from vqtl.config import VqtlConfig
-from vqtl.core.data import VqtlDataset
+from vqtl.core.data import VqtlDataset, dosage_matrix
 from vqtl.core.interaction import fit_interaction, is_binary
 from vqtl.core.scan import residualize
 
@@ -175,7 +175,7 @@ def run_robustness_and_permutation(
         exp_std_col = dataset.exposure_std_cols.get(exp_raw)
         if safe_col is None or exp_std_col is None:
             continue
-        dosage = dataset.df[safe_col].to_numpy(dtype=float)
+        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # bugfix: gestisce i "." (genotipo mancante) come NaN, come fa scan.py
         exposure_vals = dataset.df[exp_std_col].to_numpy(dtype=float)
 
         for variant_name, (yv, mask) in phenotype_variants.items():
@@ -227,7 +227,7 @@ def run_robustness_and_permutation(
         exp_std_col = dataset.exposure_std_cols.get(exp_raw)
         if safe_col is None or exp_std_col is None:
             continue
-        dosage = dataset.df[safe_col].to_numpy(dtype=float)
+        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # bugfix: gestisce i "." (genotipo mancante) come NaN, come fa scan.py
         exposure_vals = dataset.df[exp_std_col].to_numpy(dtype=float)
         observed_beta = row["beta_I"]
 
