@@ -15,6 +15,7 @@ Esempi:
     python -m gene_environment.cli report-onset-age
     python -m gene_environment.cli assign-genes
     python -m gene_environment.cli annotate-genes
+    python -m gene_environment.cli run-gxe-genetlib
     python -m gene_environment.cli pipeline-order    # stampa l'ordine consigliato
 """
 from __future__ import annotations
@@ -79,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("assign-genes", help="Assegna il gene Ensembl alle varianti significative")
     sub.add_parser("annotate-genes", help="Annotazioni neuro sui geni")
     sub.add_parser("pipeline-order", help="Stampa l'ordine consigliato degli step")
+    sub.add_parser("run-gxe-genetlib", help="Analisi G x E cromosoma-per-cromosoma con GENetLib")
 
     p_final = sub.add_parser(
         "recalculate-final",
@@ -139,6 +141,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "annotate-genes":
         from gene_environment.gene_annotation.annotate_genes import run_annotate_gene_neuro_info
         run_annotate_gene_neuro_info()
+
+    elif args.command == "run-gxe-genetlib":
+        from gene_environment.analysis.gxe_genetlib import run_gxe_genetlib_pipeline
+        run_gxe_genetlib_pipeline()
 
     elif args.command == "recalculate-final":
         from gene_environment.analysis.run_final_recalc import run_final_recalculation
