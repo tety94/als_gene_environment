@@ -90,14 +90,42 @@ def section(title: str) -> None:
 
 
 # ============================================================
+# Cache: se una variante ha gia' un isolated_summary.json con status "ok",
+# non la riesegue -- utile per riprendere dopo un errore/interruzione senza
+# rifare da capo le 46+16 varianti. Bypassabile con --force.
+# ============================================================
+
+def _load_cached_result(var_dir: str, force: bool = False) -> dict | None:
+    if force:
+        return None
+    summary_path = os.path.join(var_dir, "isolated_summary.json")
+    if not os.path.isfile(summary_path):
+        return None
+    try:
+        with open(summary_path) as f:
+            cached = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None  # file corrotto/incompleto: ricalcola
+    if cached.get("status") != "ok":
+        return None  # un run fallito in precedenza va sempre riprovato
+    return cached
+
+
+# ============================================================
 # Una variante G×E alla volta
 # ============================================================
 
 def run_isolated_ge_variant(label: str, beta_inter: float, beta_main: float,
-                             n_workers: int = 1) -> dict:
-    section(f"[GxE isolata] {label}  (beta_inter={beta_inter}, beta_main={beta_main})")
+                             n_workers: int = 1, force: bool = False) -> dict:
     var_dir = os.path.join(ISOLATED_ROOT, "ge", label)
     fake_dir = os.path.join(var_dir, "fake_data")
+
+    cached = _load_cached_result(var_dir, force=force)
+    if cached is not None:
+        print(f"[GxE isolata] {label}: risultato gia' presente (status ok), salto il ricalcolo.")
+        return cached
+
+    section(f"[GxE isolata] {label}  (beta_inter={beta_inter}, beta_main={beta_main})")
     os.makedirs(fake_dir, exist_ok=True)
 
     # Nel pool DEFAULT_CAUSAL_VARIANTS alcune voci hanno beta_inter=0.0
@@ -162,9 +190,15 @@ def run_isolated_ge_variant(label: str, beta_inter: float, beta_main: float,
 # Una variante pure_variance (vQTL) alla volta
 # ============================================================
 
-def run_isolated_vqtl_variant(label: str, sd_by_dosage: dict, n_workers: int = 1) -> dict:
-    section(f"[vQTL isolata] {label}  (sd_by_dosage={sd_by_dosage})")
+def run_isolated_vqtl_variant(label: str, sd_by_dosage: dict, n_workers: int = 1, force: bool = False) -> dict:
     var_dir = os.path.join(ISOLATED_ROOT, "vqtl", label)
+
+    cached = _load_cached_result(var_dir, force=force)
+    if cached is not None:
+        print(f"[vQTL isolata] {label}: risultato gia' presente (status ok), salto il ricalcolo.")
+        return cached
+
+    section(f"[vQTL isolata] {label}  (sd_by_dosage={sd_by_dosage})")
     fake_dir = os.path.join(var_dir, "fake_data")
     os.makedirs(fake_dir, exist_ok=True)
 
@@ -214,12 +248,12 @@ def run_isolated_vqtl_variant(label: str, sd_by_dosage: dict, n_workers: int = 1
 # Wrapper top-level per ProcessPoolExecutor (deve essere picklabile)
 # ============================================================
 
-def _worker_ge(label: str, beta_inter: float, beta_main: float, n_workers: int) -> dict:
-    return run_isolated_ge_variant(label, beta_inter, beta_main, n_workers=n_workers)
+def _worker_ge(label: str, beta_inter: float, beta_main: float, n_workers: int, force: bool) -> dict:
+    return run_isolated_ge_variant(label, beta_inter, beta_main, n_workers=n_workers, force=force)
 
 
-def _worker_vqtl(label: str, sd_by_dosage: dict, n_workers: int) -> dict:
-    return run_isolated_vqtl_variant(label, sd_by_dosage, n_workers=n_workers)
+def _worker_vqtl(label: str, sd_by_dosage: dict, n_workers: int, force: bool) -> dict:
+    return run_isolated_vqtl_variant(label, sd_by_dosage, n_workers=n_workers, force=force)
 
 
 # ============================================================
@@ -437,11 +471,15 @@ def main() -> None:
                          help="Numero di varianti da testare in parallelo (processi separati). Default 1.")
     parser.add_argument("--only-ge", action="store_true", help="Testa solo le varianti G×E")
     parser.add_argument("--only-vqtl", action="store_true", help="Testa solo le varianti pure_variance")
+    parser.add_argument("--force", action="store_true",
+                         help="Ricalcola anche le varianti che hanno gia' un isolated_summary.json con status ok "
+                              "(default: vengono saltate e si riusa il risultato salvato)")
     args = parser.parse_args()
 
     do_ge = not args.only_vqtl
     do_vqtl = not args.only_ge
     n_workers = max(1, args.workers)
+    force = args.force
     os.makedirs(ISOLATED_ROOT, exist_ok=True)
 
     jobs = []
@@ -459,10 +497,10 @@ def main() -> None:
         for job in jobs:
             if job[0] == "ge":
                 _, label, beta_inter, beta_main = job
-                all_results.append(run_isolated_ge_variant(label, beta_inter, beta_main, n_workers=1))
+                all_results.append(run_isolated_ge_variant(label, beta_inter, beta_main, n_workers=1, force=force))
             else:
                 _, label, sd_by_dosage, _ = job
-                all_results.append(run_isolated_vqtl_variant(label, sd_by_dosage, n_workers=1))
+                all_results.append(run_isolated_vqtl_variant(label, sd_by_dosage, n_workers=1, force=force))
     else:
         print(f"Eseguo {len(jobs)} varianti isolate con {n_workers} processi paralleli...")
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
@@ -470,10 +508,10 @@ def main() -> None:
             for job in jobs:
                 if job[0] == "ge":
                     _, label, beta_inter, beta_main = job
-                    fut = pool.submit(_worker_ge, label, beta_inter, beta_main, n_workers)
+                    fut = pool.submit(_worker_ge, label, beta_inter, beta_main, n_workers, force)
                 else:
                     _, label, sd_by_dosage, _ = job
-                    fut = pool.submit(_worker_vqtl, label, sd_by_dosage, n_workers)
+                    fut = pool.submit(_worker_vqtl, label, sd_by_dosage, n_workers, force)
                 futures[fut] = (job[0], job[1])
             for fut in as_completed(futures):
                 kind, label = futures[fut]
@@ -511,7 +549,15 @@ def main() -> None:
     with open(os.path.join(ISOLATED_ROOT, "isolated_power_curve.json"), "w") as f:
         json.dump(all_results, f, indent=2, default=str)
     print(f"\n[export] {summary_csv}")
-    print(f"Completato in {time.time() - t0:.0f}s.")
+
+    section("REPORT — grafici e Word")
+    plot_paths = generate_plots(summary_df)
+    for name, p in plot_paths.items():
+        print(f"[plot] {name}: {p}")
+    report_path = generate_word_report(summary_df, plot_paths)
+    print(f"[export] {report_path}")
+
+    print(f"\nCompletato in {time.time() - t0:.0f}s.")
 
     missed_power = [r["variant"] for r in all_results
                     if r["status"] == "ok" and r.get("role", "power") == "power" and not r.get("recovered")]
