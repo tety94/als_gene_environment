@@ -65,8 +65,7 @@ import sys
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from report_utils import generate_recap, generate_multi_scenario_recap
-from report_utils import generate_recap, generate_multi_scenario_recap, load_scenario_recap
+from test.report_utils import generate_recap, generate_multi_scenario_recap, load_scenario_recap
 
 import numpy as np
 import pandas as pd

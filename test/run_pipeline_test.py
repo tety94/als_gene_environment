@@ -33,7 +33,7 @@ COME LANCIARLO (gira da TE, non da questa chat):
   4. python run_pipeline_test.py
 """
 from __future__ import annotations
-from report_utils  import generate_recap
+from test.report_utils  import generate_recap
 
 import os
 import sys
