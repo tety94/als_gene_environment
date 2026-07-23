@@ -250,7 +250,6 @@ def get_variants_to_run(mapping: dict, variant_cols_safe: list[str], exposure: s
 # --------------------------------------------------------------------------
 # Geni / annotazione
 # --------------------------------------------------------------------------
-
 def get_empty_variants_gene() -> pd.DataFrame:
     """Recupera le varianti significative dalla stored procedure
     get_significant_results (nessun filtro exposure) e le filtra per
@@ -263,11 +262,14 @@ def get_empty_variants_gene() -> pd.DataFrame:
     with get_connection() as conn:
         with cursor_scope(conn) as cur:
             cur.execute(
-                "SELECT variant FROM variant_results_significant WHERE gene IS NOT NULL"
+                "SELECT variant, exposure FROM variant_results_significant WHERE gene IS NOT NULL"
             )
-            already_assigned = {row[0] for row in cur.fetchall()}
+            already_assigned = {(row[0], row[1]) for row in cur.fetchall()}
 
-    empty_df = sig_df[~sig_df["variant"].isin(already_assigned)]
+    empty_df = sig_df[
+        ~sig_df.apply(lambda r: (r["variant"], r["exposure"]) in already_assigned, axis=1)
+    ]
+
     log.info(f"Da calcolare {len(empty_df)} variants")
     return empty_df[["variant", "mutation", "position", "chromosome"]].reset_index(drop=True)
 
