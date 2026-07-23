@@ -22,14 +22,41 @@ Ogni scenario scrive sotto scenarios/<nome>/ (fake_data/, vqtl_results/,
 debug/, ge_pipeline_results.csv, scenario_summary.json). Alla fine viene
 scritto un report riassuntivo unico in scenarios/all_scenarios_summary.csv
 e .json, cosi' si vede a colpo d'occhio se qualche scenario e' andato
-storto (has_failures, causali recuperate, lambda_GC, eventuali eccezioni).
+storto (has_failures, causali recuperate, lambda_GC, eventuali eccezioni),
+piu' un report Word aggregato (scenarios/recap_all/all_scenarios_report.docx).
+
+*** VARIANTI CAUSALI USATE QUI: un set PICCOLO E FISSO (SCENARIO_CAUSAL_
+VARIANTS / SCENARIO_PURE_VARIANCE_VARIANTS sotto), NON i default "grandi"
+di gen_fake_data.py (DEFAULT_CAUSAL_VARIANTS / DEFAULT_PURE_VARIANCE_VARIANTS,
+46 G×E + 16 pure_variance).
+
+PERCHE': gen_fake_data.py somma il contributo di OGNI variante causale
+attiva alla STESSA onset_age, per lo stesso paziente:
+
+    for lab, (beta_inter, beta_main) in causal_variants.items():
+        onset_age += beta_main*dosage + beta_inter*dosage*exposure_std
+    for lab, sd_by_dosage in pure_variance_variants.items():
+        onset_age += rng.normal(0, sd_i, size=n)
+
+Se se ne attivano 46+16 insieme (misurato su un run reale): il rumore
+"nascosto" che ogni singolo test si trova davanti sale a ~4.5x il noise_sd
+dichiarato (soprattutto per colpa delle pure_variance, da sole ~15x la
+varianza base), perche' nessun test di una singola variante si aggiusta
+per le altre varianti causali attive nello stesso dataset. Per testare la
+ROBUSTEZZA della pipeline a condizioni diverse (stratificazione,
+missingness, campione piccolo, esposizione zero-inflazionata) serve un
+segnale pulito e comparabile fra scenari -- quindi qui si usa SEMPRE questo
+set piccolo, indipendentemente dai default di gen_fake_data.py. La curva di
+potenza per magnitudine/segno va invece misurata con
+run_isolated_causal_test.py (1 sola variante attiva per dataset), non qui.
+***
 
 COME LANCIARLO (gira da TE, non da questa chat):
   Metti questo file nella cartella ROOT del repo, insieme a
   gen_fake_data.py, run_pipeline_test.py (non serve importarlo: la sua
   logica e' replicata qui sotto), test_vqtl_pipeline.py, debug_se_method.py,
-  fake_vqtl_repository.py, report_utils.py -- cioe' allo stesso livello
-  dove li hai gia' messi per gli script singoli.
+  fake_vqtl_repository.py, e test/report_utils.py -- cioe' allo stesso
+  livello dove li hai gia' messi per gli script singoli.
 
     python run_scenarios.py                          # sequenziale, tutti gli scenari
     python run_scenarios.py baseline small_sample     # sequenziale, solo alcuni
@@ -65,7 +92,6 @@ import sys
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from test.report_utils import generate_recap, generate_multi_scenario_recap, load_scenario_recap
 
 import numpy as np
 import pandas as pd
@@ -75,13 +101,37 @@ REPO_ROOT = SCRIPT_DIR  # cambia qui se questo file non sta nella root del repo
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, SCRIPT_DIR)
 
+from test.report_utils import generate_recap, generate_multi_scenario_recap, load_scenario_recap
+
 SCENARIOS_ROOT = os.path.join(SCRIPT_DIR, "scenarios")
 
 # ============================================================
-# Definizione scenari: ogni dict e' passato cosi' com'e' a
-# gen_fake_data.generate_dataset(out_dir=..., **params). Tutti i parametri
-# non specificati restano ai default del generatore (comportamento
-# "originale"). Aggiungine/modificane pure altri qui.
+# Varianti causali per gli scenari di ROBUSTEZZA: set piccolo e fisso,
+# gli stessi 5 G×E + 2 pure_variance "storici" (quelli con cui la pipeline
+# e' stata validata originariamente). Vedi spiegazione in cima al file sul
+# perche' NON si usano i default grandi di gen_fake_data.py qui.
+# ============================================================
+SCENARIO_CAUSAL_VARIANTS: dict[str, tuple[float, float]] = {
+    "1_1000001_A_G": (-4.5, -1.0),
+    "2_2000002_C_T": (4.0, 0.5),
+    "3_3000003_G_A": (-3.5, 0.0),
+    "4_4000004_T_C": (3.2, -0.5),
+    "5_5000005_A_T": (-5.0, 1.0),
+}
+SCENARIO_PURE_VARIANCE_VARIANTS: dict[str, dict[int, float]] = {
+    "7_7000001_A_G": {0: 3.0, 1: 12.0},
+    "7_7000002_C_T": {0: 12.0, 1: 3.0},
+}
+
+# ============================================================
+# Definizione scenari: ogni dict e' passato a
+# gen_fake_data.generate_dataset(out_dir=..., causal_variants=SCENARIO_CAUSAL_VARIANTS,
+# pure_variance_variants=SCENARIO_PURE_VARIANCE_VARIANTS, **params).
+# Tutti i parametri non specificati restano ai default del generatore.
+# Aggiungine/modificane pure altri qui (NON mettere "causal_variants" o
+# "pure_variance_variants" dentro questi dict: sono gia' fissati sopra e
+# passati esplicitamente in run_scenario(), per evitare l'errore
+# "got multiple values for keyword argument").
 # ============================================================
 SCENARIOS: dict[str, dict] = {
     "baseline": {},
@@ -439,7 +489,18 @@ def run_scenario(name: str, gen_params: dict, n_workers: int = 1) -> dict:
 
     try:
         from gen_fake_data import generate_dataset
-        gen_summary = generate_dataset(out_dir=fake_dir, verbose=True, **gen_params)
+        # Set FISSO e piccolo (vedi spiegazione in cima al file): NON i
+        # default grandi di gen_fake_data.py, per non contaminare il
+        # rumore effettivo che ogni test vede rispetto al noise_sd
+        # dichiarato -- qui vogliamo isolare l'effetto del PARAMETRO di
+        # scenario (stratificazione, missingness, ecc.), non mischiarlo
+        # con l'effetto di avere decine di varianti causali attive insieme.
+        gen_summary = generate_dataset(
+            out_dir=fake_dir, verbose=True,
+            causal_variants=SCENARIO_CAUSAL_VARIANTS,
+            pure_variance_variants=SCENARIO_PURE_VARIANCE_VARIANTS,
+            **gen_params,
+        )
         result["gen_summary"] = gen_summary
 
         vqtl_n_jobs = max(1, (os.cpu_count() or 2) // max(1, n_workers))
@@ -521,11 +582,14 @@ def main() -> None:
         vqtl_a = r.get("vqtl_asymptotic", {}) or {}
         vqtl_d = r.get("vqtl_debug", {}) or {}
         ge = r.get("ge_interaction", {}) or {}
+        ge_recap = ge.get("recap", {}) or {}
+        ge_power = (ge_recap.get("gxe_interaction", {}) or {}).get("power_overall")
         rows.append({
             "scenario": r["scenario"],
             "status": r["status"],
             "error": r.get("error"),
             "ge_n_significant": ge.get("n_significant_p_emp_lt_05"),
+            "ge_power_overall": ge_power,
             "vqtl_lambda_gc": vqtl_a.get("lambda_gc"),
             "vqtl_causal_found": vqtl_a.get("n_found_causal"),
             "vqtl_causal_total": vqtl_a.get("n_causal_total"),
