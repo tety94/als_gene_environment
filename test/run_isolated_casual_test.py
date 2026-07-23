@@ -74,6 +74,26 @@ WHAT IT TESTS, PER VARIANT
                               config): expect NOT significant; if significant
                               it's a crosstalk / specificity failure
 
+CACHING / RESUME BEHAVIOUR
+---------------------------
+Each variant's outcome is persisted to isolated/<variant>/isolated_summary.json
+as soon as it is computed. Before (re-)computing a variant, the script checks
+for this file: if it exists and has status "ok", the variant is SKIPPED
+entirely (no dataset regeneration, no re-running of either test) and the
+saved result is reused as-is. Use --force to ignore this cache and recompute
+everything. A variant whose previous run FAILED is always retried regardless
+of --force, since a failed run has nothing useful to reuse.
+
+Because individual variants can be skipped (cached) across runs, the final
+combined outputs (isolated_power_curve.csv/.json, plots, Word report) are
+NOT simply built from whatever this particular process run happened to
+compute in memory. Instead, once all variants in the current plan have been
+processed (freshly computed or reused from cache), the script re-reads every
+isolated/<variant>/isolated_summary.json from disk to assemble the combined
+table. This guarantees the combined recap always reflects exactly what is
+saved on disk -- including results from earlier runs/processes -- rather than
+only what happened to be computed in this particular invocation.
+
 OUTPUT: isolated/<variant_label>/... (data + raw results) and a single combined
 recap isolated/isolated_power_curve.csv + .json with, for every variant: both
 mechanisms' declared parameters, recovery flags, p-values, plus
@@ -187,6 +207,10 @@ def build_variant_plan() -> list[dict]:
 # skip re-running it -- useful to resume after an error/interruption without
 # redoing every variant. Bypassable with --force.
 # ============================================================
+
+def _summary_path(label: str) -> str:
+    return os.path.join(ISOLATED_ROOT, label, "isolated_summary.json")
+
 
 def _load_cached_result(var_dir: str, force: bool = False) -> dict | None:
     if force:
@@ -304,6 +328,46 @@ def run_isolated_variant(plan_entry: dict, n_workers: int = 1, force: bool = Fal
 
 def _worker(plan_entry: dict, n_workers: int, force: bool) -> dict:
     return run_isolated_variant(plan_entry, n_workers=n_workers, force=force)
+
+
+# ============================================================
+# Final aggregation, ALWAYS read back from disk.
+#
+# Individual variants may have been skipped this run (cache hit) or computed
+# by a different process (--workers) or in a previous invocation of the
+# script entirely. Rather than trusting the in-memory list accumulated
+# during this particular run, we re-read every isolated_summary.json from
+# disk for the variants in the current plan. This is the single source of
+# truth for the combined recap (isolated_power_curve.csv/.json + report),
+# and makes the combined output correct even if:
+#   - some variants were skipped via cache in this run,
+#   - the process crashed/was interrupted partway through a previous run,
+#   - variants were computed across multiple separate invocations.
+# ============================================================
+
+def collect_results_from_disk(plan: list[dict]) -> pd.DataFrame:
+    rows = []
+    missing = []
+    for entry in plan:
+        label = entry["variant"]
+        summary_path = _summary_path(label)
+        if not os.path.isfile(summary_path):
+            missing.append(label)
+            continue
+        try:
+            with open(summary_path) as f:
+                rows.append(json.load(f))
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[warn] could not read {summary_path}: {exc}")
+            missing.append(label)
+
+    if missing:
+        print(
+            f"\n[warn] {len(missing)} variant(s) have no readable isolated_summary.json on disk "
+            f"and are excluded from the combined recap: {missing}"
+        )
+
+    return pd.DataFrame(rows)
 
 
 # ============================================================
@@ -481,7 +545,8 @@ def generate_word_report(df: pd.DataFrame, plot_paths: dict) -> str:
         "otherwise-null panel, on BOTH the G×E and the vQTL mechanism simultaneously "
         "(using a null/flat configuration on whichever mechanism it was not designed for). "
         "This gives, for every variant, both a power estimate on its designed mechanism "
-        "and a specificity check on the other mechanism."
+        "and a specificity check on the other mechanism. Combined results below are "
+        "assembled directly from the per-variant result files saved on disk."
     )
 
     doc.add_heading("Summary", level=1)
@@ -587,11 +652,10 @@ def main() -> None:
     print(f"{len(plan)} unique variants to test (union of both default pools), both mechanisms each.")
 
     t0 = time.time()
-    all_results = []
 
     if n_workers == 1:
         for entry in plan:
-            all_results.append(run_isolated_variant(entry, n_workers=1, force=force))
+            run_isolated_variant(entry, n_workers=1, force=force)
     else:
         print(f"Running {len(plan)} isolated variants with {n_workers} parallel processes...")
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
@@ -599,20 +663,29 @@ def main() -> None:
             for fut in as_completed(futures):
                 label = futures[fut]
                 try:
-                    all_results.append(fut.result())
+                    res = fut.result()
+                    status = res.get("status", "?")
                 except Exception as exc:
-                    all_results.append({"variant": label, "status": "FAILED", "error": f"{type(exc).__name__}: {exc}"})
+                    status = "FAILED"
                     print(f"\n*** VARIANT '{label}' FAILED in worker process: {exc} ***")
-                print(f"[{label}] done ({all_results[-1]['status']}).")
+                print(f"[{label}] done ({status}).")
 
-    section("COMBINED RESULTS")
-    df = pd.DataFrame(all_results)
+    section("COMBINED RESULTS (assembled from disk)")
+    # Always rebuild the combined table from the per-variant isolated_summary.json
+    # files on disk, rather than from whatever this run's execution happened to
+    # accumulate in memory. This is what makes the combined recap correct even
+    # when some variants were skipped this run (cache hit) or computed in a
+    # separate process/invocation.
+    df = collect_results_from_disk(plan)
+    if df.empty:
+        print("No results found on disk -- nothing to report.")
+        sys.exit(1)
     print(df.to_string(index=False))
 
     summary_csv = os.path.join(ISOLATED_ROOT, "isolated_power_curve.csv")
     df.to_csv(summary_csv, index=False)
     with open(os.path.join(ISOLATED_ROOT, "isolated_power_curve.json"), "w") as f:
-        json.dump(all_results, f, indent=2, default=str)
+        json.dump(df.to_dict(orient="records"), f, indent=2, default=str)
     print(f"\n[export] {summary_csv}")
 
     section("REPORT — plots and Word")
@@ -636,7 +709,7 @@ def main() -> None:
     if fp_ge:
         print(f"*** SPURIOUS GxE SIGNIFICANCE (fpr_control or crosstalk): {fp_ge} ***")
     if missed_power_vqtl:
-        print(f"*** CAUSAL VARIANTS NOT RECOVERED (vQTL power, isolated): {missed_power_vqtl} ***")
+        print(f"\n*** CAUSAL VARIANTS NOT RECOVERED (vQTL power, isolated): {missed_power_vqtl} ***")
     if fp_vqtl:
         print(f"*** SPURIOUS vQTL SIGNIFICANCE (crosstalk): {fp_vqtl} ***")
     if failed:
