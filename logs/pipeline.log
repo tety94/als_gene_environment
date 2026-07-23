@@ -1,1 +1,29 @@
 2026-07-09 20:34:49 [INFO] [pid=654] gene_environment.utils.stats_utils: Volcano plot salvato in /tmp/test_volcano.png
+2026-07-22 22:20:36 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: Carico file genetica da C:/Users/Stefano/Downloads/gen.parquet (formato=parquet)
+2026-07-22 22:20:36 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: Carico file genetica da C:/Users/Stefano/Downloads/gen.parquet (formato=parquet)
+2026-07-22 22:25:45 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: Colonne varianti individuate: 1302488
+2026-07-22 22:25:49 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: Carico file ambientale da C:/Users/Stefano/Downloads/componenti_ambientali_full.csv
+2026-07-22 22:25:49 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: sex codificata con {'M': 1, 'F': 0}
+2026-07-22 22:25:49 [WARNING] [pid=25228] gene_environment.vcf_pipeline.build_dataset: Nessuna mappa id->generazione trovata (/mnt/cresla_prod/genome_datasets/merged_csv\sample_generation_map.csv) e nessuna ENV_GENERATION_COL configurata: uso TUTTE le righe senza filtro per generazione.
+2026-07-22 22:25:49 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: Standardizzazione dell'esposizione 'risaie_1500' (standardize=True)
+2026-07-22 22:25:49 [INFO] [pid=25228] gene_environment.utils.pca_utils: PCA: caricate 10 PC per 437 campioni da C:/Users/Stefano/Downloads/gen2/pca_covariates.csv (generazione=2)
+2026-07-22 22:25:49 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: PCA: 208/1506 id del blocco covariate trovano corrispondenza in IID.
+2026-07-22 22:25:49 [WARNING] [pid=25228] gene_environment.vcf_pipeline.build_dataset: PCA: 1298/1506 campioni (86.2%) senza corrispondenza dopo il merge (blocco stretto).
+2026-07-22 22:25:49 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: sex: nessun valore mancante su 1506 campioni.
+2026-07-22 22:25:49 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: Covariate di correzione usate nel modello: ['PC1', 'PC2', 'PC3', 'PC4', 'PC5', 'PC6', 'PC7', 'PC8', 'PC9', 'PC10', 'sex']
+2026-07-22 22:25:49 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: Merge finale (unico touch del dataframe genetico largo) su 'id'
+2026-07-22 22:25:53 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: Righe covariate=1506, genetica=1781, dopo merge finale (inner)=1392
+2026-07-22 22:25:53 [INFO] [pid=25228] gene_environment.vcf_pipeline.build_dataset: Id unici post-merge: 1392 (righe totali: 1392)
+2026-07-22 22:27:42 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: Colonne varianti individuate: 1302488
+2026-07-22 22:27:50 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: Carico file ambientale da C:/Users/Stefano/Downloads/componenti_ambientali_full.csv
+2026-07-22 22:27:50 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: sex codificata con {'M': 1, 'F': 0}
+2026-07-22 22:27:50 [WARNING] [pid=3644] gene_environment.vcf_pipeline.build_dataset: Nessuna mappa id->generazione trovata (/mnt/cresla_prod/genome_datasets/merged_csv\sample_generation_map.csv) e nessuna ENV_GENERATION_COL configurata: uso TUTTE le righe senza filtro per generazione.
+2026-07-22 22:27:50 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: Standardizzazione dell'esposizione 'risaie_1500' (standardize=True)
+2026-07-22 22:27:51 [INFO] [pid=3644] gene_environment.utils.pca_utils: PCA: caricate 10 PC per 437 campioni da C:/Users/Stefano/Downloads/gen2/pca_covariates.csv (generazione=2)
+2026-07-22 22:27:51 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: PCA: 208/1506 id del blocco covariate trovano corrispondenza in IID.
+2026-07-22 22:27:51 [WARNING] [pid=3644] gene_environment.vcf_pipeline.build_dataset: PCA: 1298/1506 campioni (86.2%) senza corrispondenza dopo il merge (blocco stretto).
+2026-07-22 22:27:51 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: sex: nessun valore mancante su 1506 campioni.
+2026-07-22 22:27:51 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: Covariate di correzione usate nel modello: ['PC1', 'PC2', 'PC3', 'PC4', 'PC5', 'PC6', 'PC7', 'PC8', 'PC9', 'PC10', 'sex']
+2026-07-22 22:27:51 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: Merge finale (unico touch del dataframe genetico largo) su 'id'
+2026-07-22 22:27:57 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: Righe covariate=1506, genetica=1781, dopo merge finale (inner)=1392
+2026-07-22 22:27:57 [INFO] [pid=3644] gene_environment.vcf_pipeline.build_dataset: Id unici post-merge: 1392 (righe totali: 1392)

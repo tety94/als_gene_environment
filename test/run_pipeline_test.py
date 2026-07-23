@@ -33,6 +33,7 @@ COME LANCIARLO (gira da TE, non da questa chat):
   4. python run_pipeline_test.py
 """
 from __future__ import annotations
+from report_utils  import generate_recap
 
 import os
 import sys
@@ -112,3 +113,12 @@ out_path = os.path.join(FAKE_DATA_DIR, "pipeline_results.csv")
 res_df.to_csv(out_path, index=False)
 print(f"Salvato in {out_path}")
 print(res_df[["variant", "n_treated", "n_control", "obs_coef", "p_emp", "iterations", "max_smd"]].to_string())
+
+
+recap_summary = generate_recap(
+    ground_truth_path=os.path.join(FAKE_DATA_DIR, "ground_truth.csv"),
+    pipeline_results_path=out_path,          # e' gia' fake_data/pipeline_results.csv
+    out_dir=os.path.join(FAKE_DATA_DIR, "recap"),
+)
+print(f"Potenza G×E complessiva: {recap_summary['gxe_interaction']['power_overall']*100:.1f}%")
+print(f"Falsi positivi (nulle): {recap_summary['null_genomewide']['false_positive_rate']*100:.2f}%")
