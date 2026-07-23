@@ -72,6 +72,9 @@ NUMERIC_VARS = [
     "seminativi_1500",
     "vigneti_1500",
     "risaie_1500",
+    "seminativi_1000",
+    "vigneti_1000",
+    "risaie_1000",
 ]
 
 VAR_LABELS = {
@@ -83,6 +86,9 @@ VAR_LABELS = {
     "seminativi_1500": "Arable land within 1500 m (%)",
     "vigneti_1500": "Vineyards within 1500 m (%)",
     "risaie_1500": "Rice fields within 1500 m (%)",
+    "seminativi_1000": "Arable land within 1000 m (%)",
+    "vigneti_1000": "Vineyards within 1000 m (%)",
+    "risaie_1000": "Rice fields within 1000 m (%)",
 }
 
 ALPHA = 0.05
