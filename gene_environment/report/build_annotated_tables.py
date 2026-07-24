@@ -51,6 +51,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # --------------------------------------------------------------------------
 # Exposure name mapping (Italian land-use category -> English)
 # --------------------------------------------------------------------------
+OUT_DIR = Path("output/annotated_tables")
 
 EXPOSURE_LABELS = {
     "seminativi_1500": "Arable land 1500mt",
@@ -271,7 +272,7 @@ def main() -> None:
              "dump instead (must have the same columns as get_annotated_results()).",
     )
     parser.add_argument(
-        "--outdir", type=Path, default=Path("."),
+        "--outdir", type=Path, default=OUT_DIR,
         help="Directory to write the .docx files into (default: current directory).",
     )
     args = parser.parse_args()
@@ -306,7 +307,6 @@ def main() -> None:
     zero.to_csv(zero_csv_path, index=False)
     log.info("Wrote %s (%d rows) and %s (%d rows)", pos_csv_path, len(pos), zero_csv_path, len(zero))
 
-    # opzionale: file con le righe escluse (NULL score)
     if not null_score.empty:
         null_csv_path = args.outdir / "supplementary_tables_score_null.csv"
         null_score.to_csv(null_csv_path, index=False)
