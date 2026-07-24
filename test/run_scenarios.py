@@ -383,7 +383,7 @@ def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
     wanted_labels = set(causal) | set(nulls_sample)
     print(f"Sottoinsieme: {len(causal)} causali + {len(nulls_sample)} nulle = {len(wanted_labels)} varianti")
 
-    ds = load_vqtl_dataset(ge_cfg, VqtlConfig(ge=ge_cfg), generation=GENERATION)
+    ds = load_vqtl_dataset(ge_cfg, VqtlConfig(ge=ge_cfg, exposures=["exposure_env"]), generation=GENERATION)
     ds.df = prepare_phenotype(ds.df, ge_cfg.target_col)
 
     inv_mapping = {v: k for k, v in ds.mapping.items()}
