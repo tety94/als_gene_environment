@@ -392,3 +392,27 @@ def load_raw_significant_results() -> pd.DataFrame:
     except Exception as exc:
         log.exception("Errore nel recupero dei risultati significativi dalla stored procedure.")
         raise
+
+
+def get_annotated_results() -> pd.DataFrame:
+    """
+    Calls the `get_annotated_results` stored procedure and returns a
+    DataFrame combining:
+        vrs1.exposure, vrs1.gene_name, vrs1.variant
+    with every column from `gene_neuro_annotation` (gna.*).
+
+    Unlike `get_significant_results`, this result set has no duplicated
+    column names, so a dictionary cursor is used directly (no need for the
+    positional-cursor workaround).
+    """
+    with get_connection() as conn:
+        with cursor_scope(conn, dictionary=True) as cur:
+            cur.callproc("get_annotated_results")
+            rows = []
+            for result in cur.stored_results():
+                rows.extend(result.fetchall())
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        log.warning("get_annotated_results(): the stored procedure returned no rows.")
+    return df
