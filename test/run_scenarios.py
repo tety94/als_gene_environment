@@ -383,7 +383,7 @@ def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
     wanted_labels = set(causal) | set(nulls_sample)
     print(f"Sottoinsieme: {len(causal)} causali + {len(nulls_sample)} nulle = {len(wanted_labels)} varianti")
 
-    ds = load_vqtl_dataset(ge_cfg, VqtlConfig(), generation=GENERATION)
+    ds = load_vqtl_dataset(ge_cfg, VqtlConfig(ge=ge_cfg), generation=GENERATION)
     ds.df = prepare_phenotype(ds.df, ge_cfg.target_col)
 
     inv_mapping = {v: k for k, v in ds.mapping.items()}
@@ -397,7 +397,7 @@ def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
     for method in ["asymptotic", "bootstrap"]:
         fake_repo.reset_all()
         reset_convergence_stats()
-        vcfg = VqtlConfig(se_method=method, n_jobs=1)
+        vcfg = VqtlConfig(ge=ge_cfg, se_method=method, n_jobs=1)
         print(f"\n--- se_method={method} (n_jobs=1 per contatori affidabili) ---")
         t0 = time.time()
         df = run_vqtl_scan(ds, vcfg, ge_cfg.target_col, generation=GENERATION, variant_subset=variant_subset)
