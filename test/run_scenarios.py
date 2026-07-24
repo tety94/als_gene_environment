@@ -478,6 +478,9 @@ def run_vqtl_asymptotic(fake_dir: str, work_dir: str) -> dict:
     }, context="vqtl-asymptotic")
     configure_logging(ge_cfg.log_dir)
     vcfg_base = get_vqtl_config()
+    vcfg_base = _force_cfg_overrides(vcfg_base, {
+        "exposures": ["exposure_env"],
+    }, context="vqtl-asymptotic-vcfg")
 
     truth = pd.read_csv(os.path.join(fake_dir, "ground_truth.csv"))
     causal_gxe = set(truth.loc[truth["effect_type"] == "gxe_meanshift", "variant"])
