@@ -23,9 +23,9 @@ are counted and logged, not silently dropped.
 
 Usage
 -----
-    python build_annotated_tables.py
-    python build_annotated_tables.py --outdir ./tables
-    python build_annotated_tables.py --input-csv results.csv   # bypass the DB call
+    python3 -m gene_environment.report.build_annotated_tables
+    python3 -m gene_environment.report.build_annotated_tables --outdir ./tables
+    python3 -m gene_environment.report.build_annotated_tables --input-csv results.csv   # bypass the DB call
 
 Requires: python-docx, pandas
     pip install python-docx pandas
@@ -53,9 +53,12 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # --------------------------------------------------------------------------
 
 EXPOSURE_LABELS = {
-    "seminativi": "Arable land",
-    "vigneti": "Vineyards",
-    "risaie": "Rice fields",
+    "seminativi_1500": "Arable land 1500mt",
+    "vigneti_1500": "Vineyards 1500mt",
+    "risaie_1500": "Rice fields 1500mt",
+    "seminativi_1000": "Arable land 1000mt",
+    "vigneti_1000": "Vineyards 1000mt",
+    "risaie_1000": "Rice fields 1000mt",
 }
 
 
@@ -288,6 +291,27 @@ def main() -> None:
         raise RuntimeError("Expected column 'neuro_plausibility_score' not found in the results.")
 
     df = translate_exposure(df)
+
+    pos = df[df["neuro_plausibility_score"] > 0].reset_index(drop=True)
+    zero = df[df["neuro_plausibility_score"] == 0].reset_index(drop=True)
+    null_score = df[df["neuro_plausibility_score"].isna()]
+
+    full_csv_path = args.outdir / "supplementary_tables_full.csv"
+    df[FULL_COLUMNS].to_csv(full_csv_path, index=False)
+    log.info("Wrote %s", full_csv_path)
+
+    pos_csv_path = args.outdir / "supplementary_tables_score_gt0.csv"
+    zero_csv_path = args.outdir / "supplementary_tables_score_eq0.csv"
+    pos.to_csv(pos_csv_path, index=False)
+    zero.to_csv(zero_csv_path, index=False)
+    log.info("Wrote %s (%d rows) and %s (%d rows)", pos_csv_path, len(pos), zero_csv_path, len(zero))
+
+    # opzionale: file con le righe escluse (NULL score)
+    if not null_score.empty:
+        null_csv_path = args.outdir / "supplementary_tables_score_null.csv"
+        null_score.to_csv(null_csv_path, index=False)
+        log.warning("%d rows have a NULL neuro_plausibility_score and were excluded; wrote %s", len(null_score), null_csv_path)
+
 
     build_document(
         df, FULL_COLUMNS,
