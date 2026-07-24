@@ -681,7 +681,14 @@ def main() -> None:
     parser.add_argument("scenarios", nargs="*", help="Nomi scenari da lanciare (default: tutti)")
     parser.add_argument("--workers", type=int, default=1,
                          help="Numero di scenari da eseguire in parallelo (processi separati). Default 1 (sequenziale).")
+    parser.add_argument("--output-dir", default=None,
+                         help="Cartella dove scrivere scenarios/ (default: la cartella di questo script).")
     args = parser.parse_args()
+
+    if args.output_dir:
+        global SCENARIOS_ROOT
+        SCENARIOS_ROOT = os.path.join(os.path.abspath(args.output_dir), "scenarios")
+        print(f"[config] Output: {SCENARIOS_ROOT}")
 
     result = run_all_scenarios(names=args.scenarios or None, n_workers=args.workers)
     if result["has_failures"]:

@@ -101,7 +101,7 @@ HOW TO RUN IT (run from YOU, not from this chat, same folder as
 run_scenarios.py, gen_fake_data.py, fake_vqtl_repository.py, report_utils.py
 and test_vqtl_pipeline.py):
     python run_isolated_casual_test.py                     # all 3 phases
-    python run_isolated_casual_test.py --workers 4          # parallel within each phase
+    python run_isolated_casual_test.py --workers 4 --output-dir         # parallel within each phase
     python run_isolated_casual_test.py --force              # ignore isolated_summary.json cache
     python run_isolated_casual_test.py --skip-scenarios     # phases 1 + 3 only
     python run_isolated_casual_test.py --skip-isolated --skip-pure-null   # phase 2 only
@@ -1160,7 +1160,20 @@ def main() -> None:
     parser.add_argument("--pure-null-near-edge-margin", type=float, default=0.02,
                          help="Phase 3: if the nominal 5%% is INSIDE the CI but closer than this to its "
                               "edge, run the P_boot comparison anyway, out of caution (default 0.02).")
+    parser.add_argument("--output-dir", default=None,
+                         help="Cartella dove scrivere isolated/ e scenarios/ (default: la cartella di "
+                              "questo script). Vale per tutte e 3 le fasi.")
     args = parser.parse_args()
+
+    if args.output_dir:
+        global ISOLATED_ROOT, PLOTS_DIR
+        output_root = os.path.abspath(args.output_dir)
+        os.makedirs(output_root, exist_ok=True)
+        ISOLATED_ROOT = os.path.join(output_root, "isolated")
+        PLOTS_DIR = os.path.join(ISOLATED_ROOT, "plots")
+        rs.SCENARIOS_ROOT = os.path.join(output_root, "scenarios")
+        print(f"[config] Output root: {output_root} "
+              f"(isolated: {ISOLATED_ROOT} | scenarios: {rs.SCENARIOS_ROOT})")
 
     n_workers = max(1, args.workers)
     t0 = time.time()
