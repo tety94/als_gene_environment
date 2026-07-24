@@ -39,17 +39,41 @@ from pathlib import Path
 
 import pandas as pd
 from docx import Document
+from docx.enum.section import WD_ORIENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.shared import Inches
 
 log = logging.getLogger("build_annotated_tables")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # --------------------------------------------------------------------------
+# Exposure name mapping (Italian land-use category -> English)
+# --------------------------------------------------------------------------
+
+EXPOSURE_LABELS = {
+    "seminativi": "Arable land",
+    "vigneti": "Vineyards",
+    "risaie": "Rice fields",
+}
+
+
+def translate_exposure(df: pd.DataFrame) -> pd.DataFrame:
+    """Map the `exposure` column from Italian land-use terms to English.
+    Values not found in EXPOSURE_LABELS are left unchanged, with a warning
+    so unmapped categories don't silently slip into the paper."""
+    df = df.copy()
+    unmapped = sorted(set(df["exposure"].dropna()) - set(EXPOSURE_LABELS))
+    if unmapped:
+        log.warning("Exposure values with no English mapping (left as-is): %s", unmapped)
+    df["exposure"] = df["exposure"].map(lambda v: EXPOSURE_LABELS.get(v, v))
+    return df
+
+
+# --------------------------------------------------------------------------
 # Column sets
 # --------------------------------------------------------------------------
-OUT_DIR = Path("output/table_annotated")
 
 FULL_COLUMNS = [
     "exposure",
@@ -162,6 +186,18 @@ def shade_cell(cell, fill: str = "D9D9D9") -> None:
 # Table building
 # --------------------------------------------------------------------------
 
+def set_landscape(doc: Document, margin: float = 0.5) -> None:
+    """Switch the document's section to landscape and use narrower margins
+    (in inches) so wide tables have more room."""
+    section = doc.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width, section.page_height = section.page_height, section.page_width
+    section.left_margin = Inches(margin)
+    section.right_margin = Inches(margin)
+    section.top_margin = Inches(margin)
+    section.bottom_margin = Inches(margin)
+
+
 def add_table(doc: Document, title: str, df: pd.DataFrame, columns: list[str]) -> None:
     doc.add_heading(title, level=2)
 
@@ -191,7 +227,9 @@ def add_table(doc: Document, title: str, df: pd.DataFrame, columns: list[str]) -
     doc.add_paragraph()  # spacing after the table
 
 
-def build_document(df: pd.DataFrame, columns: list[str], out_path: Path, doc_title: str) -> None:
+def build_document(
+    df: pd.DataFrame, columns: list[str], out_path: Path, doc_title: str, landscape: bool = False
+) -> None:
     pos = df[df["neuro_plausibility_score"] > 0].reset_index(drop=True)
     zero = df[df["neuro_plausibility_score"] == 0].reset_index(drop=True)
     null_score = df[df["neuro_plausibility_score"].isna()]
@@ -204,6 +242,8 @@ def build_document(df: pd.DataFrame, columns: list[str], out_path: Path, doc_tit
         )
 
     doc = Document()
+    if landscape:
+        set_landscape(doc)
     doc.add_heading(doc_title, level=1)
 
     add_table(doc, "Genes with neuro plausibility score > 0", pos, columns)
@@ -228,7 +268,7 @@ def main() -> None:
              "dump instead (must have the same columns as get_annotated_results()).",
     )
     parser.add_argument(
-        "--outdir", type=Path, default=OUT_DIR,
+        "--outdir", type=Path, default=Path("."),
         help="Directory to write the .docx files into (default: current directory).",
     )
     args = parser.parse_args()
@@ -247,10 +287,13 @@ def main() -> None:
     if "neuro_plausibility_score" not in df.columns:
         raise RuntimeError("Expected column 'neuro_plausibility_score' not found in the results.")
 
+    df = translate_exposure(df)
+
     build_document(
         df, FULL_COLUMNS,
         args.outdir / "supplementary_tables.docx",
         "Supplementary Tables \u2014 Full Gene Neuro-Annotation",
+        landscape=True,
     )
     build_document(
         df, SUBSET_COLUMNS,
