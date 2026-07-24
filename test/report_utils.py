@@ -1,30 +1,34 @@
 """
-Utility di export (CSV + Word) e di verifica automatica (assert-based)
-per test_vqtl_pipeline.py. Vedi in fondo l'uso previsto.
+Utility condivise di export (CSV + Word) e di verifica automatica
+(assert-based) usate da test_vqtl_pipeline.py (report per singolo
+se_method) e da run_scenarios.py (recap per singolo scenario + report
+aggregato su tutti gli scenari).
+
+Contenuto, in ordine:
+  1) export_csv                                  -- export CSV generico
+  2) CheckResult / CheckSuite / run_checks        -- controlli PASS/WARN/FAIL
+     sull'esito della pipeline vQTL (usati da test_vqtl_pipeline.py)
+  3) export_docx                                  -- report Word per singolo
+     se_method della pipeline vQTL (Step 3-7)
+  4) build_recap / generate_recap                 -- incrocio ground_truth
+     vs pipeline_results.csv (parte gene-ambiente) -> summary + detail + docx
+  5) generate_multi_scenario_recap                -- aggregazione dei recap
+     di piu' scenari in un unico report Word
 """
 from __future__ import annotations
 
-import os
 import json
+import os
 from dataclasses import dataclass, field
-
-import pandas as pd
-from docx import Document
-from docx.shared import Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-
-import json
-import os
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
-
 from docx import Document
-from docx.shared import Pt, Cm
+from docx.shared import Cm, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 CAUSAL_TYPES = {"gxe_meanshift", "pure_variance"}
 
@@ -146,7 +150,6 @@ def run_checks(
     if gxe_rows.empty:
         suite.skip("G×E: interazione significativa e segno coerente", "nessuna variante G×E fra i candidati in questo run")
     else:
-        import numpy as np
         sign_ok = (
             (gxe_rows["pval"] < alpha)
             & (pd_sign(gxe_rows["beta_I"]) == pd_sign(gxe_rows["true_beta_interaction"]))
@@ -202,7 +205,6 @@ def run_checks(
 
 
 def pd_sign(series: pd.Series) -> pd.Series:
-    import numpy as np
     return series.apply(np.sign)
 
 
@@ -219,7 +221,7 @@ def _set_cell_shading(cell, hex_color: str) -> None:
     tcPr.append(shd)
 
 
-def _add_table(doc: Document, df: pd.DataFrame, highlight_col: str | None = "effect_type") -> None:
+def _add_df_table(doc: Document, df: pd.DataFrame, highlight_col: str | None = "effect_type") -> None:
     if df.empty:
         doc.add_paragraph("(nessun dato)").italic = True
         return
@@ -288,7 +290,7 @@ def export_docx(
     check_df = pd.DataFrame(check_suite.to_list())
     if not check_df.empty:
         check_df = check_df.rename(columns={"name": "controllo", "level": "esito", "detail": "dettaglio"})
-        _add_table(doc, check_df, highlight_col=None)
+        _add_df_table(doc, check_df, highlight_col=None)
 
     # ---- Tabelle per step ----
     for title_text, note_text, df in tables:
@@ -297,7 +299,7 @@ def export_docx(
             note_p = doc.add_paragraph(note_text)
             note_p.runs[0].italic = True
             note_p.runs[0].font.size = Pt(9)
-        _add_table(doc, df)
+        _add_df_table(doc, df)
         doc.add_paragraph("")
 
     doc.save(out_path)
@@ -305,25 +307,20 @@ def export_docx(
     return out_path
 
 
-
-"""
-Recap automatico dei risultati del test G×E: incrocia ground_truth.csv
-(verita' nota, da gen_fake_data.py) con l'output REALE della pipeline
-(pipeline_results.csv, da modeling.process_single_variant) e produce
-sempre 3 file nella cartella indicata:
-
-  - recap_summary.json  -> numeri aggregati (potenza per segno/magnitudine,
-                            falsi positivi sulle nulle, ecc.)
-  - recap_detail.csv    -> una riga per variante, con esito (TP/FN/FP/TN)
-  - recap_report.docx   -> stesso contenuto in tabelle Word, leggibile
-                            senza aprire CSV/JSON
-
-Pensato per essere chiamato IN AUTOMATICO alla fine di run_pipeline_test.py
-e di ogni scenario in run_scenarios.py -- non serve lanciarlo a mano.
-
-Dipendenza aggiuntiva: python-docx (pip install python-docx).
-"""
-
+# ============================================================
+# Recap gene-ambiente: incrocia ground_truth.csv (verita' nota, da
+# gen_fake_data.py) con l'output REALE della pipeline (pipeline_results.csv,
+# da modeling.process_single_variant) e produce sempre 3 file nella cartella
+# indicata:
+#   - recap_summary.json  -> numeri aggregati (potenza per segno/magnitudine,
+#                             falsi positivi sulle nulle, ecc.)
+#   - recap_detail.csv    -> una riga per variante, con esito (TP/FN/FP/TN)
+#   - recap_report.docx   -> stesso contenuto in tabelle Word, leggibile
+#                             senza aprire CSV/JSON
+# Chiamato in automatico alla fine di ogni scenario/variante isolata dagli
+# script di orchestrazione (run_scenarios.py, run_isolated_casual_test.py)
+# -- non serve lanciarlo a mano. Richiede python-docx.
+# ============================================================
 
 MAGNITUDE_BINS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, np.inf]
 MAGNITUDE_LABELS = ["0-1", "1-2", "2-3", "3-4", "4-5", "5-6", "6-7", "7-8", "8-9", "9+"]
@@ -554,23 +551,6 @@ def write_docx(summary: dict, detail: pd.DataFrame, path: str, title: str = "Rep
 # ============================================================
 # 4) Funzione "tutto in uno", da chiamare a fine pipeline
 # ============================================================
-
-def generate_recap(ground_truth_path: str, pipeline_results_path: str, out_dir: str,
-                    pvalue_threshold: float = 0.05) -> dict:
-    """Legge i due CSV, scrive recap_summary.json / recap_detail.csv / recap_report.docx
-    in out_dir, e ritorna il dict di summary (utile per loggarlo o per il
-    report riassuntivo multi-scenario in run_scenarios.py)."""
-    os.makedirs(out_dir, exist_ok=True)
-    gt = pd.read_csv(ground_truth_path)
-    pr = pd.read_csv(pipeline_results_path)
-    detail, summary = build_recap(gt, pr, pvalue_threshold=pvalue_threshold)
-
-    write_json(summary, os.path.join(out_dir, "recap_summary.json"))
-    write_csv(detail, os.path.join(out_dir, "recap_detail.csv"))
-    write_docx(summary, detail, os.path.join(out_dir, "recap_report.docx"))
-
-    return summary
-
 
 def generate_recap(ground_truth_path: str, pipeline_results_path: str, out_dir: str,
                     pvalue_threshold: float = 0.05) -> dict:

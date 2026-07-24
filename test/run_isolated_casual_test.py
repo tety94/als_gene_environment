@@ -5,110 +5,112 @@ a time against an otherwise-null panel.
 
 WHY BOTH TESTS FOR EVERY VARIANT
 ---------------------------------
-The previous version of this script only ran the G×E pipeline on variants
-from DEFAULT_CAUSAL_VARIANTS and the vQTL pipeline on variants from
-DEFAULT_PURE_VARIANCE_VARIANTS. That answers "does the pipeline recover a
-variant on the mechanism it was designed for", but not "does a variant
-designed for one mechanism spuriously show up on the other" (crosstalk /
-specificity), and not "what is the combined detection rate across both
-mechanisms for the full panel". This version answers both questions.
-
-DESIGN
-------
 For every variant label in the union of DEFAULT_CAUSAL_VARIANTS and
 DEFAULT_PURE_VARIANCE_VARIANTS, we generate ONE dataset in which that single
-variant is simultaneously declared:
-  - causal for G×E, using its real (beta_inter, beta_main) if the label is in
-    DEFAULT_CAUSAL_VARIANTS, otherwise a null (0.0, 0.0) -- i.e. no G×E or
-    main effect at all.
-  - causal for vQTL, using its real sd_by_dosage if the label is in
-    DEFAULT_PURE_VARIANCE_VARIANTS, otherwise a "flat" null sd_by_dosage
-    (same sd at every dosage -> no heteroscedasticity, no true vQTL effect),
-    using the same dosage keys as the rest of the pool.
-All other variants in the panel remain null by construction of
-gen_fake_data.py, so this isolates exactly the contribution of the single
-variant, on both mechanisms simultaneously, in a single dataset (i.e. no
-extra dataset generations vs. before -- one dataset per variant, not one per
-variant per mechanism).
+variant is simultaneously declared causal-for-G×E (real or null beta) and
+causal-for-vQTL (real or flat-null sd_by_dosage). This isolates exactly the
+contribution of the single variant, on both mechanisms simultaneously, in a
+single dataset. Both run_ge_interaction() and run_vqtl_debug() are then run
+on that same dataset, and the label is looked up in both result tables.
 
-Both run_ge_interaction() and run_vqtl_debug() are then run on that same
-dataset, and the label is looked up in both result tables.
+============================================================================
+WHY "G×E-only variant significant on vQTL" IS NOT NECESSARILY A FALSE
+POSITIVE (read before touching PVALUE_THRESHOLD / the zone logic below)
+============================================================================
+gen_fake_data.py builds the phenotype for a causal_variants entry as:
 
-*** ASSUMPTIONS ON gen_fake_data.py (verify -- file not available in this
-chat) ***
-  - DEFAULT_CAUSAL_VARIANTS: dict[str, tuple[float, float]]  (beta_inter, beta_main)
-  - DEFAULT_PURE_VARIANCE_VARIANTS: dict[str, dict[int, float]]  (sd per dosage,
-    dosage keys are presumably {0, 1, 2})
-  - generate_dataset(out_dir=..., causal_variants=..., pure_variance_variants=..., **kw)
-    with "everything else null by default" if not listed in the two dicts above.
-  - run_ge_interaction() returns a results CSV with a "variant" column and a
-    "p_emp" column, and tests every variant in the panel (not just causal
-    ones) -- this is required for the crosstalk check to work, since a
-    variant not marked causal for G×E still needs a p_emp entry.
-  - run_vqtl_debug() reads causal/null SNPs from THIS dataset's ground_truth
-    and compares asymptotic vs bootstrap; because every variant here IS
-    explicitly declared in pure_variance_variants (real or flat-null), it is
-    guaranteed to appear in the comparison table (not left to random null
-    sampling).
-  - The "flat null" sd_by_dosage default below assumes dosage keys {0,1,2}
-    and sd=1.0 at each. If DEFAULT_PURE_VARIANCE_VARIANTS uses different
-    dosage keys or a different natural noise scale, adjust FLAT_NULL_SD and
-    FLAT_NULL_DOSAGES below.
-If any of this doesn't match, adjust the generate_dataset() call and the
-result-table column names -- the rest of the logic doesn't change.
+    onset_age += beta_main * dosage_bin + beta_inter * dosage_bin * exposure_std_approx
 
-WHAT IT TESTS, PER VARIANT
----------------------------
-  ge_role:
-    "power"              -> beta_inter != 0 (designed G×E effect): expect significant
-    "fpr_control"        -> beta_inter == 0 but beta_main != 0 (designed
-                             main-effect-only control): expect NOT significant
-    "crosstalk_check"    -> not in DEFAULT_CAUSAL_VARIANTS at all (a vQTL-only
-                             variant riding along with a null G×E config):
-                             expect NOT significant; if significant it's a
-                             crosstalk / specificity failure
-  vqtl_role:
-    "power"               -> label in DEFAULT_PURE_VARIANCE_VARIANTS: expect significant
-    "crosstalk_check"     -> not in DEFAULT_PURE_VARIANCE_VARIANTS (a G×E-only
-                              variant riding along with a flat/null vQTL
-                              config): expect NOT significant; if significant
-                              it's a crosstalk / specificity failure
+dosage_bin is binary (carrier/non-carrier) and exposure_std_approx is a
+per-subject random variable with variance ~1. This means:
 
-CACHING / RESUME BEHAVIOUR
----------------------------
-Each variant's outcome is persisted to isolated/<variant>/isolated_summary.json
-as soon as it is computed. Before (re-)computing a variant, the script checks
-for this file: if it exists and has status "ok", the variant is SKIPPED
-entirely (no dataset regeneration, no re-running of either test) and the
-saved result is reused as-is. Use --force to ignore this cache and recompute
-everything. A variant whose previous run FAILED is always retried regardless
-of --force, since a failed run has nothing useful to reuse.
+    Var(onset_age | non-carrier) ~= noise_sd^2
+    Var(onset_age | carrier)     ~= noise_sd^2 + beta_inter^2
 
-Because individual variants can be skipped (cached) across runs, the final
-combined outputs (isolated_power_curve.csv/.json, plots, Word report) are
-NOT simply built from whatever this particular process run happened to
-compute in memory. Instead, once all variants in the current plan have been
-processed (freshly computed or reused from cache), the script re-reads every
-isolated/<variant>/isolated_summary.json from disk to assemble the combined
-table. This guarantees the combined recap always reflects exactly what is
-saved on disk -- including results from earlier runs/processes -- rather than
-only what happened to be computed in this particular invocation.
+i.e. a "pure" G×E variant with no declared vQTL effect STILL mechanically
+induces real heteroscedasticity by dosage, proportional to beta_inter^2. The
+vQTL test correctly detects this when beta_inter is large -- that is NOT a
+specificity failure of the vQTL test, it is the vQTL test doing its job on
+a phenotype that genuinely has unequal variance across dosage groups. It IS,
+however, a sign that "is this variant declared as G×E-only" is the wrong
+ground-truth label to test vQTL specificity against.
+
+The predicted variance ratio induced by a given beta_inter is:
+
+    predicted_var_ratio = 1 + (beta_inter / noise_sd)^2
+
+We use this every run to split G×E-only variants into three zones instead
+of a single "expect not significant" bucket:
+  - "pure_null"          : predicted_var_ratio is small -> a real vQTL
+                            specificity test (expect NOT significant).
+  - "confounded_expected": predicted_var_ratio is large enough that a
+                            vQTL hit is the MECHANICALLY EXPECTED outcome,
+                            not an error (expect significant, and if it
+                            IS significant that's counted as a correct
+                            outcome, not a false positive).
+  - "borderline"          : in between -- excluded from the pass/fail
+                            counts entirely (neither zone's expectation is
+                            reliable there), reported separately.
+
+The two thresholds (ratio_low, ratio_high) are NOT hard-coded: they are
+re-fit EVERY RUN from the data itself (logistic regression of
+"significant_vqtl" on log(predicted_var_ratio) over the G×E-only variants),
+because they depend on run-specific parameters (noise_sd, sample size,
+vQTL test power at that n, ...) that can change between runs. See
+fit_vqtl_confound_thresholds().
+
+DESIGN, CACHING, DISK-BASED AGGREGATION: unchanged from the previous version
+of this script -- see individual function docstrings below.
 
 OUTPUT: isolated/<variant_label>/... (data + raw results) and a single combined
-recap isolated/isolated_power_curve.csv + .json with, for every variant: both
-mechanisms' declared parameters, recovery flags, p-values, plus
-isolated/plots/*.png and isolated/isolated_causal_test_report.docx with
-tables and summary plots for the paper (all in English).
+recap isolated/isolated_power_curve.csv + .json (now including
+predicted_var_ratio, vqtl_zone, expected_sig_vqtl, match_vqtl, expected_sig_ge,
+match_ge, as_expected for every variant), plus isolated/plots/*.png and
+isolated/isolated_causal_test_report.docx (all in English).
+
+============================================================================
+SINGLE ENTRY POINT FOR THE WHOLE TEST BATTERY
+============================================================================
+Running this file runs THREE phases in sequence (each one individually
+skippable, see --skip-* below):
+
+  1) isolated   -- everything described above: every variant, both
+                    mechanisms, one at a time. Answers "does the pipeline
+                    recover each variant's effect at the right magnitude,
+                    with the right sign, and no crosstalk between the two
+                    mechanisms?".
+  2) scenarios  -- the small-set robustness battery from run_scenarios.py
+                    (population stratification, missingness, small/high
+                    sample size, zero-inflated exposure, ...). Answers
+                    "does the pipeline still work under conditions other
+                    than the clean default one?". Reuses run_scenarios.py
+                    as-is (run_all_scenarios()), not duplicated here.
+  3) pure_null  -- exact binomial confidence interval on the false-positive
+                    rate observed in the isolated run's "pure_null" vQTL
+                    zone (phase 1's cleanest false-positive check), and --
+                    only if the nominal 5% falls outside (or close to the
+                    edge of) that CI -- a second check using the bootstrap
+                    p-value (P_boot, K=200) already computed for every
+                    variant by run_vqtl_debug, to tell apart "estimation
+                    noise at K=50" from "a real bias in the variance test
+                    itself". Needs phase 1 to have produced
+                    isolated_power_curve.csv at least once (from this run,
+                    or a previous one on disk).
 
 HOW TO RUN IT (run from YOU, not from this chat, same folder as
-run_scenarios.py):
-    python run_isolated_causal_test.py                 # all default variants, sequential
-    python run_isolated_causal_test.py --workers 4      # parallel, separate processes
-    python run_isolated_causal_test.py --force          # ignore cached isolated_summary.json
+run_scenarios.py, gen_fake_data.py, fake_vqtl_repository.py, report_utils.py
+and test_vqtl_pipeline.py):
+    python run_isolated_casual_test.py                     # all 3 phases
+    python run_isolated_casual_test.py --workers 4          # parallel within each phase
+    python run_isolated_casual_test.py --force              # ignore isolated_summary.json cache
+    python run_isolated_casual_test.py --skip-scenarios     # phases 1 + 3 only
+    python run_isolated_casual_test.py --skip-isolated --skip-pure-null   # phase 2 only
+    python run_isolated_casual_test.py --scenarios baseline small_sample  # phase 2, subset only
 """
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -117,7 +119,10 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
+import statsmodels.api as sm
+from scipy.stats import binomtest
 import matplotlib
 matplotlib.use("Agg")  # headless: no display required
 import matplotlib.pyplot as plt
@@ -143,6 +148,16 @@ from gen_fake_data import (
 ISOLATED_ROOT = os.path.join(SCRIPT_DIR, "isolated")
 PLOTS_DIR = os.path.join(ISOLATED_ROOT, "plots")
 PVALUE_THRESHOLD = 0.05
+
+# noise_sd actually used to generate the phenotype -- read from
+# generate_dataset()'s own default instead of hard-coding 8.5 here, so this
+# stays correct automatically if the default in gen_fake_data.py ever
+# changes. We ALSO pass it explicitly to every generate_dataset() call below
+# (instead of relying on the implicit default) and store it in each
+# variant's result, so predicted_var_ratio is always computed with the
+# value that was actually used to generate that variant's data, even if
+# someone changes the default between runs for a subset of cached variants.
+DEFAULT_NOISE_SD = inspect.signature(generate_dataset).parameters["noise_sd"].default
 
 # Fallback "flat null" sd_by_dosage used for variants that are NOT in
 # DEFAULT_PURE_VARIANCE_VARIANTS, so they can still be explicitly declared
@@ -259,11 +274,12 @@ def run_isolated_variant(plan_entry: dict, n_workers: int = 1, force: bool = Fal
         "ge_role": plan_entry["ge_role"],
         "sd_by_dosage": plan_entry["sd_by_dosage"],
         "vqtl_role": plan_entry["vqtl_role"],
+        "noise_sd_used": DEFAULT_NOISE_SD,
         "status": "ok", "error": None,
     }
     try:
         generate_dataset(
-            out_dir=fake_dir, verbose=True,
+            out_dir=fake_dir, verbose=True, noise_sd=DEFAULT_NOISE_SD,
             causal_variants={label: (plan_entry["beta_inter"], plan_entry["beta_main"])},
             pure_variance_variants={label: plan_entry["sd_by_dosage"]},
         )
@@ -301,18 +317,31 @@ def run_isolated_variant(plan_entry: dict, n_workers: int = 1, force: bool = Fal
             result["vqtl_found_in_results"] = False
             result["p_vqtl"] = None
             result["significant_vqtl"] = False
+            result["p_vqtl_boot"] = None
+            result["significant_vqtl_boot"] = False
         else:
             p_asym = float(vrow["P_asym"].iloc[0]) if "P_asym" in vrow.columns else None
+            p_boot = float(vrow["P_boot"].iloc[0]) if "P_boot" in vrow.columns else None
             result["vqtl_found_in_results"] = True
             result["p_vqtl"] = p_asym
             result["significant_vqtl"] = (p_asym is not None) and (p_asym < PVALUE_THRESHOLD)
+            result["p_vqtl_boot"] = p_boot
+            result["significant_vqtl_boot"] = (p_boot is not None) and (p_boot < PVALUE_THRESHOLD)
 
         if not result["vqtl_found_in_results"]:
             result["recovered_vqtl"] = False
         elif plan_entry["vqtl_role"] == "power":
             result["recovered_vqtl"] = result["significant_vqtl"]
-        else:  # crosstalk_check: expect NOT significant
+        else:  # crosstalk_check: expect NOT significant (naive label -- refined
+               # per-run into pure_null/confounded_expected/borderline, see
+               # classify_vqtl_crosstalk_zones() below; recovered_vqtl here is
+               # kept only as the raw naive flag, for backward compatibility)
             result["recovered_vqtl"] = not result["significant_vqtl"]
+
+        # predicted_var_ratio can be computed right away (only needs
+        # beta_inter and the noise_sd actually used for THIS variant), no
+        # aggregate/other-variant information required.
+        result["predicted_var_ratio"] = 1.0 + (plan_entry["beta_inter"] / DEFAULT_NOISE_SD) ** 2
 
     except Exception as exc:
         result["status"] = "FAILED"
@@ -338,11 +367,10 @@ def _worker(plan_entry: dict, n_workers: int, force: bool) -> dict:
 # script entirely. Rather than trusting the in-memory list accumulated
 # during this particular run, we re-read every isolated_summary.json from
 # disk for the variants in the current plan. This is the single source of
-# truth for the combined recap (isolated_power_curve.csv/.json + report),
-# and makes the combined output correct even if:
-#   - some variants were skipped via cache in this run,
-#   - the process crashed/was interrupted partway through a previous run,
-#   - variants were computed across multiple separate invocations.
+# truth for the combined recap, and makes it correct even if some variants
+# were skipped this run (cache hit), the process crashed/was interrupted
+# partway through a previous run, or variants were computed across multiple
+# separate invocations.
 # ============================================================
 
 def collect_results_from_disk(plan: list[dict]) -> pd.DataFrame:
@@ -367,13 +395,188 @@ def collect_results_from_disk(plan: list[dict]) -> pd.DataFrame:
             f"and are excluded from the combined recap: {missing}"
         )
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if not df.empty and "predicted_var_ratio" not in df.columns:
+        # backward compatibility with isolated_summary.json files written by
+        # the previous version of this script (no predicted_var_ratio saved)
+        df["predicted_var_ratio"] = np.nan
+    if not df.empty and "noise_sd_used" not in df.columns:
+        df["noise_sd_used"] = np.nan
+    # recompute defensively for any row missing it (cached from an older run,
+    # or noise_sd_used present but predicted_var_ratio wasn't saved)
+    need_fill = df["predicted_var_ratio"].isna() & df["noise_sd_used"].notna() & df["beta_inter"].notna()
+    if need_fill.any():
+        df.loc[need_fill, "predicted_var_ratio"] = 1.0 + (
+            df.loc[need_fill, "beta_inter"] / df.loc[need_fill, "noise_sd_used"]
+        ) ** 2
+    return df
+
+
+# ============================================================
+# G×E-confound-aware vQTL specificity classification.
+#
+# Re-fit EVERY run from the data itself -- see module docstring for why a
+# fixed threshold is wrong (it depends on noise_sd, sample size, vQTL test
+# power at that n, etc., all of which can change between runs).
+# ============================================================
+
+FALLBACK_RATIO_LOW = 1.05
+FALLBACK_RATIO_HIGH = 1.35
+
+
+def fit_vqtl_confound_thresholds(df: pd.DataFrame) -> dict:
+    """Logistic regression of significant_vqtl ~ log(predicted_var_ratio)
+    over the G×E-only variants (vqtl_role == 'crosstalk_check'), used to
+    find:
+      - ratio_low: predicted_var_ratio at which P(significant) is back down
+        to the empirical baseline rate (observed on the beta_inter=0
+        controls, i.e. ratio==1) -- below this, a hit is genuine noise.
+      - ratio_high: predicted_var_ratio at which P(significant) reaches 90%
+        -- above this, a hit is the mechanically expected outcome.
+    Falls back to fixed constants (with a printed warning) if the fit fails
+    or isn't well-behaved (e.g. too few points, no variation in the outcome,
+    non-monotonic/negative slope)."""
+    sub = df[
+        (df["vqtl_role"] == "crosstalk_check")
+        & (df["status"] == "ok")
+        & df["p_vqtl"].notna()
+        & df["predicted_var_ratio"].notna()
+    ].copy()
+
+    result = {
+        "method": "fallback_fixed",
+        "ratio_low": FALLBACK_RATIO_LOW,
+        "ratio_high": FALLBACK_RATIO_HIGH,
+        "baseline_rate": None,
+        "n_points": len(sub),
+        "note": None,
+    }
+
+    if len(sub) < 8:
+        result["note"] = f"Only {len(sub)} G×E-only variants available; using fallback fixed thresholds."
+        print(f"[warn] {result['note']}")
+        return result
+
+    sub["log_ratio"] = np.log(sub["predicted_var_ratio"].clip(lower=1.0 + 1e-9))
+    y = sub["significant_vqtl"].astype(float).to_numpy()
+
+    baseline_mask = sub["predicted_var_ratio"] <= (sub["predicted_var_ratio"].min() + 1e-6)
+    baseline_rate = float(y[baseline_mask.to_numpy()].mean()) if baseline_mask.any() else float(y.mean())
+    baseline_rate = min(max(baseline_rate, 0.01), 0.20)  # keep it sane: between 1% and 20%
+    result["baseline_rate"] = baseline_rate
+
+    if y.min() == y.max():
+        result["note"] = "No variation in significant_vqtl outcome across G×E-only variants; using fallback thresholds."
+        print(f"[warn] {result['note']}")
+        return result
+
+    try:
+        X = sm.add_constant(sub["log_ratio"].to_numpy())
+        model = sm.Logit(y, X).fit(disp=0)
+        b0, b1 = model.params
+        if not np.isfinite(b0) or not np.isfinite(b1) or b1 <= 0:
+            result["note"] = f"Logistic fit degenerate or non-increasing (b1={b1:.4g}); using fallback thresholds."
+            print(f"[warn] {result['note']}")
+            return result
+
+        def _logit(p: float) -> float:
+            p = min(max(p, 1e-6), 1 - 1e-6)
+            return np.log(p / (1 - p))
+
+        target_high = 0.90
+        x_low = (_logit(baseline_rate) - b0) / b1
+        x_high = (_logit(target_high) - b0) / b1
+
+        ratio_low = max(1.0, float(np.exp(x_low)))
+        ratio_high = float(np.exp(x_high))
+        if not np.isfinite(ratio_low) or not np.isfinite(ratio_high) or ratio_high <= ratio_low:
+            result["note"] = "Fitted thresholds not well-ordered/finite; using fallback thresholds."
+            print(f"[warn] {result['note']}")
+            return result
+
+        result.update({
+            "method": "logistic_fit",
+            "ratio_low": ratio_low,
+            "ratio_high": ratio_high,
+            "b0": float(b0), "b1": float(b1),
+            "note": None,
+        })
+        print(
+            f"[thresholds] Fitted from data: baseline_rate={baseline_rate:.3f}, "
+            f"ratio_low={ratio_low:.3f}, ratio_high={ratio_high:.3f} "
+            f"(logistic b0={b0:.3f}, b1={b1:.3f}, n={len(sub)})"
+        )
+        return result
+    except Exception as exc:
+        result["note"] = f"Logistic fit raised {type(exc).__name__}: {exc}; using fallback thresholds."
+        print(f"[warn] {result['note']}")
+        return result
+
+
+def add_expectation_columns(df: pd.DataFrame, thresholds: dict) -> pd.DataFrame:
+    """Adds, for every variant:
+      expected_sig_ge, match_ge   (unchanged logic: G×E test has no known
+                                    confound, so 'power' -> expect significant,
+                                    everything else -> expect not significant)
+      vqtl_zone                   ('power' | 'pure_null' | 'confounded_expected'
+                                    | 'borderline')
+      expected_sig_vqtl           (True / False / NaN for 'borderline')
+      match_vqtl                  (bool, or NaN when vqtl_zone == 'borderline')
+      as_expected                 (match_ge AND match_vqtl, NaN if match_vqtl
+                                    is NaN -- i.e. undetermined, not "failed")
+    """
+    df = df.copy()
+
+    df["expected_sig_ge"] = df["ge_role"] == "power"
+    df["match_ge"] = df["significant_ge"] == df["expected_sig_ge"]
+
+    ratio_low, ratio_high = thresholds["ratio_low"], thresholds["ratio_high"]
+
+    def _zone(row):
+        if row["vqtl_role"] == "power":
+            return "power"
+        r = row.get("predicted_var_ratio")
+        if r is None or pd.isna(r):
+            return "borderline"
+        if r <= ratio_low:
+            return "pure_null"
+        if r >= ratio_high:
+            return "confounded_expected"
+        return "borderline"
+
+    df["vqtl_zone"] = df.apply(_zone, axis=1)
+
+    def _expected_sig_vqtl(row):
+        if row["vqtl_zone"] == "power":
+            return True
+        if row["vqtl_zone"] == "pure_null":
+            return False
+        if row["vqtl_zone"] == "confounded_expected":
+            return True
+        return np.nan  # borderline: undetermined by design
+
+    df["expected_sig_vqtl"] = df.apply(_expected_sig_vqtl, axis=1)
+
+    def _match_vqtl(row):
+        if pd.isna(row["expected_sig_vqtl"]):
+            return np.nan
+        return bool(row["significant_vqtl"] == row["expected_sig_vqtl"])
+
+    df["match_vqtl"] = df.apply(_match_vqtl, axis=1)
+
+    def _as_expected(row):
+        if pd.isna(row["match_vqtl"]):
+            return np.nan
+        return bool(row["match_ge"] and row["match_vqtl"])
+
+    df["as_expected"] = df.apply(_as_expected, axis=1)
+    return df
 
 
 # ============================================================
 # Reporting: plots (matplotlib) + Word report (python-docx), always written
 # under ISOLATED_ROOT/plots/ and ISOLATED_ROOT/isolated_causal_test_report.docx.
-# Requires: pip install matplotlib python-docx
+# Requires: pip install matplotlib python-docx statsmodels
 # ============================================================
 
 def _fmt_p(p) -> str:
@@ -389,7 +592,7 @@ def _sd_ratio(d):
     return max(vals) / min(vals) if min(vals) > 0 else None
 
 
-def generate_plots(df: pd.DataFrame) -> dict:
+def generate_plots(df: pd.DataFrame, thresholds: dict) -> dict:
     os.makedirs(PLOTS_DIR, exist_ok=True)
     paths = {}
 
@@ -477,32 +680,55 @@ def generate_plots(df: pd.DataFrame) -> dict:
         fig.savefig(p, dpi=150); plt.close(fig)
         paths["vqtl_power_scatter"] = p
 
-    # ---- 4) Crosstalk / specificity summary ----
-    ct_rows = []
+    # ---- 4) GxE crosstalk on the GxE side (unchanged: vQTL-only variants tested on GxE) ----
     if not ge_crosstalk.empty:
         fp = int((~ge_crosstalk["recovered_ge"]).sum())
-        ct_rows.append(("vQTL variants tested on GxE\n(expect: not significant)", fp, len(ge_crosstalk)))
-    if not vqtl_crosstalk.empty:
-        fp = int((~vqtl_crosstalk["recovered_vqtl"]).sum())
-        ct_rows.append(("GxE variants tested on vQTL\n(expect: not significant)", fp, len(vqtl_crosstalk)))
-    if ct_rows:
-        fig, ax = plt.subplots(figsize=(6.5, 4))
-        labels = [r[0] for r in ct_rows]
-        pct = [100 * r[1] / r[2] if r[2] else 0 for r in ct_rows]
-        bars = ax.bar(labels, pct, color="#8a4fd6")
-        for b, r in zip(bars, ct_rows):
-            ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 1.5,
-                     f"{r[1]}/{r[2]}", ha="center", fontsize=9)
-        ax.set_ylabel("spurious cross-mechanism detection rate (%)")
-        ax.set_ylim(0, max(pct + [10]) * 1.3)
-        ax.set_title("Cross-mechanism specificity check")
+        fig, ax = plt.subplots(figsize=(5.5, 4))
+        pct = 100 * fp / len(ge_crosstalk)
+        ax.bar(["vQTL variants tested on GxE\n(expect: not significant)"], [pct], color="#8a4fd6")
+        ax.text(0, pct + 1.5, f"{fp}/{len(ge_crosstalk)}", ha="center", fontsize=9)
+        ax.set_ylabel("spurious GxE detection rate (%)")
+        ax.set_ylim(0, max(pct, 10) * 1.3)
+        ax.set_title("GxE specificity check (vQTL-only variants)")
         ax.grid(axis="y", alpha=0.3)
         fig.tight_layout()
-        p = os.path.join(PLOTS_DIR, "crosstalk_specificity.png")
+        p = os.path.join(PLOTS_DIR, "ge_specificity.png")
         fig.savefig(p, dpi=150); plt.close(fig)
-        paths["crosstalk_specificity"] = p
+        paths["ge_specificity"] = p
 
-    # ---- 5) Overlap: power variants recovered by BOTH mechanisms ----
+    # ---- 5) vQTL confound-aware curve: predicted_var_ratio vs significance,
+    #         with fitted thresholds and zone coloring. This REPLACES the old
+    #         single-number "crosstalk specificity" bar for the vQTL side,
+    #         which conflated genuine specificity failures with mechanically
+    #         expected hits. ----
+    if not vqtl_crosstalk.empty and vqtl_crosstalk["predicted_var_ratio"].notna().any():
+        zone_colors = {"pure_null": "#2a78d6", "confounded_expected": "#d68a2a", "borderline": "#9a9a9a"}
+        fig, ax = plt.subplots(figsize=(7.5, 4.5))
+        for zone, color in zone_colors.items():
+            sub = vqtl_crosstalk[vqtl_crosstalk["vqtl_zone"] == zone] if "vqtl_zone" in vqtl_crosstalk.columns else pd.DataFrame()
+            if sub.empty:
+                continue
+            marker_colors = sub["significant_vqtl"].map({True: color, False: "white"})
+            ax.scatter(sub["predicted_var_ratio"], sub["p_vqtl"].fillna(1.0), c=marker_colors,
+                       edgecolor=color, linewidth=1.3, s=60, label=zone, zorder=3)
+        ax.axhline(0.05, color="#898781", linestyle="--", linewidth=1, zorder=1)
+        ax.axvline(thresholds["ratio_low"], color="#2a78d6", linestyle=":", linewidth=1.2,
+                   label=f"ratio_low={thresholds['ratio_low']:.2f}", zorder=1)
+        ax.axvline(thresholds["ratio_high"], color="#d68a2a", linestyle=":", linewidth=1.2,
+                   label=f"ratio_high={thresholds['ratio_high']:.2f}", zorder=1)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("predicted_var_ratio = 1 + (beta_inter / noise_sd)^2  [log scale]")
+        ax.set_ylabel("p_vqtl  [log scale]")
+        ax.set_title(f"vQTL outcome on G×E-only variants vs. predicted confound\n(thresholds: {thresholds['method']})")
+        ax.legend(fontsize=7, frameon=False, loc="lower left")
+        ax.grid(alpha=0.3, which="both")
+        fig.tight_layout()
+        p = os.path.join(PLOTS_DIR, "vqtl_confound_curve.png")
+        fig.savefig(p, dpi=150); plt.close(fig)
+        paths["vqtl_confound_curve"] = p
+
+    # ---- 6) Overlap: power variants recovered by BOTH mechanisms ----
     both_defined = df[df["in_ge_pool"] & df["in_vqtl_pool"]].copy()
     if not both_defined.empty:
         fig, ax = plt.subplots(figsize=(6, 4.5))
@@ -529,12 +755,15 @@ def generate_plots(df: pd.DataFrame) -> dict:
     return paths
 
 
-def generate_word_report(df: pd.DataFrame, plot_paths: dict) -> str:
+def generate_word_report(df: pd.DataFrame, plot_paths: dict, thresholds: dict) -> str:
     ge_power = df[df["ge_role"] == "power"]
     ge_fpr = df[df["ge_role"] == "fpr_control"]
     vqtl_power = df[df["vqtl_role"] == "power"]
     ge_crosstalk = df[df["ge_role"] == "crosstalk_check"]
     vqtl_crosstalk = df[df["vqtl_role"] == "crosstalk_check"]
+    pure_null = vqtl_crosstalk[vqtl_crosstalk["vqtl_zone"] == "pure_null"] if "vqtl_zone" in vqtl_crosstalk.columns else pd.DataFrame()
+    confounded = vqtl_crosstalk[vqtl_crosstalk["vqtl_zone"] == "confounded_expected"] if "vqtl_zone" in vqtl_crosstalk.columns else pd.DataFrame()
+    borderline = vqtl_crosstalk[vqtl_crosstalk["vqtl_zone"] == "borderline"] if "vqtl_zone" in vqtl_crosstalk.columns else pd.DataFrame()
 
     doc = Document()
     doc.add_heading("Isolated causal variant test — combined results report", level=0)
@@ -544,9 +773,20 @@ def generate_word_report(df: pd.DataFrame, plot_paths: dict) -> str:
         "Every variant from either default pool was tested one at a time against an "
         "otherwise-null panel, on BOTH the G×E and the vQTL mechanism simultaneously "
         "(using a null/flat configuration on whichever mechanism it was not designed for). "
-        "This gives, for every variant, both a power estimate on its designed mechanism "
-        "and a specificity check on the other mechanism. Combined results below are "
-        "assembled directly from the per-variant result files saved on disk."
+        "Combined results below are assembled directly from the per-variant result files "
+        "saved on disk."
+    )
+    doc.add_paragraph(
+        "Note on vQTL specificity: a G×E-only variant with interaction term "
+        "beta_inter*dosage*exposure mechanically induces heteroscedasticity by dosage "
+        "(predicted variance ratio = 1 + (beta_inter/noise_sd)^2), independent of any "
+        "declared vQTL effect. A vQTL hit on such a variant is therefore only a genuine "
+        "specificity failure when the predicted ratio is small; when it is large, "
+        "significance is the mechanically expected outcome. G×E-only variants are "
+        f"classified into three zones EVERY RUN (not fixed thresholds) via a logistic fit "
+        f"of vQTL significance on the predicted ratio -- see 'vQTL specificity' section below "
+        f"(method used this run: {thresholds['method']}, ratio_low={thresholds['ratio_low']:.3f}, "
+        f"ratio_high={thresholds['ratio_high']:.3f})."
     )
 
     doc.add_heading("Summary", level=1)
@@ -575,12 +815,36 @@ def generate_word_report(df: pd.DataFrame, plot_paths: dict) -> str:
             f"Cross-mechanism check, vQTL-only variants tested on G×E: {n_fp}/{n_tot} "
             f"showed a spurious G×E signal ({100 * n_fp / n_tot:.1f}%)."
         )
-    if not vqtl_crosstalk.empty:
-        n_fp, n_tot = int((~vqtl_crosstalk["recovered_vqtl"]).sum()), len(vqtl_crosstalk)
+
+    doc.add_heading("vQTL specificity (G×E-confound-aware)", level=1)
+    doc.add_paragraph(
+        f"Thresholds this run: ratio_low={thresholds['ratio_low']:.3f}, "
+        f"ratio_high={thresholds['ratio_high']:.3f} (method: {thresholds['method']}"
+        + (f", {thresholds['note']}" if thresholds.get("note") else "") + ")."
+    )
+    if not pure_null.empty:
+        n_fp = int((~pure_null["match_vqtl"].astype(bool)).sum())
         doc.add_paragraph(
-            f"Cross-mechanism check, G×E-only variants tested on vQTL: {n_fp}/{n_tot} "
-            f"showed a spurious vQTL signal ({100 * n_fp / n_tot:.1f}%)."
+            f"Genuine specificity zone (pure_null, predicted_var_ratio <= {thresholds['ratio_low']:.3f}): "
+            f"{n_fp}/{len(pure_null)} showed a spurious vQTL signal "
+            f"({100 * n_fp / len(pure_null):.1f}%) -- these are real specificity failures / noise."
         )
+    if not confounded.empty:
+        n_sig = int(confounded["significant_vqtl"].sum())
+        doc.add_paragraph(
+            f"Mechanically-confounded zone (confounded_expected, predicted_var_ratio >= "
+            f"{thresholds['ratio_high']:.3f}): {n_sig}/{len(confounded)} were significant on vQTL "
+            f"({100 * n_sig / len(confounded):.1f}%) -- this is the EXPECTED outcome given the "
+            f"induced heteroscedasticity, not a specificity failure."
+        )
+    if not borderline.empty:
+        n_sig = int(borderline["significant_vqtl"].sum())
+        doc.add_paragraph(
+            f"Borderline zone ({thresholds['ratio_low']:.3f} < predicted_var_ratio < "
+            f"{thresholds['ratio_high']:.3f}): {len(borderline)} variants excluded from the pass/fail "
+            f"counts above ({n_sig} were significant) -- reported for transparency, not scored."
+        )
+
     failed = df[df["status"] == "FAILED"]
     if not failed.empty:
         p = doc.add_paragraph()
@@ -594,11 +858,12 @@ def generate_word_report(df: pd.DataFrame, plot_paths: dict) -> str:
             "ge_power_by_bin": "GxE detection rate by effect-size bin.",
             "ge_fpr_controls": "Main-effect-only controls — false-positive check.",
             "vqtl_power_scatter": "vQTL isolated power test — pure_variance variants.",
-            "crosstalk_specificity": "Cross-mechanism specificity check.",
+            "ge_specificity": "GxE specificity check (vQTL-only variants tested on GxE).",
+            "vqtl_confound_curve": "vQTL outcome on G×E-only variants vs. predicted variance-ratio confound, with data-driven zone thresholds.",
             "overlap_both_mechanisms": "Detection overlap for variants designed on both mechanisms.",
         }
         for key in ["ge_power_scatter", "ge_power_by_bin", "ge_fpr_controls",
-                    "vqtl_power_scatter", "crosstalk_specificity", "overlap_both_mechanisms"]:
+                    "vqtl_power_scatter", "ge_specificity", "vqtl_confound_curve", "overlap_both_mechanisms"]:
             if key in plot_paths:
                 doc.add_picture(plot_paths[key], width=Inches(6))
                 cap = doc.add_paragraph(captions[key])
@@ -608,9 +873,11 @@ def generate_word_report(df: pd.DataFrame, plot_paths: dict) -> str:
                     run.font.size = Pt(9)
 
     doc.add_heading("Detailed results", level=1)
-    cols = ["variant", "in_ge_pool", "in_vqtl_pool", "ge_role", "beta_inter", "beta_main",
-            "p_ge", "significant_ge", "recovered_ge",
-            "vqtl_role", "sd_by_dosage", "p_vqtl", "significant_vqtl", "recovered_vqtl", "status"]
+    cols = ["variant", "in_ge_pool", "in_vqtl_pool",
+            "ge_role", "beta_inter", "beta_main", "p_ge", "significant_ge", "expected_sig_ge", "match_ge",
+            "vqtl_role", "sd_by_dosage", "predicted_var_ratio", "vqtl_zone",
+            "p_vqtl", "significant_vqtl", "expected_sig_vqtl", "match_vqtl",
+            "as_expected", "status"]
     cols = [c for c in cols if c in df.columns]
     table = doc.add_table(rows=1, cols=len(cols))
     table.style = "Light Grid Accent 1"
@@ -625,6 +892,8 @@ def generate_word_report(df: pd.DataFrame, plot_paths: dict) -> str:
             val = row[c]
             if c in ("p_ge", "p_vqtl"):
                 val = _fmt_p(val)
+            elif c == "predicted_var_ratio" and pd.notna(val):
+                val = f"{val:.3f}"
             cells[i].text = "" if pd.isna(val) else str(val)
         for c in table.rows[-1].cells:
             for r in c.paragraphs[0].runs:
@@ -635,23 +904,18 @@ def generate_word_report(df: pd.DataFrame, plot_paths: dict) -> str:
     return out_path
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Isolated test: every variant, both mechanisms")
-    parser.add_argument("--workers", type=int, default=1,
-                         help="Number of variants to test in parallel (separate processes). Default 1.")
-    parser.add_argument("--force", action="store_true",
-                         help="Recompute even variants that already have an isolated_summary.json with "
-                              "status ok (default: skipped and cached result reused)")
-    args = parser.parse_args()
+# ============================================================
+# PHASE 1: isolated per-variant test (everything above this point).
+# Runs every variant in the plan (parallel or sequential), rebuilds the
+# combined table from disk, classifies vQTL zones, writes CSV/JSON/plots/
+# docx, and returns a result dict summarizing pass/fail for main() to
+# combine with the other two phases' outcomes.
+# ============================================================
 
-    n_workers = max(1, args.workers)
-    force = args.force
+def run_isolated_phase(n_workers: int = 1, force: bool = False) -> dict:
     os.makedirs(ISOLATED_ROOT, exist_ok=True)
-
     plan = build_variant_plan()
     print(f"{len(plan)} unique variants to test (union of both default pools), both mechanisms each.")
-
-    t0 = time.time()
 
     if n_workers == 1:
         for entry in plan:
@@ -673,35 +937,44 @@ def main() -> None:
     section("COMBINED RESULTS (assembled from disk)")
     # Always rebuild the combined table from the per-variant isolated_summary.json
     # files on disk, rather than from whatever this run's execution happened to
-    # accumulate in memory. This is what makes the combined recap correct even
-    # when some variants were skipped this run (cache hit) or computed in a
-    # separate process/invocation.
+    # accumulate in memory (see collect_results_from_disk docstring).
     df = collect_results_from_disk(plan)
     if df.empty:
         print("No results found on disk -- nothing to report.")
-        sys.exit(1)
+        return {"df": pd.DataFrame(), "has_failures": True}
+
+    # Zone thresholds are refit from THIS run's data every time (see module
+    # docstring for why they can't be hard-coded), then applied to classify
+    # every variant and compute expected_sig_ge/vqtl, match_ge/vqtl, as_expected.
+    thresholds = fit_vqtl_confound_thresholds(df)
+    df = add_expectation_columns(df, thresholds)
+
     print(df.to_string(index=False))
 
     summary_csv = os.path.join(ISOLATED_ROOT, "isolated_power_curve.csv")
     df.to_csv(summary_csv, index=False)
     with open(os.path.join(ISOLATED_ROOT, "isolated_power_curve.json"), "w") as f:
         json.dump(df.to_dict(orient="records"), f, indent=2, default=str)
+    with open(os.path.join(ISOLATED_ROOT, "vqtl_confound_thresholds.json"), "w") as f:
+        json.dump(thresholds, f, indent=2, default=str)
     print(f"\n[export] {summary_csv}")
+    print(f"[export] {os.path.join(ISOLATED_ROOT, 'vqtl_confound_thresholds.json')}")
 
     section("REPORT — plots and Word")
-    plot_paths = generate_plots(df)
+    plot_paths = generate_plots(df, thresholds)
     for name, p in plot_paths.items():
         print(f"[plot] {name}: {p}")
-    report_path = generate_word_report(df, plot_paths)
+    report_path = generate_word_report(df, plot_paths, thresholds)
     print(f"[export] {report_path}")
 
-    print(f"\nCompleted in {time.time() - t0:.0f}s.")
-
     ok = df[df["status"] == "ok"]
-    missed_power_ge = ok.loc[(ok["ge_role"] == "power") & (~ok["recovered_ge"]), "variant"].tolist()
-    fp_ge = ok.loc[(ok["ge_role"] != "power") & (~ok["recovered_ge"]), "variant"].tolist()
-    missed_power_vqtl = ok.loc[(ok["vqtl_role"] == "power") & (~ok["recovered_vqtl"]), "variant"].tolist()
-    fp_vqtl = ok.loc[(ok["vqtl_role"] != "power") & (~ok["recovered_vqtl"]), "variant"].tolist()
+    missed_power_ge = ok.loc[(ok["ge_role"] == "power") & (~ok["match_ge"]), "variant"].tolist()
+    fp_ge = ok.loc[(ok["ge_role"] != "power") & (~ok["match_ge"]), "variant"].tolist()
+    missed_power_vqtl = ok.loc[(ok["vqtl_role"] == "power") & (~ok["match_vqtl"].astype("boolean").fillna(True)), "variant"].tolist()
+    # genuine vQTL specificity failures: only in the pure_null zone (see report)
+    fp_vqtl_genuine = ok.loc[
+        (ok["vqtl_zone"] == "pure_null") & (~ok["match_vqtl"].astype("boolean").fillna(True)), "variant"
+    ].tolist()
     failed = df.loc[df["status"] == "FAILED", "variant"].tolist()
 
     if missed_power_ge:
@@ -710,14 +983,242 @@ def main() -> None:
         print(f"*** SPURIOUS GxE SIGNIFICANCE (fpr_control or crosstalk): {fp_ge} ***")
     if missed_power_vqtl:
         print(f"\n*** CAUSAL VARIANTS NOT RECOVERED (vQTL power, isolated): {missed_power_vqtl} ***")
-    if fp_vqtl:
-        print(f"*** SPURIOUS vQTL SIGNIFICANCE (crosstalk): {fp_vqtl} ***")
+    if fp_vqtl_genuine:
+        print(f"*** GENUINE SPURIOUS vQTL SIGNIFICANCE (pure_null zone only): {fp_vqtl_genuine} ***")
     if failed:
         print(f"*** FAILED VARIANTS (exception): {failed} ***")
 
-    if missed_power_ge or fp_ge or missed_power_vqtl or fp_vqtl or failed:
+    has_failures = bool(missed_power_ge or fp_ge or missed_power_vqtl or fp_vqtl_genuine or failed)
+    if not has_failures:
+        print("\n*** All isolated causal variants recovered correctly on both mechanisms "
+              "(vQTL judged with G×E-confound-aware zones). ***")
+
+    return {
+        "df": df,
+        "report_path": report_path,
+        "missed_power_ge": missed_power_ge,
+        "fp_ge": fp_ge,
+        "missed_power_vqtl": missed_power_vqtl,
+        "fp_vqtl_genuine": fp_vqtl_genuine,
+        "failed": failed,
+        "has_failures": has_failures,
+    }
+
+
+# ============================================================
+# PHASE 3: pure_null zone confidence interval (ported from the former
+# analize_pure_null.py -- it only made sense as a follow-up to phase 1, so
+# it now lives here as the phase run right after it by default).
+#
+# Exact binomial CI on the observed false-positive rate in the isolated
+# run's "pure_null" vQTL zone (predicted_var_ratio small enough that a vQTL
+# hit is genuine noise, not G×E-induced heteroscedasticity -- see module
+# docstring). Only if the nominal 5% falls outside (or close to the edge
+# of) that CI do we spend the extra comparison against the bootstrap
+# p-value (K=200, steadier SE estimate than the asymptotic one at K=50) to
+# tell apart "estimation noise at K=50" from "a real bias in the test".
+# This needs p_vqtl_boot/significant_vqtl_boot, which run_isolated_variant()
+# now saves for every variant (previously missing: run_vqtl_debug already
+# computes both se_methods for every variant, so this costs nothing extra).
+# ============================================================
+
+NOMINAL_VQTL_RATE = 0.05
+
+
+def _binomial_ci_block(n_sig: int, n_tot: int, alpha: float) -> dict:
+    if n_tot == 0:
+        return {"n": 0, "n_significant": 0, "observed_rate": None,
+                "ci_low": None, "ci_high": None, "nominal_in_ci": None}
+    res = binomtest(n_sig, n_tot, p=NOMINAL_VQTL_RATE, alternative="two-sided")
+    ci = res.proportion_ci(confidence_level=1 - alpha, method="exact")
+    return {
+        "n": n_tot,
+        "n_significant": n_sig,
+        "observed_rate": round(n_sig / n_tot, 4),
+        "ci_low": round(ci.low, 4),
+        "ci_high": round(ci.high, 4),
+        "confidence_level": 1 - alpha,
+        "nominal_in_ci": bool(ci.low <= NOMINAL_VQTL_RATE <= ci.high),
+        "binom_test_pvalue": round(res.pvalue, 4),
+    }
+
+
+def run_pure_null_ci_check(df: pd.DataFrame, alpha: float = 0.05, near_edge_margin: float = 0.02) -> dict:
+    if "vqtl_zone" not in df.columns:
+        raise SystemExit(
+            "isolated_power_curve.csv doesn't have a vqtl_zone column: was it written by an "
+            "old version of this script? Re-run the isolated phase (drop --skip-isolated)."
+        )
+
+    pure_null = df[(df["vqtl_zone"] == "pure_null") & (df["status"] == "ok")].copy()
+    n_tot = len(pure_null)
+    n_sig = int(pure_null["significant_vqtl"].sum()) if n_tot else 0
+    if n_tot:
+        print(f"pure_null zone: n={n_tot} variants, {n_sig} significant on P_asym "
+              f"(observed rate {100 * n_sig / n_tot:.1f}%).")
+    else:
+        print("pure_null zone is empty: nothing to check.")
+
+    ci_asym = _binomial_ci_block(n_sig, n_tot, alpha)
+    if n_tot:
+        print(f"Exact {int(ci_asym['confidence_level'] * 100)}% CI on P_asym: "
+              f"[{ci_asym['ci_low']}, {ci_asym['ci_high']}]")
+
+    report = {"alpha": alpha, "n_pure_null_total_rows": n_tot, "asym": ci_asym}
+
+    proceed_to_boot = False
+    if n_tot == 0:
+        pass
+    elif not ci_asym["nominal_in_ci"]:
+        print("The nominal 5% falls OUTSIDE the P_asym CI -> comparing against P_boot.")
+        proceed_to_boot = True
+    else:
+        dist_to_edge = min(abs(NOMINAL_VQTL_RATE - ci_asym["ci_low"]), abs(ci_asym["ci_high"] - NOMINAL_VQTL_RATE))
+        if dist_to_edge < near_edge_margin:
+            print(f"The nominal 5% is INSIDE the P_asym CI but close to the edge "
+                  f"(distance {dist_to_edge:.3f} < margin {near_edge_margin}) -> "
+                  f"comparing against P_boot anyway, to be safe.")
+            proceed_to_boot = True
+        else:
+            print("The nominal 5% is comfortably inside the P_asym CI: no evidence of a problem. "
+                  "No need for the P_boot comparison.")
+
+    report["proceeded_to_boot_comparison"] = proceed_to_boot
+    flag_for_review = False
+
+    if proceed_to_boot:
+        has_boot = "p_vqtl_boot" in pure_null.columns and pure_null["p_vqtl_boot"].notna().any()
+        if not has_boot:
+            print("\n[warn] No p_vqtl_boot available for the pure_null zone (isolated_power_curve.csv "
+                  "was produced before run_isolated_variant() started saving it). Re-run the isolated "
+                  "phase -- even just with --force on the affected variants is enough to repopulate "
+                  "p_vqtl_boot without regenerating the datasets, since run_vqtl_debug always runs "
+                  "both se_methods anyway.")
+            report["boot"] = None
+        else:
+            if "significant_vqtl_boot" in pure_null.columns:
+                n_sig_boot = int(pure_null["significant_vqtl_boot"].fillna(False).sum())
+            else:
+                n_sig_boot = int((pure_null["p_vqtl_boot"] < NOMINAL_VQTL_RATE).sum())
+            ci_boot = _binomial_ci_block(n_sig_boot, n_tot, alpha)
+            print(f"Same subset on P_boot (K=200): {n_sig_boot}/{n_tot} significant "
+                  f"(observed rate {100 * n_sig_boot / n_tot:.1f}%), CI: [{ci_boot['ci_low']}, {ci_boot['ci_high']}]")
+            report["boot"] = ci_boot
+
+            if ci_boot["nominal_in_ci"] and not ci_asym["nominal_in_ci"]:
+                print("\n-> P_boot (K=200) falls back within nominal while P_asym (K=50) doesn't: "
+                      "consistent with SE estimation noise at low K, not a real bias. Worth considering "
+                      "a higher default VQTL_ASYMPTOTIC_BOOTSTRAP_K, or se_method='bootstrap' for "
+                      "false-positive screening.")
+            elif not ci_boot["nominal_in_ci"] and not ci_asym["nominal_in_ci"]:
+                print("\n-> P_boot (K=200, the production method) ALSO shows the nominal 5% outside the "
+                      "CI: not just a K issue. Likely a systematic bias in the variance test itself, "
+                      "independent of the bootstrap replicate count -- worth a dedicated check (e.g. a "
+                      "QQ-plot of vQTL p-values under pure H0, with no G×E component at all).")
+                flag_for_review = True
+            else:
+                print("\n-> Both methods fall within nominal on this subset: the signal initially seen "
+                      "on P_asym was compatible with sampling noise at this n.")
+
+    report["flag_for_review"] = flag_for_review
+    out_path = os.path.join(ISOLATED_ROOT, "pure_null_ci_report.json")
+    os.makedirs(ISOLATED_ROOT, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    print(f"\n[export] {out_path}")
+    return report
+
+
+# ============================================================
+# PHASE 2: robustness scenario battery, delegated to run_scenarios.py
+# (run_all_scenarios()) -- not duplicated here, see run_scenarios.py's own
+# docstring for what each scenario covers.
+# ============================================================
+
+def run_scenario_phase(n_workers: int = 1, names: list[str] | None = None) -> dict:
+    return rs.run_all_scenarios(names=names, n_workers=n_workers)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Full vQTL/G×E pipeline test battery: isolated per-variant test, "
+                     "robustness scenario battery, and pure_null zone CI check."
+    )
+    parser.add_argument("--workers", type=int, default=1,
+                         help="Parallel processes used within each phase (isolated variants, then "
+                              "scenarios). Default 1 (sequential).")
+    parser.add_argument("--force", action="store_true",
+                         help="Isolated phase only: recompute even variants that already have an "
+                              "isolated_summary.json with status ok (default: cached result reused).")
+    parser.add_argument("--skip-isolated", action="store_true", help="Skip phase 1 (isolated per-variant test).")
+    parser.add_argument("--skip-scenarios", action="store_true", help="Skip phase 2 (robustness scenario battery).")
+    parser.add_argument("--skip-pure-null", action="store_true", help="Skip phase 3 (pure_null zone CI check).")
+    parser.add_argument("--scenarios", nargs="*", default=None,
+                         help="Phase 2 only: specific scenario names to run (default: all of them).")
+    parser.add_argument("--pure-null-alpha", type=float, default=0.05,
+                         help="Phase 3: 1 - confidence level for the binomial CI (default 0.05 -> 95%% CI).")
+    parser.add_argument("--pure-null-near-edge-margin", type=float, default=0.02,
+                         help="Phase 3: if the nominal 5%% is INSIDE the CI but closer than this to its "
+                              "edge, run the P_boot comparison anyway, out of caution (default 0.02).")
+    args = parser.parse_args()
+
+    n_workers = max(1, args.workers)
+    t0 = time.time()
+    phase_results = {}
+
+    if not args.skip_isolated:
+        section("PHASE 1/3 — ISOLATED PER-VARIANT TEST")
+        phase_results["isolated"] = run_isolated_phase(n_workers=n_workers, force=args.force)
+    else:
+        print("[skip] phase 1 (isolated) skipped by --skip-isolated.")
+
+    if not args.skip_scenarios:
+        section("PHASE 2/3 — ROBUSTNESS SCENARIO BATTERY")
+        phase_results["scenarios"] = run_scenario_phase(n_workers=n_workers, names=args.scenarios)
+    else:
+        print("[skip] phase 2 (scenarios) skipped by --skip-scenarios.")
+
+    if not args.skip_pure_null:
+        section("PHASE 3/3 — PURE_NULL ZONE CONFIDENCE INTERVAL")
+        isolated_df = phase_results.get("isolated", {}).get("df")
+        if isolated_df is None or isolated_df.empty:
+            # Phase 1 wasn't run this time (or produced nothing): fall back to
+            # whatever isolated_power_curve.csv is already on disk from a
+            # previous run, same as the old standalone analize_pure_null.py.
+            csv_path = os.path.join(ISOLATED_ROOT, "isolated_power_curve.csv")
+            if os.path.isfile(csv_path):
+                isolated_df = pd.read_csv(csv_path)
+            else:
+                isolated_df = None
+        if isolated_df is None:
+            print(f"[skip] phase 3 (pure_null) skipped: no isolated_power_curve.csv found "
+                  f"(run phase 1 at least once, or drop --skip-isolated).")
+        else:
+            phase_results["pure_null"] = run_pure_null_ci_check(
+                isolated_df, alpha=args.pure_null_alpha, near_edge_margin=args.pure_null_near_edge_margin)
+    else:
+        print("[skip] phase 3 (pure_null) skipped by --skip-pure-null.")
+
+    section("FINAL SUMMARY — all phases")
+    print(f"Completed in {time.time() - t0:.0f}s.")
+
+    isolated_failed = phase_results.get("isolated", {}).get("has_failures", False)
+    scenarios_failed = phase_results.get("scenarios", {}).get("has_failures", False)
+    pure_null_flag = phase_results.get("pure_null", {}).get("flag_for_review", False)
+
+    if isolated_failed:
+        print("*** Phase 1 (isolated): FAILURES found, see above. ***")
+    if scenarios_failed:
+        print(f"*** Phase 2 (scenarios): failed scenarios "
+              f"{phase_results['scenarios'].get('failed')} / "
+              f"vQTL-check failures {phase_results['scenarios'].get('vqtl_failed')}. ***")
+    if pure_null_flag:
+        print("*** Phase 3 (pure_null): possible systematic bias flagged for manual review, see above. ***")
+
+    if isolated_failed or scenarios_failed:
         sys.exit(1)
-    print("\n*** All isolated causal variants recovered correctly on both mechanisms. ***")
+    if not (isolated_failed or scenarios_failed or pure_null_flag):
+        print("*** All executed phases completed with no failures. ***")
 
 
 if __name__ == "__main__":

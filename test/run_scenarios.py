@@ -1,22 +1,23 @@
 """
-Orchestratore multi-scenario.
+Orchestratore multi-scenario (battery di robustezza).
 
 Per ciascuno scenario definito in SCENARIOS:
   1) genera i dati sintetici       -> gen_fake_data.generate_dataset(**params)
-  2) gira la parte gene-ambiente   -> stessa logica di run_pipeline_test.py
+  2) gira la parte gene-ambiente   -> run_ge_interaction() qui sotto
      (chiamata diretta e sequenziale a modeling.process_single_variant,
      nessuna reimplementazione)
   3) gira la parte vQTL in due modalita':
-       - "debug"      -> stessa logica di debug_se_method.py: confronto
-                          asymptotic vs bootstrap su (7 causali + 20 nulle
-                          a caso), utile per un check rapido di divergenza
+       - "debug"      -> run_vqtl_debug() qui sotto: confronto asymptotic
+                          vs bootstrap su (varianti causali + 20 nulle a
+                          caso), utile per un check rapido di divergenza
                           fra i due metodi di SE
-       - "asymptotic" -> pipeline vQTL completa Step 3->7
-                          (run_pipeline_for_method di test_vqtl_pipeline.py,
-                          importata cosi' com'e', non duplicata), solo
-                          se_method="asymptotic" (il bootstrap e' gia'
-                          confrontato nel debug, farlo girare anche qui
-                          raddoppierebbe il tempo per poco valore aggiunto)
+       - "asymptotic" -> run_vqtl_asymptotic() qui sotto: pipeline vQTL
+                          completa Step 3->7 (run_pipeline_for_method di
+                          test_vqtl_pipeline.py, importata cosi' com'e', non
+                          duplicata), solo se_method="asymptotic" (il
+                          bootstrap e' gia' confrontato nel debug, farlo
+                          girare anche qui raddoppierebbe il tempo per poco
+                          valore aggiunto)
 
 Ogni scenario scrive sotto scenarios/<nome>/ (fake_data/, vqtl_results/,
 debug/, ge_pipeline_results.csv, scenario_summary.json). Alla fine viene
@@ -48,20 +49,24 @@ missingness, campione piccolo, esposizione zero-inflazionata) serve un
 segnale pulito e comparabile fra scenari -- quindi qui si usa SEMPRE questo
 set piccolo, indipendentemente dai default di gen_fake_data.py. La curva di
 potenza per magnitudine/segno va invece misurata con
-run_isolated_causal_test.py (1 sola variante attiva per dataset), non qui.
+run_isolated_casual_test.py (1 sola variante attiva per dataset), non qui.
 ***
 
-COME LANCIARLO (gira da TE, non da questa chat):
-  Metti questo file nella cartella ROOT del repo, insieme a
-  gen_fake_data.py, run_pipeline_test.py (non serve importarlo: la sua
-  logica e' replicata qui sotto), test_vqtl_pipeline.py, debug_se_method.py,
-  fake_vqtl_repository.py, e test/report_utils.py -- cioe' allo stesso
-  livello dove li hai gia' messi per gli script singoli.
+QUESTO FILE E' SIA UNA LIBRERIA CHE UNO SCRIPT:
+  - run_isolated_casual_test.py lo importa (`import run_scenarios as rs`)
+    per riusare _set_common_env / run_ge_interaction / run_vqtl_debug (test
+    isolato per-variante) e run_all_scenarios (battery di scenari, come
+    "fase 2" della batteria completa) -- vedi il docstring di quel file per
+    il punto d'ingresso unico consigliato.
+  - Puo' comunque essere lanciato da solo, se si vuole SOLO la battery di
+    scenari senza il resto:
+        python run_scenarios.py                          # sequenziale, tutti gli scenari
+        python run_scenarios.py baseline small_sample     # sequenziale, solo alcuni
+        python run_scenarios.py --workers 4               # parallelo, 4 scenari insieme
+        python run_scenarios.py --workers 4 baseline small_sample
 
-    python run_scenarios.py                          # sequenziale, tutti gli scenari
-    python run_scenarios.py baseline small_sample     # sequenziale, solo alcuni
-    python run_scenarios.py --workers 4               # parallelo, 4 scenari insieme
-    python run_scenarios.py --workers 4 baseline small_sample
+Metti questo file nella cartella ROOT del repo, insieme a gen_fake_data.py,
+test_vqtl_pipeline.py, fake_vqtl_repository.py e report_utils.py.
 
 get_config()/get_vqtl_config() del repo leggono gli env ogni volta (non
 sono cachate con lru_cache) -- per questo qui basta aggiornare os.environ e
@@ -101,7 +106,7 @@ REPO_ROOT = SCRIPT_DIR  # cambia qui se questo file non sta nella root del repo
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, SCRIPT_DIR)
 
-from test.report_utils import generate_recap, generate_multi_scenario_recap, load_scenario_recap
+from report_utils import generate_recap, generate_multi_scenario_recap, load_scenario_recap
 
 SCENARIOS_ROOT = os.path.join(SCRIPT_DIR, "scenarios")
 
@@ -164,10 +169,11 @@ def section(title: str) -> None:
 
 
 def _set_common_env(fake_dir: str, work_dir: str, vqtl_n_jobs: int | None = None) -> None:
-    """Stesse chiavi/valori di default usate da run_pipeline_test.py e
-    test_vqtl_pipeline.py, ma puntate alle cartelle dello scenario corrente.
-    vqtl_n_jobs sovrascrive il default (4) -- usato per non sovrasaturare la
-    CPU quando piu' scenari girano in parallelo (vedi run_scenario)."""
+    """Chiavi/valori di default per gene_environment.config.get_config() e
+    vqtl.config.get_vqtl_config(), puntate alle cartelle dello scenario
+    corrente. vqtl_n_jobs sovrascrive il default (4) -- usato per non
+    sovrasaturare la CPU quando piu' scenari girano in parallelo (vedi
+    run_scenario)."""
     n_jobs = vqtl_n_jobs if vqtl_n_jobs is not None else min(4, os.cpu_count() or 2)
     os.environ.update({
         "DB_USER": "test_user",
@@ -243,8 +249,11 @@ def _force_cfg_overrides(cfg, overrides: dict, context: str):
 
 
 # ============================================================
-# Step 2: parte gene-ambiente -- stessa logica di run_pipeline_test.py,
-# qui come funzione richiamabile in loop invece che script a se stante.
+# Step 2: parte gene-ambiente. Chiama direttamente modeling.process_single_
+# variant su ogni variante del dataset, in sequenza -- nessuna
+# reimplementazione della statistica, solo orchestrazione. Unica copia di
+# questa logica nel repo: riusata sia da run_scenario() qui sotto sia da
+# run_isolated_casual_test.py per il test isolato per-variante.
 # ============================================================
 
 def run_ge_interaction(fake_dir: str, work_dir: str) -> dict:
@@ -312,9 +321,10 @@ def run_ge_interaction(fake_dir: str, work_dir: str) -> dict:
 
 
 # ============================================================
-# Step 3a: parte vQTL "debug" -- stessa logica di debug_se_method.py,
-# confronto asymptotic vs bootstrap su un sottoinsieme piccolo
-# (7 causali + 20 nulle a caso), qui come funzione richiamabile in loop.
+# Step 3a: parte vQTL "debug" -- confronto asymptotic vs bootstrap su un
+# sottoinsieme piccolo (causali + 20 nulle a caso). Unica copia di questa
+# logica nel repo: riusata sia da run_scenario() qui sotto sia da
+# run_isolated_casual_test.py per il confronto per-variante.
 # ============================================================
 
 def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
@@ -421,33 +431,7 @@ def run_vqtl_asymptotic(fake_dir: str, work_dir: str) -> dict:
     from gene_environment.config import get_config
     from gene_environment.logging_utils import configure_logging
     from vqtl.config import get_vqtl_config
-
-    # test_vqtl_pipeline.py, AL MOMENTO DELL'IMPORT (una tantum per
-    # processo), calcola FAKE = <cartella del file>/fake_data e fa
-    # `raise SystemExit` se non esiste -- prima ancora che questa funzione
-    # possa rimappare i path allo scenario corrente. Nella cartella del
-    # repo vero (non in uno scenario) quella fake_data/ tipicamente non
-    # c'e', quindi il solo `import test_vqtl_pipeline` qui sotto falliva.
-    # Creiamo una cartella placeholder (vuota va benissimo: serve solo a
-    # superare l'isdir-check dell'import, il contenuto non viene letto in
-    # quel momento) accanto al modulo, cosi' l'import va a buon fine
-    # indipendentemente da quale scenario lo triggeri per primo.
-    tvp_dir = os.path.dirname(os.path.abspath(
-        __import__("importlib").util.find_spec("test_vqtl_pipeline").origin
-    ))
-    os.makedirs(os.path.join(tvp_dir, "fake_data"), exist_ok=True)
-
     import test_vqtl_pipeline as tvp
-
-    # Import fatto una sola volta per processo: se un secondo scenario
-    # richiama questa funzione nello STESSO processo (caso --workers 1,
-    # sequenziale), il modulo e' gia' in sys.modules e i suoi path non
-    # verrebbero ricalcolati automaticamente. Li sovrascriviamo qui
-    # esplicitamente ad ogni chiamata invece di fidarci dello stato
-    # fissato all'import.
-    tvp.SCRIPT_DIR = work_dir
-    tvp.FAKE = fake_dir
-    tvp.GENERATION = GENERATION
 
     ge_cfg = get_config()
     ge_cfg = _force_cfg_overrides(ge_cfg, {
@@ -469,8 +453,12 @@ def run_vqtl_asymptotic(fake_dir: str, work_dir: str) -> dict:
     n_null_truth = int((truth["effect_type"] == "no_effect").sum())
     print(f"Ground truth: {len(causal_gxe)} G×E causali, {len(causal_pure_var)} vQTL pure, {n_null_truth} nulle")
 
+    # work_dir e GENERATION passati esplicitamente (non piu' monkey-patchati
+    # sul modulo tvp): sicuro da richiamare per piu' scenari di fila nello
+    # stesso processo, vedi docstring di test_vqtl_pipeline.py.
     summary = tvp.run_pipeline_for_method(
         "asymptotic", ge_cfg, vcfg_base, truth, all_causal, n_null_truth,
+        work_dir=work_dir, generation=GENERATION,
     )
     return summary
 
@@ -506,7 +494,7 @@ def run_scenario(name: str, gen_params: dict, n_workers: int = 1) -> dict:
         vqtl_n_jobs = max(1, (os.cpu_count() or 2) // max(1, n_workers))
         _set_common_env(fake_dir, scenario_dir, vqtl_n_jobs=vqtl_n_jobs)
 
-        section(f"[{name}] Parte gene-ambiente (run_pipeline_test)")
+        section(f"[{name}] Parte gene-ambiente")
         result["ge_interaction"] = run_ge_interaction(fake_dir, scenario_dir)
 
         section(f"[{name}] Parte vQTL — debug (asymptotic vs bootstrap, sottoinsieme)")
@@ -536,19 +524,25 @@ def _run_scenario_worker(name: str, n_workers: int) -> dict:
     return run_scenario(name, SCENARIOS[name], n_workers=n_workers)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Orchestratore multi-scenario")
-    parser.add_argument("scenarios", nargs="*", help="Nomi scenari da lanciare (default: tutti)")
-    parser.add_argument("--workers", type=int, default=1,
-                         help="Numero di scenari da eseguire in parallelo (processi separati). Default 1 (sequenziale).")
-    args = parser.parse_args()
-
-    names = args.scenarios if args.scenarios else list(SCENARIOS.keys())
+def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1) -> dict:
+    """Gira la battery di scenari (tutti, o solo `names` se specificato),
+    scrive i report aggregati sotto SCENARIOS_ROOT e ritorna un dict con:
+      - "all_results":  lista dei result dict di ogni scenario (uno per
+                         scenario, stesso schema di run_scenario())
+      - "summary_df":   pd.DataFrame di riepilogo (stesso contenuto di
+                         all_scenarios_summary.csv)
+      - "failed":       nomi degli scenari falliti per eccezione
+      - "vqtl_failed":  nomi degli scenari con has_failures=True sui
+                         controlli automatici della pipeline vQTL
+      - "has_failures": True se failed o vqtl_failed non sono vuoti
+    Usata sia da main() (CLI standalone) sia da run_isolated_casual_test.py
+    (come "fase scenari" della batteria di test completa)."""
+    names = list(names) if names else list(SCENARIOS.keys())
     unknown = set(names) - set(SCENARIOS)
     if unknown:
         raise SystemExit(f"Scenari sconosciuti: {sorted(unknown)}. Disponibili: {list(SCENARIOS)}")
 
-    n_workers = max(1, args.workers)
+    n_workers = max(1, n_workers)
     os.makedirs(SCENARIOS_ROOT, exist_ok=True)
     all_results = []
     t0 = time.time()
@@ -637,9 +631,28 @@ def main() -> None:
         print(f"\n*** SCENARI FALLITI (eccezione): {failed} ***")
     if vqtl_failed:
         print(f"*** SCENARI CON CONTROLLI vQTL FALLITI (has_failures): {vqtl_failed} ***")
-    if failed or vqtl_failed:
+    if not failed and not vqtl_failed:
+        print("\n*** Tutti gli scenari completati senza errori bloccanti. ***")
+
+    return {
+        "all_results": all_results,
+        "summary_df": summary_df,
+        "failed": failed,
+        "vqtl_failed": vqtl_failed,
+        "has_failures": bool(failed or vqtl_failed),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Orchestratore multi-scenario")
+    parser.add_argument("scenarios", nargs="*", help="Nomi scenari da lanciare (default: tutti)")
+    parser.add_argument("--workers", type=int, default=1,
+                         help="Numero di scenari da eseguire in parallelo (processi separati). Default 1 (sequenziale).")
+    args = parser.parse_args()
+
+    result = run_all_scenarios(names=args.scenarios or None, n_workers=args.workers)
+    if result["has_failures"]:
         sys.exit(1)
-    print("\n*** Tutti gli scenari completati senza errori bloccanti. ***")
 
 
 if __name__ == "__main__":
