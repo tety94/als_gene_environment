@@ -49,6 +49,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # --------------------------------------------------------------------------
 # Column sets
 # --------------------------------------------------------------------------
+OUT_DIR = Path("output/table_annotated")
 
 FULL_COLUMNS = [
     "exposure",
@@ -227,7 +228,7 @@ def main() -> None:
              "dump instead (must have the same columns as get_annotated_results()).",
     )
     parser.add_argument(
-        "--outdir", type=Path, default=Path("."),
+        "--outdir", type=Path, default=OUT_DIR,
         help="Directory to write the .docx files into (default: current directory).",
     )
     args = parser.parse_args()
