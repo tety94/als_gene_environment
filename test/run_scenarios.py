@@ -271,6 +271,17 @@ def run_ge_interaction(fake_dir: str, work_dir: str) -> dict:
         "generation": GENERATION,
         "exposure": "exposure_env",
         "covariates": "sex",
+        # Deve puntare a un path che NON esiste per i dati sintetici: se
+        # lasciato al valore letto dal .env reale del progetto, build_dataset.
+        # _build_narrow_covariates() userebbe la mappa id->generazione VERA
+        # (pazienti reali), che non contiene nessuno degli id sintetici qui
+        # -- ogni riga risulterebbe "generazione sconosciuta" e verrebbe
+        # scartata (sintomo: "N -> 0 righe" nei log, poi crash a valle sullo
+        # StandardScaler per array vuoto). Puntandolo a un path inesistente,
+        # _build_narrow_covariates() prende il ramo "nessuna mappa trovata,
+        # uso tutte le righe", corretto per un dataset sintetico mono-
+        # generazione.
+        "sample_generation_map": os.path.join(fake_dir, "__no_sample_generation_map__.csv"),
     }, context="gene-ambiente")
     configure_logging(cfg.log_dir)
     log = get_logger(__name__)
@@ -347,6 +358,17 @@ def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
         "generation": GENERATION,
         "exposure": "exposure_env",
         "covariates": "sex",
+        # Deve puntare a un path che NON esiste per i dati sintetici: se
+        # lasciato al valore letto dal .env reale del progetto, build_dataset.
+        # _build_narrow_covariates() userebbe la mappa id->generazione VERA
+        # (pazienti reali), che non contiene nessuno degli id sintetici qui
+        # -- ogni riga risulterebbe "generazione sconosciuta" e verrebbe
+        # scartata (sintomo: "N -> 0 righe" nei log, poi crash a valle sullo
+        # StandardScaler per array vuoto). Puntandolo a un path inesistente,
+        # _build_narrow_covariates() prende il ramo "nessuna mappa trovata,
+        # uso tutte le righe", corretto per un dataset sintetico mono-
+        # generazione.
+        "sample_generation_map": os.path.join(fake_dir, "__no_sample_generation_map__.csv"),
     }, context="vqtl-debug")
     configure_logging(ge_cfg.log_dir)
 
@@ -442,6 +464,17 @@ def run_vqtl_asymptotic(fake_dir: str, work_dir: str) -> dict:
         "generation": GENERATION,
         "exposure": "exposure_env",
         "covariates": "sex",
+        # Deve puntare a un path che NON esiste per i dati sintetici: se
+        # lasciato al valore letto dal .env reale del progetto, build_dataset.
+        # _build_narrow_covariates() userebbe la mappa id->generazione VERA
+        # (pazienti reali), che non contiene nessuno degli id sintetici qui
+        # -- ogni riga risulterebbe "generazione sconosciuta" e verrebbe
+        # scartata (sintomo: "N -> 0 righe" nei log, poi crash a valle sullo
+        # StandardScaler per array vuoto). Puntandolo a un path inesistente,
+        # _build_narrow_covariates() prende il ramo "nessuna mappa trovata,
+        # uso tutte le righe", corretto per un dataset sintetico mono-
+        # generazione.
+        "sample_generation_map": os.path.join(fake_dir, "__no_sample_generation_map__.csv"),
     }, context="vqtl-asymptotic")
     configure_logging(ge_cfg.log_dir)
     vcfg_base = get_vqtl_config()
