@@ -189,31 +189,3 @@ isn't there, the corresponding section prints an explicit
 PC-exposure correlation, lambda GC sections) — all `exposures` are still
 run and get their own diagnostics folder, this setting just decides
 which one's numbers go in the Word document.
-
----
-
-## 5. What changed in this rewrite
-
-For anyone comparing against an older version of this pipeline:
-
-- Everything is now in English (code, comments, log/print output,
-  generated report), and orchestrated by `run_pipeline.py` /
-  `pipeline_config.yaml` instead of copy-pasted shell commands per
-  cohort.
-- `extract_pca_covariates.py`'s docstring used to claim the PCA was
-  computed on the pooled gen1+gen2 cohort; that was stale and
-  contradicted the actual per-cohort design — fixed, and the config
-  structure now makes per-cohort PCA the only supported path.
-- Doubled-ID stripping (`NAME_NAME` → `NAME`) used to be silent and
-  unconditional in `interpret_plink_output.py`, but opt-in and logged in
-  `extract_pca_covariates.py`. Both now go through the same
-  `plink_io.strip_doubled_ids()`, opt-in and logged in both places.
-- All the repeated plink2-table-reading code (5 near-identical copies
-  across scripts) is now in `plink_io.py`.
-- `build_supplementary_report.py` used to regex-scrape numbers out of
-  `diagnostics_report.txt`; it now reads `diagnostics_summary.json` (see
-  §4 above).
-- Stale references to a third `gen3` cohort (dropped from the study
-  design a while ago) are gone from comments/docstrings; the bash
-  pipeline's multi-directory input is now documented as "batches within
-  one cohort", which is what it's actually for.

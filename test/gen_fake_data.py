@@ -1,39 +1,38 @@
 """
-Generatore di dataset sintetico (genetica + ambiente + PC di popolazione),
-REFACTOR PARAMETRIZZATO della versione originale.
+Synthetic dataset generator (genetics + environment + population PCs),
+PARAMETRIZED REFACTOR of the original version.
 
-Tutto quello che prima era una costante a modulo (N_PATIENTS, CAUSAL_VARIANTS,
-PURE_VARIANCE_VARIANTS, prop_unexposed, missing rate, RNG_SEED, ecc.) e' ora
-un argomento di `generate_dataset(...)`, cosi' lo stesso generatore puo'
-essere richiamato in loop da uno script di orchestrazione multi-scenario
-(vedi run_scenarios.py) senza duplicare codice o editare costanti a mano
-per ogni run.
+Everything that used to be a module-level constant (N_PATIENTS,
+CAUSAL_VARIANTS, PURE_VARIANCE_VARIANTS, prop_unexposed, missing rate,
+RNG_SEED, etc.) is now an argument of `generate_dataset(...)`, so the same
+generator can be called in a loop from a multi-scenario orchestration script
+(see run_scenarios.py) without duplicating code or hand-editing constants
+for every run.
 
-Lanciato da riga di comando si comporta come lo script originale (stessi
-default), ma accetta due argomenti opzionali:
-  --out-dir       cartella di output (default: <script_dir>/fake_data)
-  --config-json   path a un file JSON con un sottoinsieme dei kwargs di
-                   generate_dataset() da sovrascrivere rispetto ai default
-                   (usato dall'orchestratore multi-scenario)
+When launched from the command line it behaves like the original script
+(same defaults), but accepts two optional arguments:
+  --out-dir       output folder (default: <script_dir>/fake_data)
+  --config-json   path to a JSON file with a subset of generate_dataset()
+                   kwargs to override relative to the defaults (used by the
+                   multi-scenario orchestrator)
 
-NUOVI PARAMETRI PER STRESS-TEST (assenti nella versione originale, tutti
-disattivati di default -> comportamento identico all'originale se non
-specificati):
+NEW STRESS-TEST PARAMETERS (absent from the original version, all disabled
+by default -> identical behaviour to the original if not specified):
 
-  - subpop_frac / subpop_onset_shift / subpop_maf_shift: simulano una
-    struttura di popolazione reale (due sottopopolazioni con MAF e
-    baseline onset_age diversi) che le PC scritte in output NON catturano
-    (le PC restano rumore gaussiano indipendente, come nell'originale) --
-    serve a stressare la correzione per stratificazione: se lambda_GC
-    sale sensibilmente rispetto allo scenario "no stratification", la
-    correzione via PC(inutili, qui) non basta, esattamente come puo'
-    succedere in produzione se le PC caricate non sono informative.
+  - subpop_frac / subpop_onset_shift / subpop_maf_shift: simulate a real
+    population structure (two subpopulations with different MAF and
+    baseline onset_age) that the PCs written to output do NOT capture (the
+    PCs remain independent Gaussian noise, as in the original) -- used to
+    stress-test the correction for stratification: if lambda_GC rises
+    noticeably relative to the "no stratification" scenario, correction via
+    (here, uninformative) PCs is not enough, exactly as can happen in
+    production if the loaded PCs are not informative.
 
-  - nonrandom_missing_carrier_rate: se diverso da None, la probabilita' di
-    missing genotype per i PORTATORI usa questo valore invece di
-    `missing_rate` (i non portatori restano a missing_rate) -- simula
-    missingness informativa (correlata al genotipo), che il semplice
-    dropna() a valle non gestisce in modo speciale.
+  - nonrandom_missing_carrier_rate: if different from None, the probability
+    of missing genotype for CARRIERS uses this value instead of
+    `missing_rate` (non-carriers stay at missing_rate) -- simulates
+    informative missingness (correlated with genotype), which a plain
+    downstream dropna() does not handle specially.
 """
 from __future__ import annotations
 
@@ -48,15 +47,15 @@ import pandas as pd
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_CAUSAL_VARIANTS = {
-    # originali, invariati (retro-compatibilità con gli scenari già girati)
+    # original, unchanged (backward compatibility with scenarios already run)
     "1_1000001_A_G": (-4.5, -1.0),
     "2_2000002_C_T": (4.0, 0.5),
     "3_3000003_G_A": (-3.5, 0.0),
     "4_4000004_T_C": (3.2, -0.5),
     "5_5000005_A_T": (-5.0, 1.0),
 
-    # griglia bilanciata: 16 magnitudini (1.0 -> 8.5, step 0.5), ognuna con
-    # coppia +/-, main effect alternato/decorrelato dal segno interazione
+    # balanced grid: 16 magnitudes (1.0 -> 8.5, step 0.5), each with a +/-
+    # pair, main effect alternated/decorrelated from the interaction sign
     "1_1300000_A_G": (1.0, 0.0),
     "1_1300001_C_T": (-1.0, 0.0),
     "2_1300010_A_G": (1.5, -0.3),
@@ -128,7 +127,7 @@ DEFAULT_CAUSAL_VARIANTS = {
     "4_1300380_A_G": (5.75, -0.37),
     "4_1300381_C_T": (-5.75, 0.37),
 
-    # solo main effect, interazione zero (controllo falsi positivi)
+    # main effect only, zero interaction (false-positive control)
     "5_5200000_A_G": (0.0, 2.0),
     "5_5200001_A_G": (0.0, -2.0),
     "5_5200002_A_G": (0.0, 3.0),
@@ -141,11 +140,11 @@ DEFAULT_CAUSAL_VARIANTS = {
 }
 
 DEFAULT_PURE_VARIANCE_VARIANTS = {
-    # originale
+    # original
     "7_7000001_A_G": {0: 3.0, 1: 12.0},
     "7_7000002_C_T": {0: 12.0, 1: 3.0},
 
-    # 7 coppie aggiuntive, rapporti di varianza diversi, bilanciate lo/hi e hi/lo
+    # 7 additional pairs, different variance ratios, balanced lo/hi and hi/lo
     "7_7400000_A_G": {0: 4.0, 1: 10.0},
     "7_7400001_C_T": {0: 10.0, 1: 4.0},
     "7_7400010_A_G": {0: 5.0, 1: 8.0},
@@ -164,9 +163,9 @@ DEFAULT_PURE_VARIANCE_VARIANTS = {
 
 
 def _stream(rng_seed: int, label: str) -> np.random.Generator:
-    """Generatore casuale indipendente e deterministico per etichetta,
-    seedato su (rng_seed, label) -- vedi docstring originale per il
-    perche' md5 invece di hash() built-in."""
+    """Deterministic, independent random generator per label, seeded on
+    (rng_seed, label) -- see the original docstring for why md5 instead of
+    the built-in hash()."""
     digest = hashlib.md5(f"{rng_seed}:{label}".encode("utf-8")).hexdigest()
     seed = int(digest[:8], 16)
     return np.random.default_rng(seed)
@@ -202,9 +201,10 @@ def generate_dataset(
     subpop_maf_shift: float = 0.0,
     verbose: bool = True,
 ) -> dict:
-    """Genera env.csv, genetic.csv, pca_covariates_gen1.csv, ground_truth.csv
-    in `out_dir`. Ritorna un piccolo dict di summary (utile per log/report
-    dell'orchestratore multi-scenario, senza dover rileggere i CSV)."""
+    """Generates env.csv, genetic.csv, pca_covariates_gen1.csv, ground_truth.csv
+    in `out_dir`. Returns a small summary dict (useful for logging/for the
+    multi-scenario orchestrator's report, without having to re-read the
+    CSVs)."""
 
     causal_variants = dict(DEFAULT_CAUSAL_VARIANTS if causal_variants is None else causal_variants)
     pure_variance_variants = dict(
@@ -219,17 +219,17 @@ def generate_dataset(
     sex = rng_sex.choice(["M", "F"], size=n)
     sex_num = (sex == "M").astype(float)
 
-    # ---- sottopopolazione latente (stress-test stratificazione) ----
-    # Assegnazione binaria NON scritta in output (non e' una covariata
-    # osservabile dalla pipeline) -- simula una struttura di popolazione
-    # reale che le PC (rumore indipendente, vedi sotto) non catturano.
+    # ---- latent subpopulation (stratification stress-test) ----
+    # Binary assignment NOT written to output (it is not a covariate
+    # observable by the pipeline) -- simulates a real population structure
+    # that the PCs (independent noise, see below) do not capture.
     if subpop_frac > 0:
         rng_subpop = _stream(rng_seed, "subpop")
         subpop_b = (rng_subpop.random(n) < subpop_frac).astype(float)
     else:
         subpop_b = np.zeros(n)
 
-    # ---- esposizione ----
+    # ---- exposure ----
     rng_exposure = _stream(rng_seed, "exposure")
     unexposed_mask = rng_exposure.random(n) < prop_unexposed
     exposure = np.empty(n, dtype=float)
@@ -241,7 +241,7 @@ def generate_dataset(
     exposure = np.round(exposure, 2)
     exposure_std_approx = (exposure - exposure.mean()) / exposure.std()
 
-    # ---- genotipi ----
+    # ---- genotypes ----
     variant_labels = (
         list(causal_variants.keys())
         + list(pure_variance_variants.keys())
@@ -253,9 +253,9 @@ def generate_dataset(
     for lab in variant_labels:
         rng_v = _stream(rng_seed, f"variant:{lab}")
         maf = rng_v.uniform(*maf_range)
-        # shift di MAF tra sottopopolazioni (population stratification):
-        # applicato a TUTTE le varianti, quindi anche alle nulle -- e'
-        # proprio questo che, se non corretto, gonfia lambda_GC.
+        # MAF shift between subpopulations (population stratification):
+        # applied to ALL variants, including null ones -- this is exactly
+        # what inflates lambda_GC if left uncorrected.
         maf_eff = np.clip(maf + subpop_maf_shift * subpop_b, 0.001, 0.999)
         dosage_diploid = rng_v.binomial(2, maf_eff).astype(int)
         dosage_binary = (dosage_diploid >= 1).astype(int)
@@ -277,7 +277,7 @@ def generate_dataset(
         dosage_num[miss_mask] = np.nan
         geno_numeric[lab] = dosage_num
 
-    # ---- fenotipo ----
+    # ---- phenotype ----
     rng_noise = _stream(rng_seed, "noise")
     noise = rng_noise.normal(0, noise_sd, size=n)
 
@@ -360,16 +360,16 @@ def generate_dataset(
         "onset_sd": float(onset_age.std()),
     }
     if verbose:
-        print(f"[gen_fake_data] {out_dir}: N={n}, varianti={len(variant_labels)} "
+        print(f"[gen_fake_data] {out_dir}: N={n}, variants={len(variant_labels)} "
               f"({len(causal_variants)} G×E, {len(pure_variance_variants)} vQTL pure, "
-              f"{n_null_variants} nulle), onset={onset_age.mean():.1f}±{onset_age.std():.1f}")
+              f"{n_null_variants} null), onset={onset_age.mean():.1f}±{onset_age.std():.1f}")
     return summary
 
 
 def _cli():
-    parser = argparse.ArgumentParser(description="Genera dataset sintetico per test pipeline gene_environment/vqtl.")
+    parser = argparse.ArgumentParser(description="Generate a synthetic dataset for the gene_environment/vqtl pipeline test.")
     parser.add_argument("--out-dir", default=os.path.join(SCRIPT_DIR, "fake_data"))
-    parser.add_argument("--config-json", default=None, help="JSON con kwargs da passare a generate_dataset()")
+    parser.add_argument("--config-json", default=None, help="JSON with kwargs to pass to generate_dataset()")
     args = parser.parse_args()
 
     kwargs = {}

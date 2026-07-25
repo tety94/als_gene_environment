@@ -1,38 +1,38 @@
 """
-Sostituto in-memory di vqtl/db/repository.py, con la STESSA interfaccia
-pubblica (stessi nomi di funzione, stessi parametri, stesso rename delle
-colonne in output) ma senza alcun MySQL/MariaDB dietro: ogni "tabella" e' un
-dict Python {chiave: riga}, popolato/letto con la stessa semantica di
-INSERT IGNORE / UPDATE / DELETE che il vero repository esprime in SQL.
+In-memory substitute for vqtl/db/repository.py, with the SAME public
+interface (same function names, same parameters, same column renaming on
+output) but with no MySQL/MariaDB behind it: every "table" is a Python dict
+{key: row}, populated/read with the same INSERT IGNORE / UPDATE / DELETE
+semantics that the real repository expresses in SQL.
 
-USO (vedi test_vqtl_pipeline.py):
+USAGE (see test_vqtl_pipeline.py):
     import sys
     import fake_vqtl_repository as fake_repo
     sys.modules["vqtl.db.repository"] = fake_repo
 
-Va fatto PRIMA di chiamare qualunque funzione di vqtl.core.* che faccia
-"from vqtl.db import repository as repo" al suo interno (import locale,
-quindi risolto al momento della chiamata, non all'import del modulo) --
-Python trova "vqtl.db.repository" gia' in sys.modules e non esegue mai il
-vero db/repository.py (che altrimenti fallirebbe all'import perche' importa
-gene_environment.db.connection, non presente in questo ambiente di test).
+Must be done BEFORE calling any vqtl.core.* function that does
+"from vqtl.db import repository as repo" internally (a local import,
+resolved at call time, not at module import time) -- Python finds
+"vqtl.db.repository" already in sys.modules and never executes the real
+db/repository.py (which would otherwise fail on import because it imports
+gene_environment.db.connection, not present in this test environment).
 
-Perche' questo approccio e non chiamate dirette alle funzioni pure
-(_beta_qi_and_asymptotic_se, fit_interaction, ecc.): permette di testare il
-codice di orchestrazione REALE (run_vqtl_scan, filter_candidates,
-run_interaction_tests, run_rge_het, run_robustness_and_permutation) cosi'
-com'e', non una sua reimplementazione parallela nello script di test -- e'
-proprio l'orchestrazione (fingerprint, placeholder, resume, short-circuit,
-rename di colonne fra uno step e l'altro) il punto in cui si sono trovati i
-bug reali (vedi run_vqtl_scan/variant_subset, load_vqtl_dataset/PCA).
+Why this approach instead of calling the pure functions directly
+(_beta_qi_and_asymptotic_se, fit_interaction, etc.): it allows testing the
+REAL orchestration code (run_vqtl_scan, filter_candidates,
+run_interaction_tests, run_rge_het, run_robustness_and_permutation) as-is,
+not a parallel reimplementation of it in the test script -- it is precisely
+the orchestration (fingerprint, placeholders, resume, short-circuit, column
+renaming between one step and the next) where the real bugs were found (see
+run_vqtl_scan/variant_subset, load_vqtl_dataset/PCA).
 """
 from __future__ import annotations
 
 import pandas as pd
 
 # ============================================================
-# Storage: un dict per "tabella", stesso nome della tabella SQL reale.
-# Chiave = tupla della primary key (stessa composizione di db/schema.sql).
+# Storage: one dict per "table", same name as the real SQL table.
+# Key = primary-key tuple (same composition as db/schema.sql).
 # ============================================================
 
 _scan_results: dict[tuple, dict] = {}
@@ -53,8 +53,8 @@ _KEYED_STORES = {
 
 
 def reset_all() -> None:
-    """Svuota tutte le tabelle finte -- utile fra un run e l'altro dello
-    script di test se si vuole ripartire da zero senza riavviare il processo."""
+    """Empties all fake tables -- useful between runs of the test script if
+    you want to start fresh without restarting the process."""
     for d in (
         _scan_results, _scan_results_significant, _scan_runs,
         _interaction_results, _interaction_results_significant,
@@ -177,7 +177,7 @@ def get_candidates(generation: int) -> pd.DataFrame:
 
 
 # ============================================================
-# Tabelle "keyed" generiche: interaction / rge_het / robustness / permutation
+# Generic "keyed" tables: interaction / rge_het / robustness / permutation
 # ============================================================
 
 _STAT_COLS = {

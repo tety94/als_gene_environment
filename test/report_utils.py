@@ -1,19 +1,23 @@
 """
-Utility condivise di export (CSV + Word) e di verifica automatica
-(assert-based) usate da test_vqtl_pipeline.py (report per singolo
-se_method) e da run_scenarios.py (recap per singolo scenario + report
-aggregato su tutti gli scenari).
+Shared export utilities (CSV + Word) and automated (assert-based) checks
+used by test_vqtl_pipeline.py (report per single se_method) and by
+run_scenarios.py (recap per single scenario + aggregate report across all
+scenarios).
 
-Contenuto, in ordine:
-  1) export_csv                                  -- export CSV generico
-  2) CheckResult / CheckSuite / run_checks        -- controlli PASS/WARN/FAIL
-     sull'esito della pipeline vQTL (usati da test_vqtl_pipeline.py)
-  3) export_docx                                  -- report Word per singolo
-     se_method della pipeline vQTL (Step 3-7)
-  4) build_recap / generate_recap                 -- incrocio ground_truth
-     vs pipeline_results.csv (parte gene-ambiente) -> summary + detail + docx
-  5) generate_multi_scenario_recap                -- aggregazione dei recap
-     di piu' scenari in un unico report Word
+Contents, in order:
+  1) export_csv                                  -- generic CSV export
+  2) CheckResult / CheckSuite / run_checks        -- PASS/WARN/FAIL checks
+     on the vQTL pipeline outcome (used by test_vqtl_pipeline.py)
+  3) export_docx                                  -- Word report for a
+     single se_method of the vQTL pipeline (Step 3-7)
+  4) build_recap / generate_recap                 -- cross ground_truth vs
+     pipeline_results.csv (gene-environment part) -> summary + detail + docx
+  5) generate_multi_scenario_recap                -- aggregation of the
+     recaps of several scenarios into a single Word report
+  6) build_scenario_comparison_table /
+     write_manuscript_scenario_report              -- manuscript-ready
+     scenario-by-scenario comparison table (G×E + vQTL metrics together),
+     with an optional embedded figure (e.g. the isolated-test power curve)
 """
 from __future__ import annotations
 
@@ -50,8 +54,8 @@ def export_csv(df: pd.DataFrame, tables_dir: str, name: str) -> str:
 
 
 # ============================================================
-# Controlli automatici (PASS / WARN / FAIL) -- non solo stampa per
-# revisione umana: qui si decide se il test e' passato o no.
+# Automated checks (PASS / WARN / FAIL) -- not just printed for human
+# review: this is where pass/fail is actually decided.
 # ============================================================
 
 @dataclass
@@ -83,7 +87,7 @@ class CheckSuite:
 
     def print_report(self) -> None:
         print("\n" + "-" * 78)
-        print(f"{'CHECK':<45}{'ESITO':<8}DETTAGLIO")
+        print(f"{'CHECK':<45}{'OUTCOME':<8}DETAIL")
         print("-" * 78)
         for r in self.results:
             print(f"{r.name:<45}{r.level:<8}{r.detail}")
@@ -108,47 +112,49 @@ def run_checks(
 ) -> CheckSuite:
     suite = CheckSuite()
 
-    # 1. lambda_GC ragionevolmente vicino a 1. La P asintotica e' nota per
-    #    essere anti-conservativa (vedi WARNING di filter_candidates), quindi
-    #    qui trattiamo uno scostamento forte come WARN, non FAIL: e' un
-    #    segnale da controllare in filter_candidates/scan, non un crash del
-    #    test in se'.
+    # 1. lambda_GC reasonably close to 1. The asymptotic P is known to be
+    #    anti-conservative (see the WARNING in filter_candidates), so a
+    #    strong deviation is treated here as WARN, not FAIL: it is a signal
+    #    to check in filter_candidates/scan, not a failure of the test
+    #    itself.
     suite.add(
-        "lambda_GC vicino a 1",
+        "lambda_GC close to 1",
         0.8 <= lambda_gc <= 1.5,
-        f"lambda_GC={lambda_gc:.3f} (atteso in [0.8, 1.5])",
+        f"lambda_GC={lambda_gc:.3f} (expected in [0.8, 1.5])",
         warn_only=True,
     )
 
-    # 2. Almeno una variante causale recuperata fra i candidati: se ZERO,
-    #    e' un fallimento vero (lo scan/filtro non funziona affatto).
+    # 2. At least one causal variant recovered among the candidates: if
+    #    ZERO, this is a real failure (the scan/filter is not working at
+    #    all).
     suite.add(
-        "Almeno 1 variante causale fra i candidati",
+        "At least 1 causal variant among the candidates",
         len(found_causal) >= 1,
-        f"{len(found_causal)}/{len(all_causal)} causali recuperate: {sorted(found_causal) or '[]'}",
+        f"{len(found_causal)}/{len(all_causal)} causal variants recovered: {sorted(found_causal) or '[]'}",
     )
 
-    # 3. Maggioranza delle causali recuperata (soglia indicativa, non 100%:
-    #    e' un test statistico su dati sintetici, non deterministico).
+    # 3. Majority of causal variants recovered (indicative threshold, not
+    #    100%: this is a statistical test on synthetic data, not
+    #    deterministic).
     frac = len(found_causal) / len(all_causal) if all_causal else 0.0
     suite.add(
-        "Recupero causali >= 50%",
+        "Causal recovery >= 50%",
         frac >= 0.5,
-        f"{frac:.0%} delle {len(all_causal)} causali recuperate fra i candidati",
+        f"{frac:.0%} of the {len(all_causal)} causal variants recovered among the candidates",
         warn_only=True,
     )
 
     if candidates.empty or interaction_df_display.empty:
-        suite.skip("Step 5+: interazione/permutazione", "nessun candidato disponibile, step 5-7 non eseguiti")
+        suite.skip("Step 5+: interaction/permutation", "no candidates available, steps 5-7 not run")
         return suite
 
     gxe_rows = interaction_df_display[interaction_df_display["effect_type"] == "gxe_meanshift"]
     pv_rows = interaction_df_display[interaction_df_display["effect_type"] == "pure_variance"]
 
-    # 4. Le G×E causali fra i candidati devono avere interazione
-    #    significativa con segno coerente.
+    # 4. Causal G×E variants among the candidates must have a significant
+    #    interaction with a consistent sign.
     if gxe_rows.empty:
-        suite.skip("G×E: interazione significativa e segno coerente", "nessuna variante G×E fra i candidati in questo run")
+        suite.skip("G×E: significant interaction with consistent sign", "no G×E variant among the candidates in this run")
     else:
         sign_ok = (
             (gxe_rows["pval"] < alpha)
@@ -156,48 +162,48 @@ def run_checks(
         )
         n_ok = int(sign_ok.sum())
         suite.add(
-            "G×E: interazione significativa e segno coerente",
+            "G×E: significant interaction with consistent sign",
             n_ok == len(gxe_rows),
-            f"{n_ok}/{len(gxe_rows)} G×E con pval<{alpha} e segno coerente",
+            f"{n_ok}/{len(gxe_rows)} G×E with pval<{alpha} and consistent sign",
         )
 
-    # 5. Le vQTL pure NON devono mostrare interazione significativa (falso
-    #    positivo del test di interazione).
+    # 5. Pure vQTL variants must NOT show a significant interaction (false
+    #    positive of the interaction test).
     if pv_rows.empty:
-        suite.skip("vQTL pure: nessun falso positivo di interazione", "nessuna vQTL pura fra i candidati in questo run")
+        suite.skip("Pure vQTL: no interaction false positives", "no pure vQTL variant among the candidates in this run")
     else:
         n_falsepos = int((pv_rows["pval"] < alpha).sum())
         suite.add(
-            "vQTL pure: nessun falso positivo di interazione",
+            "Pure vQTL: no interaction false positives",
             n_falsepos == 0,
-            f"{n_falsepos}/{len(pv_rows)} vQTL pure con interazione falsamente significativa",
+            f"{n_falsepos}/{len(pv_rows)} pure vQTL with a falsely significant interaction",
         )
 
-    # 6. Empirical pval (Step 7) basso per le G×E causali fra i top loci
-    #    permutati -- conferma indipendente dello Step 5.
+    # 6. Low empirical pval (Step 7) for causal G×E variants among the top
+    #    permuted loci -- independent confirmation of Step 5.
     perm_gxe = perm_df_display[perm_df_display["effect_type"] == "gxe_meanshift"] if not perm_df_display.empty else perm_df_display
     if perm_gxe is None or perm_gxe.empty:
-        suite.skip("G×E: empirical_pval basso (Step 7)", "nessuna G×E fra i top loci permutati in questo run")
+        suite.skip("G×E: low empirical_pval (Step 7)", "no G×E variant among the top permuted loci in this run")
     else:
         n_ok = int((perm_gxe["empirical_pval"] < alpha).sum())
         suite.add(
-            "G×E: empirical_pval basso (Step 7)",
+            "G×E: low empirical_pval (Step 7)",
             n_ok == len(perm_gxe),
-            f"{n_ok}/{len(perm_gxe)} G×E con empirical_pval<{alpha}",
-            warn_only=True,  # 500 permutazioni: potenza limitata, non deterministico
+            f"{n_ok}/{len(perm_gxe)} G×E with empirical_pval<{alpha}",
+            warn_only=True,  # 500 permutations: limited power, not deterministic
         )
 
-    # 7. Levene basso per le vQTL pure fra i top loci permutati (segnale di
-    #    eteroschedasticita' anche senza interazione).
+    # 7. Low Levene p-value for pure vQTL variants among the top permuted
+    #    loci (heteroscedasticity signal even without interaction).
     perm_pv = perm_df_display[perm_df_display["effect_type"] == "pure_variance"] if not perm_df_display.empty else perm_df_display
     if perm_pv is None or perm_pv.empty:
-        suite.skip("vQTL pure: levene_pval basso (Step 7)", "nessuna vQTL pura fra i top loci permutati in questo run")
+        suite.skip("Pure vQTL: low levene_pval (Step 7)", "no pure vQTL variant among the top permuted loci in this run")
     else:
         n_ok = int((perm_pv["levene_pval"] < 0.1).sum())
         suite.add(
-            "vQTL pure: levene_pval basso (Step 7)",
+            "Pure vQTL: low levene_pval (Step 7)",
             n_ok == len(perm_pv),
-            f"{n_ok}/{len(perm_pv)} vQTL pure con levene_pval<0.10",
+            f"{n_ok}/{len(perm_pv)} pure vQTL with levene_pval<0.10",
             warn_only=True,
         )
 
@@ -223,7 +229,7 @@ def _set_cell_shading(cell, hex_color: str) -> None:
 
 def _add_df_table(doc: Document, df: pd.DataFrame, highlight_col: str | None = "effect_type") -> None:
     if df.empty:
-        doc.add_paragraph("(nessun dato)").italic = True
+        doc.add_paragraph("(no data)").italic = True
         return
     table = doc.add_table(rows=1, cols=len(df.columns))
     table.style = "Table Grid"
@@ -261,38 +267,38 @@ def export_docx(
     check_suite: CheckSuite,
     tables: list[tuple[str, str, pd.DataFrame]],
 ) -> str:
-    """tables: lista di (titolo, nota, dataframe) nell'ordine desiderato."""
+    """tables: list of (title, note, dataframe) in the desired order."""
     doc = Document()
 
-    title = doc.add_heading(f"Report pipeline vQTL — generazione {generation}", level=0)
+    title = doc.add_heading(f"vQTL pipeline report — generation {generation}", level=0)
 
-    # ---- Riepilogo ----
-    doc.add_heading("Riepilogo", level=1)
+    # ---- Summary ----
+    doc.add_heading("Summary", level=1)
     for line in [
         f"lambda_GC: {summary['lambda_gc']}",
-        f"Causali recuperate come candidati: {summary['n_found_causal']}/{summary['n_causal_total']} "
-        f"({', '.join(summary['found_causal']) or 'nessuna'})",
-        f"Falsi positivi fra i candidati: {summary['n_false_positives']}/{summary['n_null_truth']}",
-        f"G×E con interazione significativa (Step 5): {summary['n_gxe_sig']}/{summary['n_gxe_total']}",
-        f"vQTL pure con interazione falsamente significativa (Step 5, atteso 0): "
+        f"Causal variants recovered as candidates: {summary['n_found_causal']}/{summary['n_causal_total']} "
+        f"({', '.join(summary['found_causal']) or 'none'})",
+        f"False positives among the candidates: {summary['n_false_positives']}/{summary['n_null_truth']}",
+        f"G×E with significant interaction (Step 5): {summary['n_gxe_sig']}/{summary['n_gxe_total']}",
+        f"Pure vQTL with a falsely significant interaction (Step 5, expected 0): "
         f"{summary['n_pv_falsepos']}/{summary['n_pv_total']}",
     ]:
         doc.add_paragraph(line)
 
-    # ---- Esito controlli automatici ----
-    doc.add_heading("Esito dei controlli automatici", level=1)
-    overall = "FALLITO" if check_suite.has_failures else "SUPERATO"
+    # ---- Automated check outcome ----
+    doc.add_heading("Automated check outcome", level=1)
+    overall = "FAILED" if check_suite.has_failures else "PASSED"
     p = doc.add_paragraph()
-    run = p.add_run(f"Esito complessivo: {overall}")
+    run = p.add_run(f"Overall outcome: {overall}")
     run.bold = True
     run.font.color.rgb = RGBColor(0xC0, 0x00, 0x00) if check_suite.has_failures else RGBColor(0x00, 0x80, 0x00)
 
     check_df = pd.DataFrame(check_suite.to_list())
     if not check_df.empty:
-        check_df = check_df.rename(columns={"name": "controllo", "level": "esito", "detail": "dettaglio"})
+        check_df = check_df.rename(columns={"name": "check", "level": "outcome", "detail": "detail"})
         _add_df_table(doc, check_df, highlight_col=None)
 
-    # ---- Tabelle per step ----
+    # ---- Per-step tables ----
     for title_text, note_text, df in tables:
         doc.add_heading(title_text, level=1)
         if note_text:
@@ -308,18 +314,18 @@ def export_docx(
 
 
 # ============================================================
-# Recap gene-ambiente: incrocia ground_truth.csv (verita' nota, da
-# gen_fake_data.py) con l'output REALE della pipeline (pipeline_results.csv,
-# da modeling.process_single_variant) e produce sempre 3 file nella cartella
-# indicata:
-#   - recap_summary.json  -> numeri aggregati (potenza per segno/magnitudine,
-#                             falsi positivi sulle nulle, ecc.)
-#   - recap_detail.csv    -> una riga per variante, con esito (TP/FN/FP/TN)
-#   - recap_report.docx   -> stesso contenuto in tabelle Word, leggibile
-#                             senza aprire CSV/JSON
-# Chiamato in automatico alla fine di ogni scenario/variante isolata dagli
-# script di orchestrazione (run_scenarios.py, run_isolated_casual_test.py)
-# -- non serve lanciarlo a mano. Richiede python-docx.
+# Gene-environment recap: crosses ground_truth.csv (known truth, from
+# gen_fake_data.py) with the REAL pipeline output (pipeline_results.csv,
+# from modeling.process_single_variant) and always produces 3 files in the
+# given folder:
+#   - recap_summary.json  -> aggregate numbers (power by sign/magnitude,
+#                             false positives on the null variants, etc.)
+#   - recap_detail.csv    -> one row per variant, with outcome (TP/FN/FP/TN)
+#   - recap_report.docx   -> same content in Word tables, readable without
+#                             opening the CSV/JSON
+# Called automatically at the end of every scenario/isolated variant by the
+# orchestration scripts (run_scenarios.py, run_isolated_casual_test.py) --
+# no need to run it by hand. Requires python-docx.
 # ============================================================
 
 MAGNITUDE_BINS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, np.inf]
@@ -327,7 +333,7 @@ MAGNITUDE_LABELS = ["0-1", "1-2", "2-3", "3-4", "4-5", "5-6", "6-7", "7-8", "8-9
 
 
 # ============================================================
-# 1) Incrocio ground_truth / pipeline_results -> detail + summary
+# 1) Cross ground_truth / pipeline_results -> detail + summary
 # ============================================================
 
 def _classify_row(row: pd.Series, pvalue_threshold: float) -> dict:
@@ -341,17 +347,17 @@ def _classify_row(row: pd.Series, pvalue_threshold: float) -> dict:
 
     if effect_type == "gxe_meanshift" and true_inter != 0:
         category, sign = "gxe_interaction", ("pos" if true_inter > 0 else "neg")
-        outcome = "TP (trovata)" if detected else "FN (mancata)"
+        outcome = "TP (found)" if detected else "FN (missed)"
     elif effect_type == "gxe_meanshift" and true_inter == 0:
-        # solo main effect, interazione vera = 0 -> controllo falsi positivi
+        # main effect only, true interaction = 0 -> false-positive control
         category, sign = "main_only_control", "zero"
-        outcome = "FP (falsa interazione)" if detected else "TN (corretto)"
+        outcome = "FP (spurious interaction)" if detected else "TN (correct)"
     elif effect_type == "pure_variance":
         category, sign = "pure_variance", "n/a"
-        outcome = "n/a (vedi step vQTL)"
+        outcome = "n/a (see vQTL step)"
     else:
         category, sign = "null", "zero"
-        outcome = "FP (falso positivo)" if detected else "TN (corretto)"
+        outcome = "FP (false positive)" if detected else "TN (correct)"
 
     return dict(
         category=category, sign=sign, magnitude=abs(true_inter), detected=detected,
@@ -412,15 +418,15 @@ def build_recap(ground_truth_df: pd.DataFrame, pipeline_results_df: pd.DataFrame
         ),
         pure_variance=dict(
             n=int(len(pv)),
-            note="Non testate dal modello G×E (obs_coef/p_emp non applicabili); "
-                 "vedi lo step vQTL (step3-7) per l'esito su queste varianti.",
+            note="Not tested by the G×E model (obs_coef/p_emp not applicable); "
+                 "see the vQTL step (step3-7) for the outcome on these variants.",
         ),
     )
     return detail, summary
 
 
 # ============================================================
-# 2) Scrittura JSON + CSV
+# 2) JSON + CSV writing
 # ============================================================
 
 def write_json(summary: dict, path: str) -> None:
@@ -433,7 +439,7 @@ def write_csv(detail: pd.DataFrame, path: str) -> None:
 
 
 # ============================================================
-# 3) Scrittura DOCX (python-docx, nessuna dipendenza da Node/docx-js)
+# 3) DOCX writing (python-docx, no dependency on Node/docx-js)
 # ============================================================
 
 def _add_table(doc: Document, headers: list[str], rows: list[list[str]], col_widths_cm: list[float] | None = None):
@@ -460,53 +466,53 @@ def _pct(x) -> str:
     return "n/a" if x is None else f"{x * 100:.1f}%"
 
 
-def write_docx(summary: dict, detail: pd.DataFrame, path: str, title: str = "Report di validazione — pipeline G×E") -> None:
+def write_docx(summary: dict, detail: pd.DataFrame, path: str, title: str = "Validation report — G×E pipeline") -> None:
     doc = Document()
 
     h = doc.add_heading(title, level=0)
     h.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
     meta = doc.add_paragraph()
-    meta.add_run(f"Generato: {summary['generated_at']}    ").italic = True
-    meta.add_run(f"Soglia p-value: {summary['pvalue_threshold']}").italic = True
+    meta.add_run(f"Generated: {summary['generated_at']}    ").italic = True
+    meta.add_run(f"P-value threshold: {summary['pvalue_threshold']}").italic = True
 
-    # ---- Riepilogo generale ----
-    doc.add_heading("Riepilogo generale", level=1)
+    # ---- General summary ----
+    doc.add_heading("General summary", level=1)
     gxe, mo, nu, pv = (summary["gxe_interaction"], summary["main_only_control"],
                        summary["null_genomewide"], summary["pure_variance"])
     _add_table(
         doc,
-        ["Categoria", "N", "N rilevate/FP", "Tasso"],
+        ["Category", "N", "N detected/FP", "Rate"],
         [
-            ["Varianti causali G×E (potenza)", gxe["n"], gxe["n_detected"], _pct(gxe["power_overall"])],
-            ["Controllo solo-main (falsi positivi attesi 0)", mo["n"], mo["n_false_interaction"], _pct(mo["false_positive_rate"])],
-            ["Varianti nulle genome-wide (falsi positivi attesi ≈ soglia)", nu["n"], nu["n_false_positive"], _pct(nu["false_positive_rate"])],
-            ["Pure variance (vQTL, non nel modello G×E)", pv["n"], "-", "vedi step vQTL"],
+            ["Causal G×E variants (power)", gxe["n"], gxe["n_detected"], _pct(gxe["power_overall"])],
+            ["Main-only control (expected 0 false positives)", mo["n"], mo["n_false_interaction"], _pct(mo["false_positive_rate"])],
+            ["Genome-wide null variants (expected false positives ≈ threshold)", nu["n"], nu["n_false_positive"], _pct(nu["false_positive_rate"])],
+            ["Pure variance (vQTL, not in the G×E model)", pv["n"], "-", "see vQTL step"],
         ],
         col_widths_cm=[8, 2, 3, 3],
     )
 
-    # ---- Potenza per segno ----
-    doc.add_heading("Potenza per segno dell'interazione", level=1)
+    # ---- Power by sign ----
+    doc.add_heading("Power by interaction sign", level=1)
     rows = []
-    for s, lab in [("pos", "Positivo"), ("neg", "Negativo")]:
+    for s, lab in [("pos", "Positive"), ("neg", "Negative")]:
         d = gxe["by_sign"][s]
         rows.append([lab, d["n"], d["n_detected"], _pct(d["power"])])
-    _add_table(doc, ["Segno", "N", "N rilevate", "Potenza"], rows, col_widths_cm=[5, 3, 3, 3])
+    _add_table(doc, ["Sign", "N", "N detected", "Power"], rows, col_widths_cm=[5, 3, 3, 3])
 
-    # ---- Potenza per magnitudine ----
-    doc.add_heading("Potenza per magnitudine di |beta_interazione|", level=1)
+    # ---- Power by magnitude ----
+    doc.add_heading("Power by |beta_interaction| magnitude", level=1)
     rows = []
     for lab, d in gxe["by_magnitude"].items():
         rows.append([lab, d["n"], _pct(d["power"]), d["n_pos"], _pct(d["power_pos"]), d["n_neg"], _pct(d["power_neg"])])
     _add_table(
         doc,
-        ["Bin |beta|", "N tot", "Potenza tot", "N pos", "Potenza pos", "N neg", "Potenza neg"],
+        ["|beta| bin", "N total", "Power total", "N pos", "Power pos", "N neg", "Power neg"],
         rows, col_widths_cm=[3, 2, 3, 2, 3, 2, 3],
     )
 
-    # ---- Dettaglio varianti causali G×E ----
-    doc.add_heading("Dettaglio varianti causali G×E", level=1)
+    # ---- Detail of causal G×E variants ----
+    doc.add_heading("Detail of causal G×E variants", level=1)
     gxe_detail = detail[detail.category == "gxe_interaction"].sort_values("magnitude", ascending=False)
     rows = []
     for _, r in gxe_detail.iterrows():
@@ -516,31 +522,31 @@ def write_docx(summary: dict, detail: pd.DataFrame, path: str, title: str = "Rep
             "" if pd.isna(r["p_emp"]) else f"{r['p_emp']:.3f}",
             r["outcome"],
         ])
-    _add_table(doc, ["Variante", "beta vero", "beta osservato", "p_emp", "esito"], rows,
+    _add_table(doc, ["Variant", "true beta", "observed beta", "p_emp", "outcome"], rows,
                col_widths_cm=[4, 2.5, 2.5, 2, 4])
 
-    # ---- Controllo falsi positivi solo-main ----
+    # ---- Main-only false-positive control ----
     if mo["n"] > 0:
-        doc.add_heading("Controllo falsi positivi (solo main effect, interazione vera = 0)", level=1)
+        doc.add_heading("False-positive control (main effect only, true interaction = 0)", level=1)
         mo_detail = detail[detail.category == "main_only_control"]
         rows = [[r["variant"], f"{r['true_beta_main']:.2f}",
                  "" if pd.isna(r["p_emp"]) else f"{r['p_emp']:.3f}", r["outcome"]]
                 for _, r in mo_detail.iterrows()]
-        _add_table(doc, ["Variante", "beta_main vero", "p_emp", "esito"], rows, col_widths_cm=[4, 3, 3, 5])
+        _add_table(doc, ["Variant", "true beta_main", "p_emp", "outcome"], rows, col_widths_cm=[4, 3, 3, 5])
 
-    # ---- Falsi positivi sulle nulle ----
-    doc.add_heading("Falsi positivi su varianti nulle genome-wide", level=1)
+    # ---- False positives on null variants ----
+    doc.add_heading("False positives on genome-wide null variants", level=1)
     p = doc.add_paragraph()
     p.add_run(
-        f"{nu['n_false_positive']} / {nu['n']} varianti nulle risultate significative "
-        f"(p_emp < {summary['pvalue_threshold']}) — tasso {_pct(nu['false_positive_rate'])}."
+        f"{nu['n_false_positive']} / {nu['n']} null variants came out significant "
+        f"(p_emp < {summary['pvalue_threshold']}) — rate {_pct(nu['false_positive_rate'])}."
     )
     fp_null = detail[(detail.category == "null") & (detail.detected)]
     if len(fp_null) > 0:
         rows = [[r["variant"], "" if pd.isna(r["obs_coef"]) else f"{r['obs_coef']:.2f}",
                  "" if pd.isna(r["p_emp"]) else f"{r['p_emp']:.3f}"]
                 for _, r in fp_null.iterrows()]
-        _add_table(doc, ["Variante", "beta osservato", "p_emp"], rows, col_widths_cm=[5, 4, 4])
+        _add_table(doc, ["Variant", "observed beta", "p_emp"], rows, col_widths_cm=[5, 4, 4])
 
     for run in doc.paragraphs[0].runs:
         run.font.size = Pt(20)
@@ -549,16 +555,17 @@ def write_docx(summary: dict, detail: pd.DataFrame, path: str, title: str = "Rep
 
 
 # ============================================================
-# 4) Funzione "tutto in uno", da chiamare a fine pipeline
+# 4) "All-in-one" function, to be called at the end of the pipeline
 # ============================================================
 
 def generate_recap(ground_truth_path: str, pipeline_results_path: str, out_dir: str,
                     pvalue_threshold: float = 0.05) -> dict:
-    """Legge i due CSV, scrive recap_summary.json / recap_detail.csv / recap_report.docx
-    in out_dir, e ritorna il dict di summary (utile per loggarlo o per il
-    report riassuntivo multi-scenario, vedi generate_multi_scenario_recap sotto).
-    Ritorna anche 'detail' dentro il dict (chiave privata "_detail") cosi'
-    run_scenarios.py non deve rileggere il CSV da disco per l'aggregazione."""
+    """Reads the two CSVs, writes recap_summary.json / recap_detail.csv /
+    recap_report.docx to out_dir, and returns the summary dict (useful for
+    logging or for the multi-scenario summary report, see
+    generate_multi_scenario_recap below). Also returns 'detail' inside the
+    dict (private key "_detail") so run_scenarios.py does not have to
+    re-read the CSV from disk for the aggregation."""
     os.makedirs(out_dir, exist_ok=True)
     gt = pd.read_csv(ground_truth_path)
     pr = pd.read_csv(pipeline_results_path)
@@ -568,17 +575,17 @@ def generate_recap(ground_truth_path: str, pipeline_results_path: str, out_dir: 
     write_csv(detail, os.path.join(out_dir, "recap_detail.csv"))
     write_docx(summary, detail, os.path.join(out_dir, "recap_report.docx"))
 
-    summary["_detail"] = detail  # comodo per l'aggregazione, non finisce nel JSON (vedi write_json)
+    summary["_detail"] = detail  # handy for aggregation, does not end up in the JSON (see write_json)
     return summary
 
 
 # ============================================================
-# 5) Report finale UNICO su tutti gli scenari
+# 5) SINGLE final report across all scenarios
 # ============================================================
 
 def load_scenario_recap(recap_dir: str) -> tuple[pd.DataFrame, dict]:
-    """Rilegge da disco l'output di generate_recap() per uno scenario
-    (utile se non hai piu' in memoria il dict/detail, es. run separati)."""
+    """Re-reads generate_recap()'s output from disk for a scenario (useful
+    if the dict/detail is no longer in memory, e.g. separate runs)."""
     detail = pd.read_csv(os.path.join(recap_dir, "recap_detail.csv"))
     with open(os.path.join(recap_dir, "recap_summary.json")) as f:
         summary = json.load(f)
@@ -592,19 +599,19 @@ def _rate(df: pd.DataFrame, mask=None):
 
 def generate_multi_scenario_recap(scenario_summaries: dict[str, dict], out_dir: str,
                                    pvalue_threshold: float = 0.05,
-                                   title: str = "Report di validazione — riepilogo tutti gli scenari") -> dict:
+                                   title: str = "Validation report — summary across all scenarios") -> dict:
     """
-    scenario_summaries: {nome_scenario: summary_dict}, dove summary_dict e'
-    quello ritornato da generate_recap() per QUELLO scenario (deve avere
-    la chiave "_detail" con il DataFrame -- se invece lo stai rileggendo da
-    disco in un secondo momento, usa load_scenario_recap() e costruisci tu
-    il dict {nome: {**summary, "_detail": detail}} prima di chiamare questa
-    funzione).
+    scenario_summaries: {scenario_name: summary_dict}, where summary_dict is
+    what generate_recap() returned for THAT scenario (must have the
+    "_detail" key with the DataFrame -- if instead you are re-reading it
+    from disk later, use load_scenario_recap() and build the
+    {name: {**summary, "_detail": detail}} dict yourself before calling
+    this function).
 
-    Scrive in out_dir:
-      - all_scenarios_summary.json  (per-scenario + aggregato su tutti)
-      - all_scenarios_detail.csv    (concatenato, con colonna 'scenario')
-      - all_scenarios_report.docx   (tabella di confronto + potenza aggregata)
+    Writes to out_dir:
+      - all_scenarios_summary.json  (per-scenario + aggregated across all)
+      - all_scenarios_detail.csv    (concatenated, with a 'scenario' column)
+      - all_scenarios_report.docx   (comparison table + aggregate power)
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -619,7 +626,7 @@ def generate_multi_scenario_recap(scenario_summaries: dict[str, dict], out_dir: 
     null_ = combined[combined.category == "null"]
     mo = combined[combined.category == "main_only_control"]
 
-    # ---- confronto per scenario ----
+    # ---- per-scenario comparison ----
     per_scenario_rows = []
     for name, summary in scenario_summaries.items():
         g = summary["gxe_interaction"]
@@ -631,7 +638,7 @@ def generate_multi_scenario_recap(scenario_summaries: dict[str, dict], out_dir: 
             fp_rate_null=n["false_positive_rate"],
         ))
 
-    # ---- aggregato su tutti gli scenari insieme ----
+    # ---- aggregate across all scenarios together ----
     by_sign_agg = {
         s: dict(n=int((gxe.sign == s).sum()), n_detected=int(gxe[gxe.sign == s]["detected"].sum()),
                 power=_rate(gxe, gxe.sign == s))
@@ -654,7 +661,7 @@ def generate_multi_scenario_recap(scenario_summaries: dict[str, dict], out_dir: 
         n_scenarios=len(scenario_summaries),
         per_scenario=per_scenario_rows,
         aggregate=dict(
-            n_gxe_observations=int(len(gxe)),  # nota: stesse varianti replicate su piu' scenari, non indipendenti
+            n_gxe_observations=int(len(gxe)),  # note: same variants replicated across scenarios, not independent
             power_overall=_rate(gxe),
             by_sign=by_sign_agg,
             by_magnitude=by_magnitude_agg,
@@ -678,11 +685,11 @@ def _write_multi_docx(agg_summary: dict, path: str, title: str) -> None:
     h.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
     meta = doc.add_paragraph()
-    meta.add_run(f"Generato: {agg_summary['generated_at']}    ").italic = True
-    meta.add_run(f"Scenari: {agg_summary['n_scenarios']}    ").italic = True
-    meta.add_run(f"Soglia p-value: {agg_summary['pvalue_threshold']}").italic = True
+    meta.add_run(f"Generated: {agg_summary['generated_at']}    ").italic = True
+    meta.add_run(f"Scenarios: {agg_summary['n_scenarios']}    ").italic = True
+    meta.add_run(f"P-value threshold: {agg_summary['pvalue_threshold']}").italic = True
 
-    doc.add_heading("Confronto tra scenari", level=1)
+    doc.add_heading("Comparison across scenarios", level=1)
     rows = []
     for r in agg_summary["per_scenario"]:
         rows.append([
@@ -691,43 +698,171 @@ def _write_multi_docx(agg_summary: dict, path: str, title: str) -> None:
         ])
     _add_table(
         doc,
-        ["Scenario", "N causali", "Potenza tot", "Potenza pos", "Potenza neg", "FP rate (nulle)"],
+        ["Scenario", "N causal", "Power total", "Power pos", "Power neg", "FP rate (null)"],
         rows, col_widths_cm=[5, 2, 2.5, 2.5, 2.5, 3],
     )
 
-    doc.add_heading("Potenza aggregata su tutti gli scenari — per segno", level=1)
+    doc.add_heading("Aggregate power across all scenarios — by sign", level=1)
     a = agg_summary["aggregate"]
     rows = []
-    for s, lab in [("pos", "Positivo"), ("neg", "Negativo")]:
+    for s, lab in [("pos", "Positive"), ("neg", "Negative")]:
         d = a["by_sign"][s]
         rows.append([lab, d["n"], d["n_detected"], _pct(d["power"])])
-    _add_table(doc, ["Segno", "N", "N rilevate", "Potenza"], rows, col_widths_cm=[5, 3, 3, 3])
+    _add_table(doc, ["Sign", "N", "N detected", "Power"], rows, col_widths_cm=[5, 3, 3, 3])
 
-    doc.add_heading("Potenza aggregata su tutti gli scenari — per magnitudine", level=1)
+    doc.add_heading("Aggregate power across all scenarios — by magnitude", level=1)
     rows = []
     for lab, d in a["by_magnitude"].items():
         rows.append([lab, d["n"], _pct(d["power"]), d["n_pos"], _pct(d["power_pos"]), d["n_neg"], _pct(d["power_neg"])])
     _add_table(
         doc,
-        ["Bin |beta|", "N tot", "Potenza tot", "N pos", "Potenza pos", "N neg", "Potenza neg"],
+        ["|beta| bin", "N total", "Power total", "N pos", "Power pos", "N neg", "Power neg"],
         rows, col_widths_cm=[3, 2, 3, 2, 3, 2, 3],
     )
 
     p = doc.add_paragraph()
     p.add_run(
-        f"Falsi positivi pooled su varianti nulle: {_pct(a['fp_rate_null_pooled'])}. "
-        + (f"Falsi positivi pooled su controllo solo-main: {_pct(a['fp_rate_main_only_pooled'])}."
+        f"Pooled false positives on null variants: {_pct(a['fp_rate_null_pooled'])}. "
+        + (f"Pooled false positives on the main-only control: {_pct(a['fp_rate_main_only_pooled'])}."
            if a["fp_rate_main_only_pooled"] is not None else "")
     )
     note = doc.add_paragraph()
     note.add_run(
-        "Nota: 'N' nella potenza aggregata conta le osservazioni variante×scenario, "
-        "non varianti indipendenti (se i DEFAULT_CAUSAL_VARIANTS sono gli stessi in ogni "
-        "scenario, con lo stesso seed non sono repliche indipendenti — vedi analisi in "
-        "conversazione)."
+        "Note: 'N' in the aggregate power counts variant×scenario observations, "
+        "not independent variants (if DEFAULT_CAUSAL_VARIANTS are the same in every "
+        "scenario, with the same seed they are not independent replicates — see the "
+        "analysis in the conversation)."
     ).italic = True
 
     for run in doc.paragraphs[0].runs:
         run.font.size = Pt(20)
 
     doc.save(path)
+
+
+# ============================================================
+# 6) Manuscript-ready scenario comparison table (G×E + vQTL metrics
+# together) -- built from the list of per-scenario result dicts produced
+# by run_scenarios.run_all_scenarios() (same schema as
+# scenarios/all_scenarios_summary.json). This is the compact, one-row-per-
+# scenario table meant to go directly into the manuscript/supplementary,
+# as opposed to _write_multi_docx() above (G×E-only, more granular,
+# intended for internal review of the recap/ folders).
+# ============================================================
+
+SCENARIO_LABELS_DEFAULT: dict[str, str] = {
+    "baseline": "Baseline",
+    "population_stratification": "Population stratification",
+    "nonrandom_missing_carriers": "Non-random missingness",
+    "small_sample": "Reduced sample",
+    "high_zero_inflation_exposure": "Zero-inflated exposure",
+    "high_sample": "Enlarged sample",
+}
+
+
+def build_scenario_comparison_table(all_results: list[dict],
+                                     labels: dict[str, str] | None = None) -> pd.DataFrame:
+    """Builds the compact, manuscript-ready scenario comparison table from
+    `all_results` (the list returned by run_scenarios.run_all_scenarios()
+    under the "all_results" key, i.e. the same content written to
+    scenarios/all_scenarios_summary.json).
+
+    One row per scenario, with:
+      Scenario, G×E power, FP rate (G×E, genome-wide), λGC (vQTL),
+      vQTL candidate recovery, Specificity FP (pure-variance)
+
+    Scenarios with status != "ok" are still included, with "n/a" in the
+    numeric columns, so a failed run is visible in the table rather than
+    silently dropped.
+    """
+    labels = labels or SCENARIO_LABELS_DEFAULT
+    rows = []
+    for r in all_results:
+        name = r.get("scenario", "?")
+        label = labels.get(name, name)
+
+        if r.get("status") != "ok":
+            rows.append({
+                "Scenario": label,
+                "G×E power": "n/a",
+                "FP rate (G×E, genome-wide)": "n/a",
+                "λGC (vQTL)": "n/a",
+                "vQTL candidate recovery": "n/a",
+                "Specificity FP (pure-variance)": "n/a",
+            })
+            continue
+
+        ge_recap = ((r.get("ge_interaction") or {}).get("recap") or {})
+        ge = ge_recap.get("gxe_interaction", {}) or {}
+        nf = ge_recap.get("null_genomewide", {}) or {}
+        va = r.get("vqtl_asymptotic", {}) or {}
+
+        ge_power = ge.get("power_overall")
+        ge_n, ge_det = ge.get("n"), ge.get("n_detected")
+        fp_rate, fp_n, fp_det = nf.get("false_positive_rate"), nf.get("n"), nf.get("n_false_positive")
+        lam = va.get("lambda_gc")
+        found, total = va.get("n_found_causal"), va.get("n_causal_total")
+        pv_fp, pv_n = va.get("n_pv_falsepos"), va.get("n_pv_total")
+
+        rows.append({
+            "Scenario": label,
+            "G×E power": (f"{ge_power * 100:.0f}% ({ge_det}/{ge_n})" if ge_power is not None else "n/a"),
+            "FP rate (G×E, genome-wide)": (f"{fp_rate * 100:.1f}% ({fp_det}/{fp_n})" if fp_rate is not None else "n/a"),
+            "λGC (vQTL)": (f"{lam:.3f}" if lam is not None else "n/a"),
+            "vQTL candidate recovery": (f"{found}/{total} ({found / total * 100:.0f}%)" if total else "n/a"),
+            "Specificity FP (pure-variance)": (f"{pv_fp}/{pv_n}" if pv_n is not None else "n/a"),
+        })
+    return pd.DataFrame(rows)
+
+
+def write_manuscript_scenario_report(
+    table_df: pd.DataFrame,
+    out_path: str,
+    figure_path: str | None = None,
+    table_title: str = "Supplementary Table — Pipeline robustness across simulated scenarios",
+    table_caption: str = (
+        "Each row corresponds to a full re-run of the analytical pipeline on an "
+        "independently simulated dataset. Specificity FP reports the number of "
+        "pure-variance control variants incorrectly flagged as showing an "
+        "interaction effect."
+    ),
+    figure_title: str = "Supplementary Figure — Detection power as a function of simulated effect size",
+    figure_caption: str = (
+        "Power to detect simulated effects in single-variant isolation tests, shown "
+        "separately for the G×E interaction test and the vQTL pure-variance test."
+    ),
+    figure_width_dxa: int = 600,
+) -> str:
+    """Writes a single manuscript-ready docx containing the scenario
+    comparison table (see build_scenario_comparison_table) and, optionally,
+    an embedded figure (e.g. a power-curve PNG produced by
+    run_isolated_casual_test.generate_manuscript_power_curve). Meant to be
+    the one file you actually paste into the manuscript/supplementary,
+    as opposed to the more granular per-scenario/isolated reports."""
+    doc = Document()
+
+    doc.add_heading(table_title, level=1)
+    if table_caption:
+        cap = doc.add_paragraph(table_caption)
+        cap.runs[0].italic = True
+        cap.runs[0].font.size = Pt(9)
+
+    headers = list(table_df.columns)
+    rows = table_df.astype(str).values.tolist()
+    _add_table(doc, headers, rows)
+
+    if figure_path and os.path.exists(figure_path):
+        doc.add_paragraph("")
+        doc.add_heading(figure_title, level=1)
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run()
+        run.add_picture(figure_path, width=Pt(figure_width_dxa))
+        if figure_caption:
+            cap = doc.add_paragraph(figure_caption)
+            cap.runs[0].italic = True
+            cap.runs[0].font.size = Pt(9)
+
+    doc.save(out_path)
+    print(f"[export] {out_path}")
+    return out_path

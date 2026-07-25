@@ -1,92 +1,98 @@
 """
-Orchestratore multi-scenario (battery di robustezza).
+Multi-scenario orchestrator (robustness battery).
 
-Per ciascuno scenario definito in SCENARIOS:
-  1) genera i dati sintetici       -> gen_fake_data.generate_dataset(**params)
-  2) gira la parte gene-ambiente   -> run_ge_interaction() qui sotto
-     (chiamata diretta e sequenziale a modeling.process_single_variant,
-     nessuna reimplementazione)
-  3) gira la parte vQTL in due modalita':
-       - "debug"      -> run_vqtl_debug() qui sotto: confronto asymptotic
-                          vs bootstrap su (varianti causali + 20 nulle a
-                          caso), utile per un check rapido di divergenza
-                          fra i due metodi di SE
-       - "asymptotic" -> run_vqtl_asymptotic() qui sotto: pipeline vQTL
-                          completa Step 3->7 (run_pipeline_for_method di
-                          test_vqtl_pipeline.py, importata cosi' com'e', non
-                          duplicata), solo se_method="asymptotic" (il
-                          bootstrap e' gia' confrontato nel debug, farlo
-                          girare anche qui raddoppierebbe il tempo per poco
-                          valore aggiunto)
+For each scenario defined in SCENARIOS:
+  1) generate the synthetic data      -> gen_fake_data.generate_dataset(**params)
+  2) run the gene-environment part    -> run_ge_interaction() below
+     (direct, sequential call to modeling.process_single_variant,
+     no reimplementation)
+  3) run the vQTL part in two modes:
+       - "debug"      -> run_vqtl_debug() below: asymptotic vs bootstrap
+                          comparison on (causal variants + 20 random nulls),
+                          useful for a quick check of divergence between
+                          the two SE methods
+       - "asymptotic" -> run_vqtl_asymptotic() below: full Step 3->7 vQTL
+                          pipeline (run_pipeline_for_method from
+                          test_vqtl_pipeline.py, imported as-is, not
+                          duplicated), se_method="asymptotic" only (the
+                          bootstrap is already compared in debug, running it
+                          here too would double the time for little added
+                          value)
 
-Ogni scenario scrive sotto scenarios/<nome>/ (fake_data/, vqtl_results/,
-debug/, ge_pipeline_results.csv, scenario_summary.json). Alla fine viene
-scritto un report riassuntivo unico in scenarios/all_scenarios_summary.csv
-e .json, cosi' si vede a colpo d'occhio se qualche scenario e' andato
-storto (has_failures, causali recuperate, lambda_GC, eventuali eccezioni),
-piu' un report Word aggregato (scenarios/recap_all/all_scenarios_report.docx).
+Each scenario writes under scenarios/<name>/ (fake_data/, vqtl_results/,
+debug/, ge_pipeline_results.csv, scenario_summary.json). At the end, a
+single summary report is written to scenarios/all_scenarios_summary.csv
+and .json, so it is immediately visible whether any scenario went wrong
+(has_failures, causal variants recovered, lambda_GC, any exceptions), plus
+an aggregate Word report (scenarios/recap_all/all_scenarios_report.docx)
+and a manuscript-ready comparison table + figure
+(scenarios/recap_all/manuscript_scenario_report.docx, see
+report_utils.build_scenario_comparison_table /
+write_manuscript_scenario_report).
 
-*** VARIANTI CAUSALI USATE QUI: un set PICCOLO E FISSO (SCENARIO_CAUSAL_
-VARIANTS / SCENARIO_PURE_VARIANCE_VARIANTS sotto), NON i default "grandi"
-di gen_fake_data.py (DEFAULT_CAUSAL_VARIANTS / DEFAULT_PURE_VARIANCE_VARIANTS,
+*** CAUSAL VARIANTS USED HERE: a SMALL, FIXED set (SCENARIO_CAUSAL_
+VARIANTS / SCENARIO_PURE_VARIANCE_VARIANTS below), NOT the "large" defaults
+from gen_fake_data.py (DEFAULT_CAUSAL_VARIANTS / DEFAULT_PURE_VARIANCE_VARIANTS,
 46 G×E + 16 pure_variance).
 
-PERCHE': gen_fake_data.py somma il contributo di OGNI variante causale
-attiva alla STESSA onset_age, per lo stesso paziente:
+WHY: gen_fake_data.py adds the contribution of EVERY active causal variant
+to the SAME onset_age, for the same patient:
 
     for lab, (beta_inter, beta_main) in causal_variants.items():
         onset_age += beta_main*dosage + beta_inter*dosage*exposure_std
     for lab, sd_by_dosage in pure_variance_variants.items():
         onset_age += rng.normal(0, sd_i, size=n)
 
-Se se ne attivano 46+16 insieme (misurato su un run reale): il rumore
-"nascosto" che ogni singolo test si trova davanti sale a ~4.5x il noise_sd
-dichiarato (soprattutto per colpa delle pure_variance, da sole ~15x la
-varianza base), perche' nessun test di una singola variante si aggiusta
-per le altre varianti causali attive nello stesso dataset. Per testare la
-ROBUSTEZZA della pipeline a condizioni diverse (stratificazione,
-missingness, campione piccolo, esposizione zero-inflazionata) serve un
-segnale pulito e comparabile fra scenari -- quindi qui si usa SEMPRE questo
-set piccolo, indipendentemente dai default di gen_fake_data.py. La curva di
-potenza per magnitudine/segno va invece misurata con
-run_isolated_casual_test.py (1 sola variante attiva per dataset), non qui.
+If 46+16 are activated together (measured on a real run): the "hidden"
+noise that every single test faces rises to ~4.5x the declared noise_sd
+(mostly because of the pure_variance ones, alone ~15x the base variance),
+because no single-variant test adjusts for the other active causal
+variants in the same dataset. To test the ROBUSTNESS of the pipeline to
+different conditions (stratification, missingness, small sample,
+zero-inflated exposure), a clean signal comparable across scenarios is
+needed -- so this small set is ALWAYS used here, regardless of
+gen_fake_data.py's defaults. The power curve by magnitude/sign, instead,
+should be measured with run_isolated_casual_test.py (1 single active
+variant per dataset), not here.
 ***
 
-QUESTO FILE E' SIA UNA LIBRERIA CHE UNO SCRIPT:
-  - run_isolated_casual_test.py lo importa (`import run_scenarios as rs`)
-    per riusare _set_common_env / run_ge_interaction / run_vqtl_debug (test
-    isolato per-variante) e run_all_scenarios (battery di scenari, come
-    "fase 2" della batteria completa) -- vedi il docstring di quel file per
-    il punto d'ingresso unico consigliato.
-  - Puo' comunque essere lanciato da solo, se si vuole SOLO la battery di
-    scenari senza il resto:
-        python run_scenarios.py                          # sequenziale, tutti gli scenari
-        python run_scenarios.py baseline small_sample     # sequenziale, solo alcuni
-        python run_scenarios.py --workers 4               # parallelo, 4 scenari insieme
+THIS FILE IS BOTH A LIBRARY AND A SCRIPT:
+  - run_isolated_casual_test.py imports it (`import run_scenarios as rs`)
+    to reuse _set_common_env / run_ge_interaction / run_vqtl_debug (per-
+    variant isolated test) and run_all_scenarios (scenario battery, as
+    "phase 2" of the full battery) -- see that file's docstring for the
+    recommended single entry point.
+  - It can still be run standalone, if you want ONLY the scenario battery
+    and nothing else:
+        python run_scenarios.py                          # sequential, all scenarios
+        python run_scenarios.py baseline small_sample     # sequential, only some
+        python run_scenarios.py --workers 4               # parallel, 4 scenarios at once
         python run_scenarios.py --workers 4 baseline small_sample
 
-Metti questo file nella cartella ROOT del repo, insieme a gen_fake_data.py,
-test_vqtl_pipeline.py, fake_vqtl_repository.py e report_utils.py.
+Put this file in the repo ROOT folder, together with gen_fake_data.py,
+test_vqtl_pipeline.py, fake_vqtl_repository.py and report_utils.py.
 
-get_config()/get_vqtl_config() del repo leggono gli env ogni volta (non
-sono cachate con lru_cache) -- per questo qui basta aggiornare os.environ e
-richiamarle ad ogni scenario, senza bisogno di cache_clear()/reload.
+get_config()/get_vqtl_config() from the repo read the env every time (they
+are not cached with lru_cache) -- which is why it is enough here to update
+os.environ and call them again for every scenario, with no need for
+cache_clear()/reload.
 
-PARALLELIZZAZIONE (--workers > 1):
-  os.environ, modeling.global_df e le tabelle in-memory di
-  fake_vqtl_repository sono stato GLOBALE DI PROCESSO -- se due scenari
-  girassero come thread nello stesso processo si sovrascriverebbero a
-  vicenda le variabili d'ambiente e i dati caricati. Per questo qui si usa
-  ProcessPoolExecutor (processi separati, ognuno col proprio spazio di
-  stato): ogni worker importa da zero i moduli e imposta i propri env,
-  senza interferenze fra scenari concorrenti. L'overhead di avvio
-  processo/import e' trascurabile rispetto al tempo di scan/permutazioni.
+PARALLELIZATION (--workers > 1):
+  os.environ, modeling.global_df, and the in-memory tables of
+  fake_vqtl_repository are PROCESS-GLOBAL state -- if two scenarios ran as
+  threads in the same process they would overwrite each other's
+  environment variables and loaded data. This is why ProcessPoolExecutor
+  is used here (separate processes, each with its own state): every worker
+  imports the modules from scratch and sets its own env, with no
+  interference between concurrent scenarios. The process-start/import
+  overhead is negligible compared to the scan/permutation time.
 
-  VQTL_N_JOBS (i job interni di joblib per lo scan vQTL, non gli scenari)
-  viene ridotto automaticamente in base a --workers per non sovrasaturare
-  la CPU: con N core disponibili e W worker di scenario, ogni scenario usa
-  al piu' N//W job interni (minimo 1). Con --workers 1 il comportamento e'
-  identico a prima (fino a 4 job interni, come negli script originali).
+  VQTL_N_JOBS (joblib's internal jobs for the vQTL scan, not the
+  scenarios) is automatically reduced based on --workers so as not to
+  oversaturate the CPU: with N available cores and W scenario workers,
+  each scenario uses at most N//W internal jobs (minimum 1). With
+  --workers 1 the behaviour is identical to before (up to 4 internal jobs,
+  as in the original scripts).
 """
 from __future__ import annotations
 
@@ -102,19 +108,22 @@ import numpy as np
 import pandas as pd
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = SCRIPT_DIR  # cambia qui se questo file non sta nella root del repo
+REPO_ROOT = SCRIPT_DIR  # change this if this file is not in the repo root
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, SCRIPT_DIR)
 
-from report_utils import generate_recap, generate_multi_scenario_recap, load_scenario_recap
+from report_utils import (
+    generate_recap, generate_multi_scenario_recap, load_scenario_recap,
+    build_scenario_comparison_table, write_manuscript_scenario_report,
+)
 
 SCENARIOS_ROOT = os.path.join(SCRIPT_DIR, "scenarios")
 
 # ============================================================
-# Varianti causali per gli scenari di ROBUSTEZZA: set piccolo e fisso,
-# gli stessi 5 G×E + 2 pure_variance "storici" (quelli con cui la pipeline
-# e' stata validata originariamente). Vedi spiegazione in cima al file sul
-# perche' NON si usano i default grandi di gen_fake_data.py qui.
+# Causal variants for the ROBUSTNESS scenarios: small, fixed set, the same
+# "historical" 5 G×E + 2 pure_variance ones (the ones the pipeline was
+# originally validated with). See the explanation at the top of the file
+# for why the large gen_fake_data.py defaults are NOT used here.
 # ============================================================
 SCENARIO_CAUSAL_VARIANTS: dict[str, tuple[float, float]] = {
     "1_1000001_A_G": (-4.5, -1.0),
@@ -129,14 +138,14 @@ SCENARIO_PURE_VARIANCE_VARIANTS: dict[str, dict[int, float]] = {
 }
 
 # ============================================================
-# Definizione scenari: ogni dict e' passato a
+# Scenario definitions: each dict is passed to
 # gen_fake_data.generate_dataset(out_dir=..., causal_variants=SCENARIO_CAUSAL_VARIANTS,
 # pure_variance_variants=SCENARIO_PURE_VARIANCE_VARIANTS, **params).
-# Tutti i parametri non specificati restano ai default del generatore.
-# Aggiungine/modificane pure altri qui (NON mettere "causal_variants" o
-# "pure_variance_variants" dentro questi dict: sono gia' fissati sopra e
-# passati esplicitamente in run_scenario(), per evitare l'errore
-# "got multiple values for keyword argument").
+# Any parameter not specified stays at the generator's default.
+# Feel free to add/change others here (do NOT put "causal_variants" or
+# "pure_variance_variants" inside these dicts: they are already fixed above
+# and passed explicitly in run_scenario(), to avoid the "got multiple
+# values for keyword argument" error).
 # ============================================================
 SCENARIOS: dict[str, dict] = {
     "baseline": {},
@@ -169,10 +178,10 @@ def section(title: str) -> None:
 
 
 def _set_common_env(fake_dir: str, work_dir: str, vqtl_n_jobs: int | None = None) -> None:
-    """Chiavi/valori di default per gene_environment.config.get_config() e
-    vqtl.config.get_vqtl_config(), puntate alle cartelle dello scenario
-    corrente. vqtl_n_jobs sovrascrive il default (4) -- usato per non
-    sovrasaturare la CPU quando piu' scenari girano in parallelo (vedi
+    """Default keys/values for gene_environment.config.get_config() and
+    vqtl.config.get_vqtl_config(), pointed at the current scenario's
+    folders. vqtl_n_jobs overrides the default (4) -- used to avoid
+    oversaturating the CPU when several scenarios run in parallel (see
     run_scenario)."""
     n_jobs = vqtl_n_jobs if vqtl_n_jobs is not None else min(4, os.cpu_count() or 2)
     os.environ.update({
@@ -210,50 +219,49 @@ def _set_common_env(fake_dir: str, work_dir: str, vqtl_n_jobs: int | None = None
 
 
 def _force_cfg_overrides(cfg, overrides: dict, context: str):
-    """Forza sui campi della dataclass di config (get_config()/get_vqtl_config())
-    i valori passati in overrides, A PRESCINDERE da cosa quelle funzioni
-    hanno effettivamente letto dagli env.
+    """Forces the values passed in `overrides` onto the config dataclass's
+    fields (get_config()/get_vqtl_config()), REGARDLESS of what those
+    functions actually read from the env.
 
-    Perche' serve: il sintomo osservato e' che, pur avendo messo
-    RAW_FILE=.../fake_data/genetic.csv in os.environ PRIMA di chiamare
-    get_config(), la pipeline ha comunque caricato un file completamente
-    diverso (gen.parquet reale). Questo succede se get_config() dentro
-    config.py ricarica un .env reale (es. via python-dotenv con
-    override=True) OGNI volta che viene chiamata: in quel caso qualsiasi
-    valore messo a mano in os.environ PRIMA della chiamata viene
-    silenziosamente rimpiazzato DENTRO la chiamata stessa, e non c'e' modo
-    di proteggersene lato env. L'unico modo robusto e' sovrascrivere i
-    campi della dataclass risultante DOPO che get_config() e' gia' stata
-    chiamata.
+    Why this is needed: the observed symptom is that, despite having set
+    RAW_FILE=.../fake_data/genetic.csv in os.environ BEFORE calling
+    get_config(), the pipeline still loaded a completely different file
+    (a real gen.parquet). This happens if get_config() inside config.py
+    reloads a real .env file (e.g. via python-dotenv with override=True)
+    EVERY time it is called: in that case any value set by hand in
+    os.environ BEFORE the call gets silently replaced INSIDE the call
+    itself, and there is no way to protect against it from the env side.
+    The only robust way is to overwrite the resulting dataclass's fields
+    AFTER get_config() has already been called.
 
-    Usa dataclasses.fields() per applicare solo ai nomi di campo che
-    esistono davvero: se un nome indovinato qui non esiste sulla tua
-    dataclass, lo stampa come "ignorato" invece di far crashare tutto --
-    in quel caso il nome vero del campo in config.py e' diverso, correggi
-    la mappa qui sotto (in _cfg_field_names) con quello giusto."""
+    Uses dataclasses.fields() to apply only to field names that actually
+    exist: if a guessed name here does not exist on your dataclass, it is
+    printed as "skipped" instead of crashing everything -- in that case the
+    real field name in config.py is different, fix the map here
+    (_cfg_field_names) with the right one."""
     import dataclasses as _dc
     if not _dc.is_dataclass(cfg):
-        print(f"[{context}] ATTENZIONE: cfg non è una dataclass, salto _force_cfg_overrides (verifica a mano i path usati).")
+        print(f"[{context}] WARNING: cfg is not a dataclass, skipping _force_cfg_overrides (check the paths used by hand).")
         return cfg
     valid_fields = {f.name for f in _dc.fields(cfg)}
     applied = {k: v for k, v in overrides.items() if k in valid_fields}
     skipped = {k: v for k, v in overrides.items() if k not in valid_fields}
     if skipped:
-        print(f"[{context}] ATTENZIONE: campi non trovati sulla dataclass di config (nome errato? "
-              f"correggi _cfg_field_names in run_scenarios.py), NON forzati: {skipped} "
-              f"| campi disponibili: {sorted(valid_fields)}")
+        print(f"[{context}] WARNING: fields not found on the config dataclass (wrong name? "
+              f"fix _cfg_field_names in run_scenarios.py), NOT forced: {skipped} "
+              f"| available fields: {sorted(valid_fields)}")
     if applied:
         cfg = _dc.replace(cfg, **applied)
-        print(f"[{context}] Path forzati sulla config (ignorando qualunque .env caricato internamente): {applied}")
+        print(f"[{context}] Paths forced onto the config (ignoring any internally loaded .env): {applied}")
     return cfg
 
 
 # ============================================================
-# Step 2: parte gene-ambiente. Chiama direttamente modeling.process_single_
-# variant su ogni variante del dataset, in sequenza -- nessuna
-# reimplementazione della statistica, solo orchestrazione. Unica copia di
-# questa logica nel repo: riusata sia da run_scenario() qui sotto sia da
-# run_isolated_casual_test.py per il test isolato per-variante.
+# Step 2: gene-environment part. Calls modeling.process_single_variant
+# directly on every variant of the dataset, sequentially -- no
+# reimplementation of the statistics, orchestration only. Single copy of
+# this logic in the repo: reused both by run_scenario() below and by
+# run_isolated_casual_test.py for the per-variant isolated test.
 # ============================================================
 
 def run_ge_interaction(fake_dir: str, work_dir: str) -> dict:
@@ -271,25 +279,25 @@ def run_ge_interaction(fake_dir: str, work_dir: str) -> dict:
         "generation": GENERATION,
         "exposure": "exposure_env",
         "covariates": "sex",
-        # Deve puntare a un path che NON esiste per i dati sintetici: se
-        # lasciato al valore letto dal .env reale del progetto, build_dataset.
-        # _build_narrow_covariates() userebbe la mappa id->generazione VERA
-        # (pazienti reali), che non contiene nessuno degli id sintetici qui
-        # -- ogni riga risulterebbe "generazione sconosciuta" e verrebbe
-        # scartata (sintomo: "N -> 0 righe" nei log, poi crash a valle sullo
-        # StandardScaler per array vuoto). Puntandolo a un path inesistente,
-        # _build_narrow_covariates() prende il ramo "nessuna mappa trovata,
-        # uso tutte le righe", corretto per un dataset sintetico mono-
-        # generazione.
+        # Must point to a path that does NOT exist for the synthetic data:
+        # if left at the value read from the project's real .env,
+        # build_dataset._build_narrow_covariates() would use the REAL
+        # id->generation map (real patients), which contains none of the
+        # synthetic ids here -- every row would come out as "unknown
+        # generation" and get dropped (symptom: "N -> 0 rows" in the logs,
+        # then a downstream crash on StandardScaler for an empty array).
+        # By pointing it at a nonexistent path, _build_narrow_covariates()
+        # takes the "no map found, use all rows" branch, which is correct
+        # for a single-generation synthetic dataset.
         "sample_generation_map": os.path.join(fake_dir, "__no_sample_generation_map__.csv"),
-    }, context="gene-ambiente")
+    }, context="gene-environment")
     configure_logging(cfg.log_dir)
     log = get_logger(__name__)
 
-    print("Carico e preparo il dataset (stesso codice usato in produzione)...")
+    print("Loading and preparing the dataset (same code used in production)...")
     df, variant_cols_safe, mapping, Ecols, variant_cols, covariate_cols = load_and_prepare_data(cfg)
-    print(f"Righe: {len(df)} | Esposizione (Ecols): {Ecols} | Covariate: {covariate_cols}")
-    print(f"Varianti da testare: {len(variant_cols_safe)}")
+    print(f"Rows: {len(df)} | Exposure (Ecols): {Ecols} | Covariates: {covariate_cols}")
+    print(f"Variants to test: {len(variant_cols_safe)}")
 
     modeling.global_df = df
     modeling.global_covariate_cols = covariate_cols
@@ -302,15 +310,15 @@ def run_ge_interaction(fake_dir: str, work_dir: str) -> dict:
             res["variant"] = v_orig
             results.append(res)
         if (i + 1) % 10 == 0:
-            print(f"  {i + 1}/{len(variant_cols_safe)} varianti processate ({time.time() - t0:.0f}s)")
+            print(f"  {i + 1}/{len(variant_cols_safe)} variants processed ({time.time() - t0:.0f}s)")
 
     elapsed = time.time() - t0
-    print(f"Completato in {elapsed:.0f}s. Risultati: {len(results)}")
+    print(f"Completed in {elapsed:.0f}s. Results: {len(results)}")
 
     res_df = pd.DataFrame(results)
     out_path = os.path.join(fake_dir, "pipeline_results.csv")
     res_df.to_csv(out_path, index=False)
-    print(f"Salvato in {out_path}")
+    print(f"Saved to {out_path}")
 
     n_sig = int((res_df["p_emp"] < 0.05).sum()) if "p_emp" in res_df.columns and not res_df.empty else 0
 
@@ -319,7 +327,7 @@ def run_ge_interaction(fake_dir: str, work_dir: str) -> dict:
         pipeline_results_path=os.path.join(fake_dir, "pipeline_results.csv"),
         out_dir=os.path.join(work_dir, "recap"),
     )
-    recap_public = {k: v for k, v in recap_summary.items() if k != "_detail"}  # niente DataFrame nel JSON
+    recap_public = {k: v for k, v in recap_summary.items() if k != "_detail"}  # no DataFrame in the JSON
 
     return {
         "n_variants_tested": len(variant_cols_safe),
@@ -332,10 +340,10 @@ def run_ge_interaction(fake_dir: str, work_dir: str) -> dict:
 
 
 # ============================================================
-# Step 3a: parte vQTL "debug" -- confronto asymptotic vs bootstrap su un
-# sottoinsieme piccolo (causali + 20 nulle a caso). Unica copia di questa
-# logica nel repo: riusata sia da run_scenario() qui sotto sia da
-# run_isolated_casual_test.py per il confronto per-variante.
+# Step 3a: vQTL "debug" part -- asymptotic vs bootstrap comparison on a
+# small subset (causal variants + 20 random nulls). Single copy of this
+# logic in the repo: reused both by run_scenario() below and by
+# run_isolated_casual_test.py for the per-variant comparison.
 # ============================================================
 
 def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
@@ -358,16 +366,16 @@ def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
         "generation": GENERATION,
         "exposure": "exposure_env",
         "covariates": "sex",
-        # Deve puntare a un path che NON esiste per i dati sintetici: se
-        # lasciato al valore letto dal .env reale del progetto, build_dataset.
-        # _build_narrow_covariates() userebbe la mappa id->generazione VERA
-        # (pazienti reali), che non contiene nessuno degli id sintetici qui
-        # -- ogni riga risulterebbe "generazione sconosciuta" e verrebbe
-        # scartata (sintomo: "N -> 0 righe" nei log, poi crash a valle sullo
-        # StandardScaler per array vuoto). Puntandolo a un path inesistente,
-        # _build_narrow_covariates() prende il ramo "nessuna mappa trovata,
-        # uso tutte le righe", corretto per un dataset sintetico mono-
-        # generazione.
+        # Must point to a path that does NOT exist for the synthetic data:
+        # if left at the value read from the project's real .env,
+        # build_dataset._build_narrow_covariates() would use the REAL
+        # id->generation map (real patients), which contains none of the
+        # synthetic ids here -- every row would come out as "unknown
+        # generation" and get dropped (symptom: "N -> 0 rows" in the logs,
+        # then a downstream crash on StandardScaler for an empty array).
+        # By pointing it at a nonexistent path, _build_narrow_covariates()
+        # takes the "no map found, use all rows" branch, which is correct
+        # for a single-generation synthetic dataset.
         "sample_generation_map": os.path.join(fake_dir, "__no_sample_generation_map__.csv"),
     }, context="vqtl-debug")
     configure_logging(ge_cfg.log_dir)
@@ -381,7 +389,7 @@ def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
     nulls_sample = rng.choice(nulls_all, size=n_sample, replace=False).tolist()
 
     wanted_labels = set(causal) | set(nulls_sample)
-    print(f"Sottoinsieme: {len(causal)} causali + {len(nulls_sample)} nulle = {len(wanted_labels)} varianti")
+    print(f"Subset: {len(causal)} causal + {len(nulls_sample)} null = {len(wanted_labels)} variants")
 
     ds = load_vqtl_dataset(ge_cfg, VqtlConfig(ge=ge_cfg, exposures=["exposure_env"]), generation=GENERATION)
     ds.df = prepare_phenotype(ds.df, ge_cfg.target_col)
@@ -390,7 +398,7 @@ def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
     variant_subset = [inv_mapping[lab] for lab in wanted_labels if lab in inv_mapping]
     missing = wanted_labels - set(inv_mapping)
     if missing:
-        print(f"ATTENZIONE: {len(missing)} label non trovate nel dataset: {missing}")
+        print(f"WARNING: {len(missing)} labels not found in the dataset: {missing}")
 
     results = {}
     convergence = {}
@@ -398,10 +406,10 @@ def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
         fake_repo.reset_all()
         reset_convergence_stats()
         vcfg = VqtlConfig(ge=ge_cfg, se_method=method, n_jobs=1)
-        print(f"\n--- se_method={method} (n_jobs=1 per contatori affidabili) ---")
+        print(f"\n--- se_method={method} (n_jobs=1 for reliable counters) ---")
         t0 = time.time()
         df = run_vqtl_scan(ds, vcfg, ge_cfg.target_col, generation=GENERATION, variant_subset=variant_subset)
-        print(f"Fatto in {time.time() - t0:.1f}s")
+        print(f"Done in {time.time() - t0:.1f}s")
         df = df.merge(truth[["variant", "effect_type"]], left_on="SNP", right_on="variant", how="left")
         results[method] = df[["SNP", "effect_type", "N", "MAF", "beta_QI", "SE", "Z", "P"]].sort_values("SNP")
 
@@ -413,8 +421,8 @@ def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
             "tau_fits_attempted": attempted, "tau_fits_discarded": discarded,
             "pct_discarded": round(pct, 1), "variants_all_nan": stats["variants_all_nan"],
         }
-        print(f"Convergenza fit tau: {discarded}/{attempted} scartati ({pct:.1f}%) | "
-              f"varianti con beta_QI=NaN: {stats['variants_all_nan']}")
+        print(f"Tau fit convergence: {discarded}/{attempted} discarded ({pct:.1f}%) | "
+              f"variants with beta_QI=NaN: {stats['variants_all_nan']}")
 
     merged = results["asymptotic"].merge(
         results["bootstrap"], on=["SNP", "effect_type"], suffixes=("_asym", "_boot")
@@ -441,9 +449,9 @@ def run_vqtl_debug(fake_dir: str, work_dir: str) -> dict:
 
 
 # ============================================================
-# Step 3b: parte vQTL "asymptotic" -- pipeline completa Step 3->7,
-# riusando run_pipeline_for_method di test_vqtl_pipeline.py cosi' com'e'
-# (nessuna duplicazione della logica statistica/di orchestrazione).
+# Step 3b: vQTL "asymptotic" part -- full Step 3->7 pipeline, reusing
+# run_pipeline_for_method from test_vqtl_pipeline.py as-is (no duplication
+# of the statistical/orchestration logic).
 # ============================================================
 
 def run_vqtl_asymptotic(fake_dir: str, work_dir: str) -> dict:
@@ -464,16 +472,16 @@ def run_vqtl_asymptotic(fake_dir: str, work_dir: str) -> dict:
         "generation": GENERATION,
         "exposure": "exposure_env",
         "covariates": "sex",
-        # Deve puntare a un path che NON esiste per i dati sintetici: se
-        # lasciato al valore letto dal .env reale del progetto, build_dataset.
-        # _build_narrow_covariates() userebbe la mappa id->generazione VERA
-        # (pazienti reali), che non contiene nessuno degli id sintetici qui
-        # -- ogni riga risulterebbe "generazione sconosciuta" e verrebbe
-        # scartata (sintomo: "N -> 0 righe" nei log, poi crash a valle sullo
-        # StandardScaler per array vuoto). Puntandolo a un path inesistente,
-        # _build_narrow_covariates() prende il ramo "nessuna mappa trovata,
-        # uso tutte le righe", corretto per un dataset sintetico mono-
-        # generazione.
+        # Must point to a path that does NOT exist for the synthetic data:
+        # if left at the value read from the project's real .env,
+        # build_dataset._build_narrow_covariates() would use the REAL
+        # id->generation map (real patients), which contains none of the
+        # synthetic ids here -- every row would come out as "unknown
+        # generation" and get dropped (symptom: "N -> 0 rows" in the logs,
+        # then a downstream crash on StandardScaler for an empty array).
+        # By pointing it at a nonexistent path, _build_narrow_covariates()
+        # takes the "no map found, use all rows" branch, which is correct
+        # for a single-generation synthetic dataset.
         "sample_generation_map": os.path.join(fake_dir, "__no_sample_generation_map__.csv"),
     }, context="vqtl-asymptotic")
     configure_logging(ge_cfg.log_dir)
@@ -487,11 +495,11 @@ def run_vqtl_asymptotic(fake_dir: str, work_dir: str) -> dict:
     causal_pure_var = set(truth.loc[truth["effect_type"] == "pure_variance", "variant"])
     all_causal = causal_gxe | causal_pure_var
     n_null_truth = int((truth["effect_type"] == "no_effect").sum())
-    print(f"Ground truth: {len(causal_gxe)} G×E causali, {len(causal_pure_var)} vQTL pure, {n_null_truth} nulle")
+    print(f"Ground truth: {len(causal_gxe)} G×E causal, {len(causal_pure_var)} pure vQTL, {n_null_truth} null")
 
-    # work_dir e GENERATION passati esplicitamente (non piu' monkey-patchati
-    # sul modulo tvp): sicuro da richiamare per piu' scenari di fila nello
-    # stesso processo, vedi docstring di test_vqtl_pipeline.py.
+    # work_dir and GENERATION passed explicitly (no longer monkey-patched
+    # onto the tvp module): safe to call for several scenarios in a row in
+    # the same process, see test_vqtl_pipeline.py's docstring.
     summary = tvp.run_pipeline_for_method(
         "asymptotic", ge_cfg, vcfg_base, truth, all_causal, n_null_truth,
         work_dir=work_dir, generation=GENERATION,
@@ -500,12 +508,44 @@ def run_vqtl_asymptotic(fake_dir: str, work_dir: str) -> dict:
 
 
 # ============================================================
-# Orchestrazione per singolo scenario + main
+# Cache: if a scenario already has a scenario_summary.json on disk with
+# status "ok" (i.e. it completed without raising, whatever the automated
+# pipeline checks concluded -- has_failures is a separate, non-fatal
+# signal, see run_all_scenarios), skip regenerating the data and rerunning
+# the whole pipeline for it. Bypassable with force=True (--force on the
+# CLI). A scenario that previously FAILED (exception) is always retried,
+# never served from cache.
 # ============================================================
 
-def run_scenario(name: str, gen_params: dict, n_workers: int = 1) -> dict:
-    section(f"SCENARIO: {name}")
+def _load_cached_scenario(scenario_dir: str, force: bool = False) -> dict | None:
+    if force:
+        return None
+    summary_path = os.path.join(scenario_dir, "scenario_summary.json")
+    if not os.path.isfile(summary_path):
+        return None
+    try:
+        with open(summary_path) as f:
+            cached = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None  # corrupted/incomplete file: recompute
+    if cached.get("status") != "ok":
+        return None  # a previously failed run should always be retried
+    return cached
+
+
+# ============================================================
+# Per-scenario orchestration + main
+# ============================================================
+
+def run_scenario(name: str, gen_params: dict, n_workers: int = 1, force: bool = False) -> dict:
     scenario_dir = os.path.join(SCENARIOS_ROOT, name)
+
+    cached = _load_cached_scenario(scenario_dir, force=force)
+    if cached is not None:
+        section(f"SCENARIO: {name} (cached result found, status ok, skipping recompute)")
+        return cached
+
+    section(f"SCENARIO: {name}")
     fake_dir = os.path.join(scenario_dir, "fake_data")
     os.makedirs(fake_dir, exist_ok=True)
 
@@ -513,12 +553,12 @@ def run_scenario(name: str, gen_params: dict, n_workers: int = 1) -> dict:
 
     try:
         from gen_fake_data import generate_dataset
-        # Set FISSO e piccolo (vedi spiegazione in cima al file): NON i
-        # default grandi di gen_fake_data.py, per non contaminare il
-        # rumore effettivo che ogni test vede rispetto al noise_sd
-        # dichiarato -- qui vogliamo isolare l'effetto del PARAMETRO di
-        # scenario (stratificazione, missingness, ecc.), non mischiarlo
-        # con l'effetto di avere decine di varianti causali attive insieme.
+        # FIXED, small set (see the explanation at the top of the file):
+        # NOT the large gen_fake_data.py defaults, so as not to contaminate
+        # the actual noise each test sees relative to the declared
+        # noise_sd -- here we want to isolate the effect of the SCENARIO
+        # PARAMETER (stratification, missingness, etc.), not mix it with
+        # the effect of having dozens of causal variants active together.
         gen_summary = generate_dataset(
             out_dir=fake_dir, verbose=True,
             causal_variants=SCENARIO_CAUSAL_VARIANTS,
@@ -530,20 +570,20 @@ def run_scenario(name: str, gen_params: dict, n_workers: int = 1) -> dict:
         vqtl_n_jobs = max(1, (os.cpu_count() or 2) // max(1, n_workers))
         _set_common_env(fake_dir, scenario_dir, vqtl_n_jobs=vqtl_n_jobs)
 
-        section(f"[{name}] Parte gene-ambiente")
+        section(f"[{name}] Gene-environment part")
         result["ge_interaction"] = run_ge_interaction(fake_dir, scenario_dir)
 
-        section(f"[{name}] Parte vQTL — debug (asymptotic vs bootstrap, sottoinsieme)")
+        section(f"[{name}] vQTL part — debug (asymptotic vs bootstrap, subset)")
         result["vqtl_debug"] = run_vqtl_debug(fake_dir, scenario_dir)
 
-        section(f"[{name}] Parte vQTL — pipeline completa Step 3→7 (se_method=asymptotic)")
+        section(f"[{name}] vQTL part — full Step 3→7 pipeline (se_method=asymptotic)")
         result["vqtl_asymptotic"] = run_vqtl_asymptotic(fake_dir, scenario_dir)
 
-    except Exception as exc:  # uno scenario che fallisce non deve bloccare gli altri
+    except Exception as exc:  # a failed scenario must not block the others
         result["status"] = "FAILED"
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["traceback"] = traceback.format_exc()
-        print(f"\n*** SCENARIO '{name}' FALLITO: {result['error']} ***")
+        print(f"\n*** SCENARIO '{name}' FAILED: {result['error']} ***")
         traceback.print_exc()
 
     with open(os.path.join(scenario_dir, "scenario_summary.json"), "w") as f:
@@ -553,30 +593,31 @@ def run_scenario(name: str, gen_params: dict, n_workers: int = 1) -> dict:
 
 
 def _run_scenario_worker(name: str, n_workers: int) -> dict:
-    """Wrapper top-level (necessario: ProcessPoolExecutor deve poter fare
-    pickle della funzione sottomessa). Ogni chiamata gira in un processo
-    Python nuovo -> nessuna condivisione di os.environ / stato dei moduli
-    con gli altri scenari in corso."""
+    """Top-level wrapper (needed: ProcessPoolExecutor must be able to
+    pickle the submitted function). Every call runs in a new Python
+    process -> no sharing of os.environ / module state with the other
+    scenarios in progress."""
     return run_scenario(name, SCENARIOS[name], n_workers=n_workers)
 
 
 def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1) -> dict:
-    """Gira la battery di scenari (tutti, o solo `names` se specificato),
-    scrive i report aggregati sotto SCENARIOS_ROOT e ritorna un dict con:
-      - "all_results":  lista dei result dict di ogni scenario (uno per
-                         scenario, stesso schema di run_scenario())
-      - "summary_df":   pd.DataFrame di riepilogo (stesso contenuto di
+    """Runs the scenario battery (all of them, or only `names` if
+    specified), writes the aggregate reports under SCENARIOS_ROOT and
+    returns a dict with:
+      - "all_results":  list of each scenario's result dict (one per
+                         scenario, same schema as run_scenario())
+      - "summary_df":   pd.DataFrame summary (same content as
                          all_scenarios_summary.csv)
-      - "failed":       nomi degli scenari falliti per eccezione
-      - "vqtl_failed":  nomi degli scenari con has_failures=True sui
-                         controlli automatici della pipeline vQTL
-      - "has_failures": True se failed o vqtl_failed non sono vuoti
-    Usata sia da main() (CLI standalone) sia da run_isolated_casual_test.py
-    (come "fase scenari" della batteria di test completa)."""
+      - "failed":       names of scenarios that failed with an exception
+      - "vqtl_failed":  names of scenarios with has_failures=True on the
+                         vQTL pipeline's automated checks
+      - "has_failures": True if failed or vqtl_failed are non-empty
+    Used both by main() (standalone CLI) and by run_isolated_casual_test.py
+    (as the "scenarios phase" of the full test battery)."""
     names = list(names) if names else list(SCENARIOS.keys())
     unknown = set(names) - set(SCENARIOS)
     if unknown:
-        raise SystemExit(f"Scenari sconosciuti: {sorted(unknown)}. Disponibili: {list(SCENARIOS)}")
+        raise SystemExit(f"Unknown scenarios: {sorted(unknown)}. Available: {list(SCENARIOS)}")
 
     n_workers = max(1, n_workers)
     os.makedirs(SCENARIOS_ROOT, exist_ok=True)
@@ -587,8 +628,8 @@ def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1) -> dic
         for name in names:
             all_results.append(run_scenario(name, SCENARIOS[name], n_workers=1))
     else:
-        print(f"Eseguo {len(names)} scenari con {n_workers} processi paralleli "
-              f"(ognuno con al piu' {max(1, (os.cpu_count() or 2) // n_workers)} job interni vQTL)...")
+        print(f"Running {len(names)} scenarios with {n_workers} parallel processes "
+              f"(each with at most {max(1, (os.cpu_count() or 2) // n_workers)} internal vQTL jobs)...")
         results_by_name = {}
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = {pool.submit(_run_scenario_worker, name, n_workers): name for name in names}
@@ -596,17 +637,17 @@ def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1) -> dic
                 name = futures[fut]
                 try:
                     results_by_name[name] = fut.result()
-                except Exception as exc:  # errore non catturato dentro run_scenario stesso (raro)
+                except Exception as exc:  # error not caught inside run_scenario itself (rare)
                     results_by_name[name] = {
                         "scenario": name, "status": "FAILED",
                         "error": f"{type(exc).__name__}: {exc}",
                     }
-                    print(f"\n*** SCENARIO '{name}' FALLITO nel processo worker: {exc} ***")
-                print(f"[{name}] completato ({results_by_name[name]['status']}).")
-        # riordino secondo l'ordine richiesto, per output deterministico
+                    print(f"\n*** SCENARIO '{name}' FAILED in the worker process: {exc} ***")
+                print(f"[{name}] completed ({results_by_name[name]['status']}).")
+        # reorder according to the requested order, for deterministic output
         all_results = [results_by_name[name] for name in names]
 
-    section("RIEPILOGO FINALE — tutti gli scenari")
+    section("FINAL SUMMARY — all scenarios")
     rows = []
     for r in all_results:
         vqtl_a = r.get("vqtl_asymptotic", {}) or {}
@@ -637,38 +678,60 @@ def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1) -> dic
         json.dump(all_results, f, indent=2, default=str)
     print(f"\n[export] {summary_csv}")
     print(f"[export] {os.path.join(SCENARIOS_ROOT, 'all_scenarios_summary.json')}")
-    print(f"\nCompletato in {time.time() - t0:.0f}s.")
+    print(f"\nCompleted in {time.time() - t0:.0f}s.")
 
-    section("REPORT FINALE UNICO (tutti gli scenari)")
+    section("SINGLE FINAL REPORT (all scenarios)")
     scenario_summaries_for_agg = {}
     for r in all_results:
         if r["status"] != "ok":
             continue
         recap_dir = os.path.join(SCENARIOS_ROOT, r["scenario"], "recap")
         if not os.path.isdir(recap_dir):
-            print(f"[{r['scenario']}] nessuna cartella recap/, salto dal report aggregato")
+            print(f"[{r['scenario']}] no recap/ folder, skipping from the aggregate report")
             continue
         detail, recap_summary = load_scenario_recap(recap_dir)
         scenario_summaries_for_agg[r["scenario"]] = {**recap_summary, "_detail": detail}
 
+    recap_all_dir = os.path.join(SCENARIOS_ROOT, "recap_all")
     if scenario_summaries_for_agg:
         generate_multi_scenario_recap(
             scenario_summaries_for_agg,
-            out_dir=os.path.join(SCENARIOS_ROOT, "recap_all"),
+            out_dir=recap_all_dir,
         )
-        print(f"[export] {os.path.join(SCENARIOS_ROOT, 'recap_all', 'all_scenarios_report.docx')}")
+        print(f"[export] {os.path.join(recap_all_dir, 'all_scenarios_report.docx')}")
     else:
-        print("Nessuno scenario ok con recap disponibile: report aggregato saltato.")
+        print("No ok scenario with a recap available: aggregate report skipped.")
+
+    section("MANUSCRIPT-READY SCENARIO COMPARISON TABLE")
+    # Compact, one-row-per-scenario table (G×E + vQTL metrics together),
+    # meant to go directly into the manuscript/supplementary -- see
+    # report_utils.build_scenario_comparison_table /
+    # write_manuscript_scenario_report. If isolated/plots/manuscript_power_curve.png
+    # already exists (produced by run_isolated_casual_test.py's phase 1),
+    # it is embedded in the same docx; otherwise the table is written on
+    # its own and the figure can be added later.
+    os.makedirs(recap_all_dir, exist_ok=True)
+    comparison_table = build_scenario_comparison_table(all_results)
+    comparison_table.to_csv(os.path.join(recap_all_dir, "manuscript_scenario_table.csv"), index=False)
+    power_curve_path = os.path.join(SCRIPT_DIR, "isolated", "plots", "manuscript_power_curve.png")
+    write_manuscript_scenario_report(
+        comparison_table,
+        out_path=os.path.join(recap_all_dir, "manuscript_scenario_report.docx"),
+        figure_path=power_curve_path if os.path.exists(power_curve_path) else None,
+    )
+    if not os.path.exists(power_curve_path):
+        print(f"[note] {power_curve_path} not found: the manuscript report was written with the table "
+              f"only. Run run_isolated_casual_test.py's phase 1 first to also get the power-curve figure.")
 
     failed = [r["scenario"] for r in all_results if r["status"] == "FAILED"]
     vqtl_failed = [r["scenario"] for r in all_results
                    if r["status"] == "ok" and (r.get("vqtl_asymptotic") or {}).get("has_failures")]
     if failed:
-        print(f"\n*** SCENARI FALLITI (eccezione): {failed} ***")
+        print(f"\n*** FAILED SCENARIOS (exception): {failed} ***")
     if vqtl_failed:
-        print(f"*** SCENARI CON CONTROLLI vQTL FALLITI (has_failures): {vqtl_failed} ***")
+        print(f"*** SCENARIOS WITH FAILED vQTL CHECKS (has_failures): {vqtl_failed} ***")
     if not failed and not vqtl_failed:
-        print("\n*** Tutti gli scenari completati senza errori bloccanti. ***")
+        print("\n*** All scenarios completed with no blocking errors. ***")
 
     return {
         "all_results": all_results,
@@ -680,12 +743,12 @@ def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1) -> dic
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Orchestratore multi-scenario")
-    parser.add_argument("scenarios", nargs="*", help="Nomi scenari da lanciare (default: tutti)")
+    parser = argparse.ArgumentParser(description="Multi-scenario orchestrator")
+    parser.add_argument("scenarios", nargs="*", help="Scenario names to run (default: all)")
     parser.add_argument("--workers", type=int, default=1,
-                         help="Numero di scenari da eseguire in parallelo (processi separati). Default 1 (sequenziale).")
+                         help="Number of scenarios to run in parallel (separate processes). Default 1 (sequential).")
     parser.add_argument("--output-dir", default=None,
-                         help="Cartella dove scrivere scenarios/ (default: la cartella di questo script).")
+                         help="Folder where scenarios/ is written (default: this script's folder).")
     args = parser.parse_args()
 
     if args.output_dir:

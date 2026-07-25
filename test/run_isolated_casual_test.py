@@ -755,7 +755,83 @@ def generate_plots(df: pd.DataFrame, thresholds: dict) -> dict:
     return paths
 
 
-def generate_word_report(df: pd.DataFrame, plot_paths: dict, thresholds: dict) -> str:
+MANUSCRIPT_VQTL_RATIO_BINS = [0, 3, 6, 9, np.inf]
+MANUSCRIPT_VQTL_RATIO_LABELS = ["2-3", "3-6", "6-9", ">9"]
+MANUSCRIPT_GE_MAGNITUDE_BINS = [0, 1, 2, 3, 4, 5, 6, np.inf]
+MANUSCRIPT_GE_MAGNITUDE_LABELS = ["0-1", "1-2", "2-3", "3-4", "4-5", "5-6", ">6"]
+
+
+def generate_manuscript_power_curve(df: pd.DataFrame) -> str | None:
+    """Single two-panel, publication-ready figure summarizing detection
+    power as a function of simulated effect size: G×E interaction power by
+    |beta_inter| bin (left) and vQTL pure_variance power by between-dosage
+    variance-ratio bin (right). This is a compact companion to the more
+    granular per-mechanism plots produced by generate_plots() above (those
+    stay in the isolated report for internal review; this one is meant to
+    be dropped directly into the manuscript/supplementary, see
+    report_utils.write_manuscript_scenario_report). Returns the PNG path,
+    or None if neither panel has any data to plot."""
+    ge_power = df[df["ge_role"] == "power"].copy()
+    vqtl_power = df[df["vqtl_role"] == "power"].copy()
+    if ge_power.empty and vqtl_power.empty:
+        return None
+
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
+
+    ax = axes[0]
+    if not ge_power.empty:
+        ge_power["abs_beta"] = ge_power["beta_inter"].abs()
+        ge_power["bin"] = pd.cut(ge_power["abs_beta"], bins=MANUSCRIPT_GE_MAGNITUDE_BINS,
+                                  labels=MANUSCRIPT_GE_MAGNITUDE_LABELS, right=False)
+        by_bin = ge_power.groupby("bin", observed=True)["recovered_ge"].agg(n="size", detected="sum")
+        by_bin = by_bin[by_bin["n"] > 0]
+        by_bin["power_pct"] = 100 * by_bin["detected"] / by_bin["n"]
+        x = range(len(by_bin))
+        ax.plot(x, by_bin["power_pct"], marker="o", color="#8B1A2B", linewidth=1.8)
+        for xi, n in zip(x, by_bin["n"]):
+            ax.annotate(f"n={int(n)}", (xi, by_bin["power_pct"].iloc[xi] + 4), ha="center", fontsize=8, color="gray")
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(by_bin.index)
+    ax.set_xlabel("|beta_inter|")
+    ax.set_ylabel("Power to detect (%)")
+    ax.set_ylim(-5, 110)
+    ax.set_title("G×E interaction test", fontsize=11)
+    ax.axhline(80, ls="--", color="lightgray", linewidth=1, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    ax = axes[1]
+    if not vqtl_power.empty:
+        vqtl_power["var_ratio"] = vqtl_power["sd_by_dosage"].apply(_sd_ratio).astype(float) ** 2
+        vqtl_power["bin"] = pd.cut(vqtl_power["var_ratio"], bins=MANUSCRIPT_VQTL_RATIO_BINS,
+                                    labels=MANUSCRIPT_VQTL_RATIO_LABELS, right=False)
+        by_bin = vqtl_power.groupby("bin", observed=True)["recovered_vqtl"].agg(n="size", detected="sum")
+        by_bin = by_bin[by_bin["n"] > 0]
+        by_bin["power_pct"] = 100 * by_bin["detected"] / by_bin["n"]
+        x = range(len(by_bin))
+        ax.plot(x, by_bin["power_pct"], marker="o", color="#1A4E8B", linewidth=1.8)
+        for xi, n in zip(x, by_bin["n"]):
+            ax.annotate(f"n={int(n)}", (xi, by_bin["power_pct"].iloc[xi] + 4), ha="center", fontsize=8, color="gray")
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(by_bin.index)
+    ax.set_xlabel("Variance ratio (dosage groups)")
+    ax.set_ylabel("Power to detect (%)")
+    ax.set_ylim(-5, 110)
+    ax.set_title("vQTL (pure-variance) test", fontsize=11)
+    ax.axhline(80, ls="--", color="lightgray", linewidth=1, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.tight_layout()
+    p = os.path.join(PLOTS_DIR, "manuscript_power_curve.png")
+    fig.savefig(p, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return p
+
+
+def generate_word_report(df: pd.DataFrame, plot_paths: dict, thresholds: dict,
+                          manuscript_power_curve_path: str | None = None) -> str:
     ge_power = df[df["ge_role"] == "power"]
     ge_fpr = df[df["ge_role"] == "fpr_control"]
     vqtl_power = df[df["vqtl_role"] == "power"]
@@ -788,6 +864,22 @@ def generate_word_report(df: pd.DataFrame, plot_paths: dict, thresholds: dict) -
         f"(method used this run: {thresholds['method']}, ratio_low={thresholds['ratio_low']:.3f}, "
         f"ratio_high={thresholds['ratio_high']:.3f})."
     )
+
+    if manuscript_power_curve_path and os.path.exists(manuscript_power_curve_path):
+        doc.add_heading("Manuscript figure — detection power vs. simulated effect size", level=1)
+        doc.add_picture(manuscript_power_curve_path, width=Inches(6.3))
+        cap = doc.add_paragraph(
+            "Power to detect simulated effects in single-variant isolation tests, shown "
+            "separately for the G×E interaction test (left, by |beta_inter| bin) and the "
+            "vQTL pure-variance test (right, by between-dosage variance-ratio bin). Point "
+            "labels show the number of simulated variants per bin; dashed line marks 80% "
+            "power. This is the compact figure meant for the manuscript/supplementary; see "
+            "the per-mechanism plots below for the underlying, more granular views."
+        )
+        cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in cap.runs:
+            run.italic = True
+            run.font.size = Pt(9)
 
     doc.add_heading("Summary", level=1)
     if not ge_power.empty:
@@ -964,7 +1056,18 @@ def run_isolated_phase(n_workers: int = 1, force: bool = False) -> dict:
     plot_paths = generate_plots(df, thresholds)
     for name, p in plot_paths.items():
         print(f"[plot] {name}: {p}")
-    report_path = generate_word_report(df, plot_paths, thresholds)
+
+    # Compact two-panel figure meant for the manuscript/supplementary (see
+    # docstring): kept separate from plot_paths above so it does not get
+    # swept into the generic per-mechanism "Plots" section of the Word
+    # report, and so run_scenarios.py can find it on disk at a fixed path
+    # (isolated/plots/manuscript_power_curve.png) to embed it into the
+    # scenario comparison report too.
+    manuscript_power_curve_path = generate_manuscript_power_curve(df)
+    if manuscript_power_curve_path:
+        print(f"[plot] manuscript_power_curve: {manuscript_power_curve_path}")
+
+    report_path = generate_word_report(df, plot_paths, thresholds, manuscript_power_curve_path)
     print(f"[export] {report_path}")
 
     ok = df[df["status"] == "ok"]
