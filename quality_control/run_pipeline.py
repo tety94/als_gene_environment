@@ -93,19 +93,40 @@ class Logger:
 
 
 def run_step(log: Logger, name: str, cmd: list, dry_run: bool, env: dict | None = None) -> int:
+    """
+    Runs cmd and streams its combined stdout+stderr both to the console
+    (live, same as before) and into the master run log, line by line.
+    Previously this used subprocess.run(cmd) with no output capture: the
+    step's own output (warnings, verdicts, "saved to" messages, etc.)
+    went straight to the terminal and was never written to the
+    run_pipeline_<timestamp>.log file -- only the start/OK/FAILED marker
+    lines were. Each step still writes its own detailed files
+    (diagnostics_report.txt/.json, logs/*.log for the bash steps) so
+    nothing was ever actually lost, but the master log alone wasn't a
+    complete record of the run. This fixes that.
+    """
     printable = " ".join(shlex.quote(str(c)) for c in cmd)
     log(f"\n{'-'*70}\n>>> [{name}] {printable}\n{'-'*70}")
     if dry_run:
         log(f">>> [{name}] (dry-run, not executed)")
         return 0
     t0 = time.time()
-    result = subprocess.run(cmd, env=env)
+    full_env = dict(env if env is not None else os.environ)
+    full_env.setdefault("PYTHONUNBUFFERED", "1")  # so python3 steps stream line-by-line, not in one block at the end
+    process = subprocess.Popen(
+        cmd, env=full_env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    for line in process.stdout:
+        log(line.rstrip("\n"))
+    process.wait()
     elapsed = time.time() - t0
-    if result.returncode == 0:
+    if process.returncode == 0:
         log(f">>> [{name}] OK in {elapsed:.1f}s")
     else:
-        log(f">>> [{name}] FAILED (exit code {result.returncode}) after {elapsed:.1f}s")
-    return result.returncode
+        log(f">>> [{name}] FAILED (exit code {process.returncode}) after {elapsed:.1f}s")
+    return process.returncode
 
 
 # ---------------------------------------------------------------------------

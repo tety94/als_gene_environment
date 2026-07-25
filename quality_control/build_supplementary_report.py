@@ -320,49 +320,8 @@ def build_relatedness(doc, kinship_dir, diagnostics_dir, counters):
     doc.add_paragraph()
 
 
-def build_sex_check(doc, qc_dir, supp_plots_dir, counters):
-    doc.add_heading("5. Sex Check", level=1)
-    sexcheck_path = qc_dir / "sex_check.sexcheck"
-    if not sexcheck_path.exists():
-        add_missing_note(doc, "sex-check table", sexcheck_path)
-        return
-
-    df = read_plink_table(sexcheck_path)
-    n_total = len(df)
-    n_problem = int((df["STATUS"] == "PROBLEM").sum()) if "STATUS" in df.columns else None
-
-    label = counters.table()
-    add_caption(doc, label, "Genetic sex check summary (PLINK2 --check-sex).")
-    summary_df = pd.DataFrame({
-        "Metric": ["Samples evaluated", "Sex mismatches flagged (STATUS = PROBLEM)"],
-        "Value": [n_total, n_problem if n_problem is not None else "n/a"],
-    })
-    add_df_table(doc, summary_df, col_widths_in=[3.5, 2.5])
-    doc.add_paragraph()
-
-    if n_problem:
-        flagged_csv = supp_plots_dir / "sex_check_flagged_samples.csv"
-        if flagged_csv.exists():
-            p = doc.add_paragraph()
-            run = p.add_run(
-                f"Flagged sample IDs are listed in {flagged_csv.name}; these should be "
-                f"cross-checked against reported sex in the metadata and excluded or resolved "
-                f"before downstream analysis."
-            )
-            run.italic = True
-
-    fig_path = supp_plots_dir / "sex_check_distribution.png"
-    if fig_path.exists():
-        flabel = counters.figure()
-        add_figure(doc, fig_path)
-        add_caption(doc, flabel, "Distribution of chrX heterozygosity F-statistic by sex-check status.", above=False)
-    else:
-        add_missing_note(doc, "sex-check distribution figure", fig_path)
-    doc.add_paragraph()
-
-
 def build_heterozygosity(doc, qc_dir, supp_plots_dir, counters, sd_threshold=3.0):
-    doc.add_heading("6. Heterozygosity Outlier Check", level=1)
+    doc.add_heading("5. Heterozygosity Outlier Check", level=1)
     het_path = qc_dir / "heterozygosity.het"
     if not het_path.exists():
         add_missing_note(doc, "heterozygosity table", het_path)
@@ -396,7 +355,7 @@ def build_heterozygosity(doc, qc_dir, supp_plots_dir, counters, sd_threshold=3.0
 
 
 def build_population_structure(doc, kinship_dir, counters):
-    doc.add_heading("7. Population Structure and Batch Effects", level=1)
+    doc.add_heading("6. Population Structure and Batch Effects", level=1)
 
     eta_csv = kinship_dir / "pca_batch_eta2.csv"
     if eta_csv.exists():
@@ -410,8 +369,10 @@ def build_population_structure(doc, kinship_dir, counters):
         add_caption(doc, label, "Fraction of principal-component variance explained by genotyping batch.")
         add_df_table(doc, df)
         doc.add_paragraph()
-    else:
-        add_missing_note(doc, "PC-batch eta-squared table", eta_csv)
+    # else: no note here on purpose. qc_report.py only writes this table when
+    # the cohort has >= 2 genotyping batches to compare (see its --vcf-dirs
+    # docstring) -- with a single batch (the common case) there is nothing
+    # to compare and this is expected, not a missing/broken step.
 
     for fname, desc in [
         ("pca_scatter_by_batch.png", "Top two principal components, colored by genotyping batch."),
@@ -428,7 +389,7 @@ def build_population_structure(doc, kinship_dir, counters):
 
 
 def build_pc_exposure(doc, diagnostics_dir, counters):
-    doc.add_heading("8. Principal Components vs. Exposure", level=1)
+    doc.add_heading("7. Principal Components vs. Exposure", level=1)
 
     diag = load_diagnostics_summary(diagnostics_dir)
     if diag.get("pc_exposure_r2") is not None:
@@ -468,7 +429,7 @@ def build_pc_exposure(doc, diagnostics_dir, counters):
 
 
 def build_maf_and_missingness(doc, supp_plots_dir, counters):
-    doc.add_heading("9. Allele Frequency Spectrum and Missingness", level=1)
+    doc.add_heading("8. Allele Frequency Spectrum and Missingness", level=1)
 
     for fname, desc in [
         ("maf_spectrum.png", "Minor allele frequency (MAF) spectrum after filtering."),
@@ -485,20 +446,33 @@ def build_maf_and_missingness(doc, supp_plots_dir, counters):
 
 
 def build_genomic_inflation(doc, diagnostics_dir, counters):
-    doc.add_heading("10. Genomic Inflation", level=1)
-
     diag = load_diagnostics_summary(diagnostics_dir)
-    if diag.get("lambda_gc") is not None:
-        label = counters.table()
-        add_caption(doc, label, "Genomic inflation factor summary.")
-        df = pd.DataFrame({
-            "Metric": ["N tests", "Lambda GC"],
-            "Value": [f"{int(diag['lambda_gc_n_tests']):,}", f"{diag['lambda_gc']:.4f}"],
-        })
-        add_df_table(doc, df, col_widths_in=[3.0, 3.0])
-        doc.add_paragraph()
-    else:
-        add_missing_note(doc, "genomic inflation (lambda GC) summary", diagnostics_dir / "diagnostics_summary.json")
+    summary_path = diagnostics_dir / "diagnostics_summary.json"
+
+    if diag.get("lambda_gc") is None:
+        if not summary_path.exists():
+            # Genuine problem: interpret_plink_output.py never ran (or ran
+            # somewhere else) for this diagnostics_dir -- worth flagging.
+            doc.add_heading("9. Genomic Inflation", level=1)
+            add_missing_note(doc, "genomic inflation (lambda GC) summary", summary_path)
+        # else: the diagnostics step DID run, it just wasn't given
+        # --pvalues (no gwas_results configured yet for this cohort in
+        # pipeline_config.yaml). That's a normal, optional state, not an
+        # error -- skip this section (heading included) rather than show
+        # a "not found" note for a file that does in fact exist. Add
+        # gwas_results for this cohort in the config and re-run the
+        # `diagnostics` + `docx` steps to populate it.
+        return
+
+    doc.add_heading("9. Genomic Inflation", level=1)
+    label = counters.table()
+    add_caption(doc, label, "Genomic inflation factor summary.")
+    df = pd.DataFrame({
+        "Metric": ["N tests", "Lambda GC"],
+        "Value": [f"{int(diag['lambda_gc_n_tests']):,}", f"{diag['lambda_gc']:.4f}"],
+    })
+    add_df_table(doc, df, col_widths_in=[3.0, 3.0])
+    doc.add_paragraph()
 
     fig_path = diagnostics_dir / "qq_plot.png"
     if fig_path.exists():
@@ -548,7 +522,6 @@ def main():
     build_reproducibility(doc, qc_dir, counters)
     build_attrition(doc, attrition_csv, counters)
     build_relatedness(doc, kinship_dir, diagnostics_dir, counters)
-    build_sex_check(doc, qc_dir, supp_plots_dir, counters)
     build_heterozygosity(doc, qc_dir, supp_plots_dir, counters)
     build_population_structure(doc, kinship_dir, counters)
     build_pc_exposure(doc, diagnostics_dir, counters)

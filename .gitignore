@@ -11,3 +11,5 @@
 /test/logs
 /test/scenarios
 /test/isolated
+
+/quality_control/pipeline_config.yaml
