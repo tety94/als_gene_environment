@@ -1,31 +1,32 @@
 """
-Repository DB per vqtl -- stesso pattern (e stesso connection pool) di
-`gene_environment/db/repository.py`: insert dei placeholder con
-status='pending', poi update in bulk (executemany) man mano che i risultati
-vengono calcolati. Sostituisce i .tsv intermedi che la pipeline scriveva in
-precedenza (vqtl_results.tsv, filtered_snps_full.tsv, interaction_results.tsv,
-rge_results.tsv, robustness_results.tsv, perm_results.tsv): ora sono tabelle
-in `vqtl_scan_results` / `vqtl_interaction_results` / `vqtl_rge_het_results` /
-`vqtl_robustness_results` / `vqtl_permutation_results` (vedi db/schema.sql).
-report.md/report.docx/figures/*.png restano file (sono deliverable finali,
-non stato intermedio da riprendere).
+DB repository for vqtl -- same pattern (and the same connection pool) as
+`gene_environment/db/repository.py`: insert placeholders with
+status='pending', then bulk-update (executemany) as results are computed.
+Replaces the intermediate .tsv files the pipeline used to write
+(vqtl_results.tsv, filtered_snps_full.tsv, interaction_results.tsv,
+rge_results.tsv, robustness_results.tsv, perm_results.tsv): these are now
+tables in `vqtl_scan_results` / `vqtl_interaction_results` /
+`vqtl_rge_het_results` / `vqtl_robustness_results` /
+`vqtl_permutation_results` (see db/schema.sql). report.md/report.docx/
+figures/*.png remain files (they are final deliverables, not intermediate
+state to resume from).
 
-Riuso diretto di `gene_environment.db.connection` (stesso pool MySQL,
-"PID-aware": ogni processo worker di joblib che aprisse una connessione
-otterrebbe automaticamente un proprio pool, niente connessioni TCP
-condivise via fork -- vedi il modulo per il dettaglio). In pratica pero' le
-scritture avvengono sempre dal processo principale (chi consuma il
-generatore di joblib in scan.py), MAI dentro i worker: piu' semplice, ed
-evita comunque di aprire N pool paralleli per niente.
+Direct reuse of `gene_environment.db.connection` (same MySQL pool,
+"PID-aware": any joblib worker process that opens a connection
+automatically gets its own pool, no TCP connections shared across a fork --
+see that module for details). In practice, though, writes always happen
+from the main process (the one consuming joblib's generator in scan.py),
+NEVER inside the workers: simpler, and it also avoids opening N parallel
+pools for nothing.
 
-Le tabelle vqtl_interaction_results / vqtl_rge_het_results /
-vqtl_robustness_results / vqtl_permutation_results condividono tutte la
-stessa forma (chiave composta generation+variant+exposure[+altro], colonna
-status, colonne di statistiche): le funzioni generiche
-`ensure_placeholders` / `get_done_keys` / `bulk_update_status` /
-`fetch_results` coprono tutte e quattro senza duplicare la stessa logica
-4 volte. `vqtl_scan_results` ha una forma diversa (fingerprint, is_candidate,
-niente colonna "exposure") e resta con funzioni dedicate.
+The vqtl_interaction_results / vqtl_rge_het_results /
+vqtl_robustness_results / vqtl_permutation_results tables all share the
+same shape (composite key generation+variant+exposure[+other], a status
+column, statistics columns): the generic functions `ensure_placeholders` /
+`get_done_keys` / `bulk_update_status` / `fetch_results` cover all four
+without duplicating the same logic 4 times. `vqtl_scan_results` has a
+different shape (fingerprint, is_candidate, no "exposure" column) and keeps
+its own dedicated functions.
 """
 from __future__ import annotations
 
@@ -42,10 +43,11 @@ log = get_logger(__name__)
 
 
 def safe_val(x):
-    """Converte NaN/tipi numpy in valori compatibili col driver MySQL.
-    Identica a gene_environment.db.repository.safe_val (duplicata qui,
-    invece di importarla, per non accoppiare vqtl a un dettaglio interno di
-    un modulo di gene_environment pensato per un'altra tabella)."""
+    """Converts NaN/numpy types into values compatible with the MySQL
+    driver. Identical to gene_environment.db.repository.safe_val
+    (duplicated here, rather than imported, so vqtl is not coupled to an
+    internal detail of a gene_environment module meant for a different
+    table)."""
     if x is None:
         return None
     if isinstance(x, float) and math.isnan(x):
@@ -60,7 +62,7 @@ def safe_val(x):
 
 
 # ============================================================
-# Step 3+4: vqtl_scan_results (scan genoma-wide + filtro candidati)
+# Step 3+4: vqtl_scan_results (genome-wide scan + candidate filter)
 # ============================================================
 
 def get_scan_fingerprint(generation: int) -> dict | None:
@@ -74,10 +76,10 @@ def get_scan_fingerprint(generation: int) -> dict | None:
 
 
 def reset_scan_run(generation: int, fingerprint: dict) -> None:
-    """Cancella tutte le righe di vqtl_scan_results per questa generazione
-    e registra la nuova fingerprint -- chiamata solo quando la fingerprint
-    salvata NON corrisponde piu' a quella corrente (parametri statistici
-    cambiati, o primo run)."""
+    """Deletes all vqtl_scan_results rows for this generation and records
+    the new fingerprint -- called only when the saved fingerprint no longer
+    matches the current one (statistical parameters changed, or first
+    run)."""
     with get_connection() as conn:
         with cursor_scope(conn) as cur:
             cur.execute("DELETE FROM vqtl_scan_results WHERE generation=%s", (generation,))
@@ -86,12 +88,13 @@ def reset_scan_run(generation: int, fingerprint: dict) -> None:
                 "ON DUPLICATE KEY UPDATE fingerprint=VALUES(fingerprint)",
                 (generation, json.dumps(fingerprint)),
             )
-    log.info("vqtl_scan_results ripulita per generation=%s (nuova fingerprint registrata).", generation)
+    log.info("vqtl_scan_results cleared for generation=%s (new fingerprint recorded).", generation)
 
 
 def ensure_scan_placeholders(generation: int, variants: list[dict], chunk_size: int = 5000) -> int:
-    """Insert IGNORE dei placeholder (status='pending') per ogni variante
-    dello scan, se non esistono gia'. `variants`: [{'variant','chromosome','position'}, ...]."""
+    """Insert IGNORE of the placeholders (status='pending') for every
+    variant in the scan, if they do not already exist. `variants`:
+    [{'variant','chromosome','position'}, ...]."""
     if not variants:
         return 0
     sql = (
@@ -106,7 +109,7 @@ def ensure_scan_placeholders(generation: int, variants: list[dict], chunk_size: 
                 data = [(generation, v["variant"], v.get("chromosome"), v.get("position")) for v in chunk]
                 cur.executemany(sql, data)
                 total += cur.rowcount
-    log.info("vqtl_scan_results: %d placeholder inseriti/gia' presenti (generation=%s)", len(variants), generation)
+    log.info("vqtl_scan_results: %d placeholders inserted/already present (generation=%s)", len(variants), generation)
     return total
 
 
@@ -131,13 +134,13 @@ def mark_scan_in_progress(generation: int, variant_list: list[str]) -> None:
 
 
 def save_scan_chunk_results(generation: int, rows: list[dict]) -> None:
-    """Aggiorna in bulk lo stato/le statistiche di un chunk di varianti gia'
-    processate. Ogni riga ha SEMPRE status 'done' o 'failed' (mai piu'
-    'pending'/'in_progress' dopo questa chiamata): una variante scartata dai
-    filtri MAF/call-rate o per cui la quantile regression non converge e'
-    comunque 'done' (con le colonne statistiche a NULL), non 'pending' --
-    altrimenti un run successivo la ritenterebbe all'infinito credendola
-    ancora da fare."""
+    """Bulk-updates the status/statistics of a chunk of already-processed
+    variants. Every row ALWAYS ends up with status 'done' or 'failed'
+    (never 'pending'/'in_progress' again after this call): a variant
+    discarded by the MAF/call-rate filters, or one for which the quantile
+    regression does not converge, is still 'done' (with the statistics
+    columns set to NULL), not 'pending' -- otherwise a subsequent run would
+    retry it forever, thinking it still needs to be processed."""
     if not rows:
         return
     sql = """
@@ -160,9 +163,9 @@ def save_scan_chunk_results(generation: int, rows: list[dict]) -> None:
 
 
 def update_gc_correction(generation: int, rows: list[dict]) -> None:
-    """rows: [{'variant','p_gc','fdr_gc'}, ...] per TUTTE le varianti con
-    esito (non solo i candidati) -- la correzione genomic-control e' calcolata
-    sull'intero scan."""
+    """rows: [{'variant','p_gc','fdr_gc'}, ...] for ALL variants with a
+    result (not only the candidates) -- the genomic-control correction is
+    computed on the whole scan."""
     if not rows:
         return
     sql = "UPDATE vqtl_scan_results SET p_gc=%(p_gc)s, fdr_gc=%(fdr_gc)s WHERE generation=%(generation)s AND variant=%(variant)s"
@@ -181,19 +184,19 @@ def mark_candidates(generation: int, variant_list: list[str]) -> None:
                     "UPDATE vqtl_scan_results SET is_candidate=1 WHERE generation=%s AND variant=%s",
                     [(generation, v) for v in variant_list],
                 )
-    log.info("vqtl_scan_results: %d candidati marcati (generation=%s)", len(variant_list), generation)
+    log.info("vqtl_scan_results: %d candidates marked (generation=%s)", len(variant_list), generation)
 
 
 _SCAN_SIG_COLS = ["variant", "chromosome", "position", "n", "maf", "beta_qi", "se", "z", "p", "p_gc", "fdr_gc"]
 
 
 def count_significant_scan(generation: int) -> int:
-    """Quante righe ci sono gia' in vqtl_scan_results_significant per questa
-    generazione. Usata come segnale di short-circuit in cli.py: se > 0 (e
-    non e' stato passato --force), lo scan genoma-wide e il filtro vengono
-    SALTATI del tutto per questa generazione, i risultati si leggono
-    direttamente da qui + da vqtl_scan_results (gia' popolata insieme, nello
-    stesso run in cui e' stata popolata questa tabella)."""
+    """How many rows already exist in vqtl_scan_results_significant for
+    this generation. Used as the short-circuit signal in cli.py: if > 0
+    (and --force was not passed), the genome-wide scan and the filter step
+    are SKIPPED entirely for this generation, and results are read directly
+    from here + from vqtl_scan_results (populated together, in the same run
+    that populated this table)."""
     with get_connection() as conn:
         with cursor_scope(conn) as cur:
             cur.execute("SELECT COUNT(*) FROM vqtl_scan_results_significant WHERE generation=%s", (generation,))
@@ -201,11 +204,11 @@ def count_significant_scan(generation: int) -> int:
 
 
 def sync_scan_significant(generation: int) -> int:
-    """Risincronizza vqtl_scan_results_significant con l'attuale insieme di
-    candidati (is_candidate=1) in vqtl_scan_results per questa generazione:
-    DELETE + INSERT ... SELECT in una sola query, cosi' resta sempre uno
-    specchio esatto (mai righe stantie di un filtro precedente). Chiamata
-    alla fine dello Step 4 (filter)."""
+    """Resynchronizes vqtl_scan_results_significant with the current set of
+    candidates (is_candidate=1) in vqtl_scan_results for this generation:
+    DELETE + INSERT ... SELECT in a single query, so it always stays an
+    exact mirror (never stale rows from a previous filter). Called at the
+    end of Step 4 (filter)."""
     with get_connection() as conn:
         with cursor_scope(conn) as cur:
             cur.execute("DELETE FROM vqtl_scan_results_significant WHERE generation=%s", (generation,))
@@ -219,7 +222,7 @@ def sync_scan_significant(generation: int) -> int:
                 (generation,),
             )
             n = cur.rowcount
-    log.info("vqtl_scan_results_significant: %d righe sincronizzate (generation=%s)", n, generation)
+    log.info("vqtl_scan_results_significant: %d rows synchronized (generation=%s)", n, generation)
     return n
 
 
@@ -228,10 +231,11 @@ _SCAN_RENAME = {"chromosome": "CHR", "position": "POS", "n": "N", "beta_qi": "be
 
 
 def get_scan_results(generation: int, only_done: bool = True) -> pd.DataFrame:
-    """only_done=True: solo righe con un risultato VALIDO (status='done' E
-    p non nullo) -- una variante 'done' ma scartata da call-rate/MAF/QR ha
-    comunque status='done' (vedi save_scan_chunk_results) ma nessun p, e non
-    ha senso includerla in Manhattan/QQ/FDR a valle."""
+    """only_done=True: only rows with a VALID result (status='done' AND p
+    not null) -- a variant that is 'done' but discarded by call-rate/MAF/QR
+    still has status='done' (see save_scan_chunk_results) but no p, and it
+    makes no sense to include it downstream in the Manhattan/QQ/FDR
+    outputs."""
     where = "generation=%s" + (" AND status='done' AND p IS NOT NULL" if only_done else "")
     with get_connection() as conn:
         with cursor_scope(conn, dictionary=True) as cur:
@@ -252,12 +256,12 @@ def get_candidates(generation: int) -> pd.DataFrame:
 
 
 # ============================================================
-# Tabelle "keyed" generiche (Step 5/6/7): interaction / rge_het /
-# robustness / permutation condividono la stessa forma di base.
+# Generic "keyed" tables (Step 5/6/7): interaction / rge_het /
+# robustness / permutation all share the same basic shape.
 # ============================================================
 
-# nome logico -> (nome tabella reale, colonne chiave extra oltre a
-# generation+variant+exposure, colonne di statistiche aggiornate a fine step)
+# logical name -> (real table name, extra key columns beyond
+# generation+variant+exposure, statistics columns updated at the end of the step)
 _KEYED_TABLES: dict[str, dict] = {
     "interaction": {
         "table": "vqtl_interaction_results",
@@ -291,7 +295,7 @@ _KEYED_TABLES: dict[str, dict] = {
 
 def _spec(name: str) -> dict:
     if name not in _KEYED_TABLES:
-        raise ValueError(f"Tabella vqtl sconosciuta: {name!r} (attese: {list(_KEYED_TABLES)})")
+        raise ValueError(f"Unknown vqtl table: {name!r} (expected one of: {list(_KEYED_TABLES)})")
     return _KEYED_TABLES[name]
 
 
@@ -316,7 +320,7 @@ def ensure_placeholders(name: str, generation: int, rows: list[dict], chunk_size
                 ]
                 cur.executemany(sql, data)
                 total += cur.rowcount
-    log.info("%s: %d placeholder inseriti/gia' presenti (generation=%s)", spec["table"], len(rows), generation)
+    log.info("%s: %d placeholders inserted/already present (generation=%s)", spec["table"], len(rows), generation)
     return total
 
 
@@ -377,14 +381,14 @@ def fetch_results(name: str, generation: int, only_done: bool = True) -> pd.Data
 
 
 def clear_downstream_for_variants(generation: int, variant_list: list[str]) -> None:
-    """Cancella le righe di TUTTE le tabelle 'keyed' (interaction/rge_het/
-    robustness/permutation) relative a varianti specifiche, per una
-    generazione. Chiamata da filter_candidates() quando una variante che
-    era candidata in un run precedente NON lo e' piu' (soglia/top_n cambiati
-    tra un filtro e l'altro): senza questa pulizia, le tabelle a valle
-    accumulerebbero righe 'done' orfane di varianti non piu' rilevanti, che
-    fetch_results() includerebbe comunque nei risultati (non c'e' nessun
-    filtro per candidacy corrente in quelle tabelle, solo per generation+status)."""
+    """Deletes rows from ALL 'keyed' tables (interaction/rge_het/
+    robustness/permutation) for specific variants, for a given generation.
+    Called by filter_candidates() when a variant that was a candidate in a
+    previous run no longer is (threshold/top_n changed between filter
+    runs): without this cleanup, the downstream tables would accumulate
+    orphaned 'done' rows for variants that are no longer relevant, and
+    fetch_results() would still include them in the results (there is no
+    filter on current candidacy in those tables, only on generation+status)."""
     if not variant_list:
         return
     with get_connection() as conn:
@@ -394,15 +398,15 @@ def clear_downstream_for_variants(generation: int, variant_list: list[str]) -> N
                     f"DELETE FROM {spec['table']} WHERE generation=%s AND variant=%s",
                     [(generation, v) for v in variant_list],
                 )
-    log.info("Ripulite righe orfane in tutte le tabelle keyed per %d varianti non piu' candidate (generation=%s)", len(variant_list), generation)
+    log.info("Cleared orphaned rows in all keyed tables for %d variants no longer candidates (generation=%s)", len(variant_list), generation)
 
 
 # ============================================================
-# vqtl_interaction_results_significant: stesso principio di
-# vqtl_scan_results_significant (mirror + risincronizzazione), ma qui SENZA
-# funzione di short-circuit sul calcolo -- vedi il commento nello schema.sql
-# sul perche'. Serve solo come fonte diretta per Table 2 (Results) del
-# report.docx, invece di rifiltrare vqtl_interaction_results ogni volta.
+# vqtl_interaction_results_significant: same principle as
+# vqtl_scan_results_significant (mirror + resynchronization), but WITHOUT a
+# compute short-circuit function -- see the comment in schema.sql for why.
+# It only serves as a direct source for Table 2 (Results) of report.docx,
+# instead of re-filtering vqtl_interaction_results every time.
 # ============================================================
 
 _INTERACTION_SIG_COLS = ["variant", "exposure", "chromosome", "position", "beta_i", "se", "pval", "n", "maf"]
@@ -422,7 +426,7 @@ def sync_interaction_significant(generation: int, p_threshold: float) -> int:
                 (generation, p_threshold),
             )
             n = cur.rowcount
-    log.info("vqtl_interaction_results_significant: %d righe sincronizzate (generation=%s, p<%s)", n, generation, p_threshold)
+    log.info("vqtl_interaction_results_significant: %d rows synchronized (generation=%s, p<%s)", n, generation, p_threshold)
     return n
 
 

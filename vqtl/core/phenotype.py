@@ -1,12 +1,11 @@
 """
-Preparazione del fenotipo per lo scan vQTL (ex Step 2 del progetto originale).
+Phenotype preparation for the vQTL scan.
 
-Logica statistica invariata rispetto all'originale (z-score, log, rank-based
-inverse-normal transform): e' genuinamente specifica del metodo vQTL/QUAIL e
-non ha equivalente in gene_environment (che non trasforma onset_age, lo usa
-cosi' com'e' nel matching+OLS). L'unica differenza e' che opera direttamente
-sul DataFrame gia' unito da `core.data.load_vqtl_dataset` invece che su un
-phenotype_clean.tsv scritto da uno step precedente.
+This is genuinely specific to the vQTL/QUAIL method (z-score, log,
+rank-based inverse-normal transform) and has no equivalent in
+gene_environment (which does not transform onset_age, using it as-is in
+matching+OLS). It operates directly on the DataFrame already merged by
+`core.data.load_vqtl_dataset`.
 """
 from __future__ import annotations
 
@@ -27,7 +26,7 @@ def rank_inverse_normal(x: np.ndarray) -> np.ndarray:
 
 
 def prepare_phenotype(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
-    """Aggiunge <target_col>_z, _log, _rint. Ritorna una COPIA di df."""
+    """Adds <target_col>_z, _log, _rint. Returns a COPY of df."""
     df = df.copy()
     y = pd.to_numeric(df[target_col], errors="coerce").values.astype(float)
 
@@ -40,7 +39,7 @@ def prepare_phenotype(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
     df[f"{target_col}_rint"] = rank_inverse_normal(y)
 
     log.info(
-        "Fenotipo '%s' preparato: n=%d, media=%.3f, sd=%.3f (colonne aggiunte: _z, _log, _rint)",
+        "Phenotype '%s' prepared: n=%d, mean=%.3f, sd=%.3f (columns added: _z, _log, _rint)",
         target_col, len(df), np.nanmean(y), np.nanstd(y),
     )
     return df

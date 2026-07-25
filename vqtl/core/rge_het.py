@@ -1,18 +1,18 @@
 """
-Step 6 - rGE (gene-environment correlation) e test di eteroschedasticita',
-per ogni SNP candidato x esposizione:
-  1. rGE: SNP_dosage ~ esposizione + covariate (OLS, HC3). Un coefficiente
-     dell'esposizione significativo suggerisce che genotipo ed esposizione
-     non sono indipendenti in questo campione -- i SNP flaggati NON vengono
-     scartati, solo segnalati (come nell'originale).
-  2. Eteroschedasticita': fenotipo ~ SNP + esposizione + covariate (SENZA
-     interazione), test di Breusch-Pagan sui residui. Un BP significativo
-     segnala che le SE del modello di interazione (Step 5) vanno lette con
-     le versioni robuste (gia' l'impostazione di default li' -- vedi
-     `interaction.py`).
+Step 6 - rGE (gene-environment correlation) and heteroscedasticity test,
+for every candidate SNP x exposure pair:
+  1. rGE: SNP_dosage ~ exposure + covariates (OLS, HC3). A significant
+     exposure coefficient suggests genotype and exposure are not
+     independent in this sample -- flagged SNPs are NOT dropped, only
+     reported.
+  2. Heteroscedasticity: phenotype ~ SNP + exposure + covariates (WITHOUT
+     the interaction term), Breusch-Pagan test on the residuals. A
+     significant BP test signals that the interaction model's (Step 5)
+     standard errors should be read using their robust versions (already
+     the default there -- see `interaction.py`).
 
-Come per lo Step 5, il dosaggio e' gia' una colonna del DataFrame: niente
-piu' rilettura dei VCF (`extract_snp_dosage` duplicato nell'originale).
+As in Step 5, the dosage is already a column of the DataFrame, so no VCF
+re-reading is needed.
 """
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ def run_rge_het(
     from vqtl.db import repository as repo
 
     if candidates.empty:
-        log.warning("Nessun candidato: nessun test rGE/eteroschedasticita' da eseguire.")
+        log.warning("No candidates: no rGE/heteroscedasticity test to run.")
         return pd.DataFrame()
 
     inv_mapping = {v: k for k, v in dataset.mapping.items()}
@@ -94,7 +94,7 @@ def run_rge_het(
         safe_col = inv_mapping.get(snp_id)
         if safe_col is None:
             continue
-        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # bugfix: gestisce i "." (genotipo mancante) come NaN, come fa scan.py
+        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # missing genotypes ('.') are treated as NaN, same as scan.py
         for exp_raw, exp_std_col in dataset.exposure_std_cols.items():
             if (snp_id, exp_raw) in done_keys:
                 continue
@@ -102,7 +102,7 @@ def run_rge_het(
             tasks.append((snp_id, exp_raw, dosage, exposure_vals))
 
     log.info(
-        "Step 6 - rGE/eteroschedasticita': %d combinazioni da calcolare (%d gia' fatte)",
+        "Step 6 - rGE/heteroscedasticity: %d combinations to compute (%d already done)",
         len(tasks), len(done_keys),
     )
 
@@ -137,9 +137,9 @@ def run_rge_het(
         })
         n_rge = int(out_df["rGE_flag"].fillna(False).astype(bool).sum())
         n_het = int(out_df["heteroscedasticity_flag"].fillna(False).astype(bool).sum())
-        log.info("rGE flaggati (p<%.2g): %d/%d", vcfg.rge_het_alpha, n_rge, len(out_df))
-        log.info("Eteroschedasticita' flaggata (BP p<%.2g): %d/%d", vcfg.rge_het_alpha, n_het, len(out_df))
+        log.info("SNPs flagged for rGE (p<%.2g): %d/%d", vcfg.rge_het_alpha, n_rge, len(out_df))
+        log.info("Heteroscedasticity flagged (BP p<%.2g): %d/%d", vcfg.rge_het_alpha, n_het, len(out_df))
         if n_rge:
-            log.warning("I SNP flaggati per rGE NON vanno letti come prova definitiva di G x E senza ulteriori analisi.")
+            log.warning("SNPs flagged for rGE should NOT be read as definitive evidence of G x E without further analysis.")
 
     return out_df

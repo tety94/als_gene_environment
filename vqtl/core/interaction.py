@@ -1,18 +1,15 @@
 """
-Step 5 - test di interazione SNP x esposizione, per ogni SNP candidato
-(Step 4) e ogni esposizione in vcfg.exposures:
-    fenotipo ~ SNP + esposizione + SNP*esposizione + covariate
-via OLS (o logit se il fenotipo e' binario, mantenuto generico come
-nell'originale anche se onset_age e' quantitativo). SE robuste
-all'eteroschedasticita' (HC3/HC1) di default -- vedi audit nel README storico.
+Step 5 - SNP x exposure interaction test, for every candidate SNP (Step 4)
+and every exposure in vcfg.exposures:
+    phenotype ~ SNP + exposure + SNP*exposure + covariates
+via OLS (or logit if the phenotype is binary; kept generic even though
+onset_age is quantitative). Heteroscedasticity-robust standard errors
+(HC3/HC1) by default.
 
-UNICA differenza rispetto all'originale: il dosaggio del SNP candidato e la
-covariata sono gia' colonne del DataFrame costruito da
-`core.data.load_vqtl_dataset` (join fatto una volta sola a monte da
-gene_environment). Non serve piu' `extract_snp_dosage` (rilettura dei VCF
-per estrarre solo le SNP candidate, duplicata identica in step5/6/7/8 del
-progetto originale) -- e' la semplificazione piu' grande resa possibile dal
-riuso della matrice genotipica gia' costruita.
+SNP dosage and the covariates are already columns of the DataFrame built
+by `core.data.load_vqtl_dataset` (join performed once, upstream, by
+gene_environment), so no per-step VCF re-reading is needed to extract
+candidate SNP dosage.
 """
 from __future__ import annotations
 
@@ -76,16 +73,16 @@ def run_interaction_tests(
     from vqtl.db import repository as repo
 
     if candidates.empty:
-        log.warning("Nessun candidato dallo Step 4: nessun test di interazione da eseguire.")
+        log.warning("No candidates from Step 4: no interaction test to run.")
         return pd.DataFrame(columns=["SNP", "CHR", "POS", "exposure", "beta_I", "SE", "pval", "N", "MAF"])
 
     inv_mapping = {v: k for k, v in dataset.mapping.items()}
     y = dataset.df[target_col].to_numpy(dtype=float)
     covariates = dataset.df[dataset.covariate_cols].to_numpy(dtype=float) if dataset.covariate_cols else np.zeros((len(dataset.df), 0))
     binary_outcome = is_binary(dataset.df[target_col])
-    log.info("Fenotipo '%s' rilevato come %s", target_col, "binario (logit)" if binary_outcome else "quantitativo (OLS)")
+    log.info("Phenotype '%s' detected as %s", target_col, "binary (logit)" if binary_outcome else "quantitative (OLS)")
 
-    # ---- placeholder per ogni coppia SNP candidata x esposizione ----
+    # ---- placeholder for every candidate-SNP x exposure pair ----
     placeholder_rows = [
         {"variant": row["SNP"], "exposure": exp, "chromosome": row["CHR"], "position": row["POS"]}
         for _, row in candidates.iterrows() for exp in dataset.exposure_std_cols
@@ -99,7 +96,7 @@ def run_interaction_tests(
         safe_col = inv_mapping.get(snp_id)
         if safe_col is None:
             continue
-        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # bugfix: gestisce i "." (genotipo mancante) come NaN, come fa scan.py
+        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # missing genotypes ('.') are treated as NaN, same as scan.py
         for exp_raw, exp_std_col in dataset.exposure_std_cols.items():
             if (snp_id, exp_raw) in done_keys:
                 continue
@@ -107,7 +104,7 @@ def run_interaction_tests(
             tasks.append((snp_id, row["CHR"], row["POS"], exp_raw, dosage, exposure_vals))
 
     log.info(
-        "Step 5 - test di interazione: %d combinazioni da calcolare (%d gia' fatte in un run precedente), n_jobs=%s",
+        "Step 5 - interaction test: %d combinations to compute (%d already done in a previous run), n_jobs=%s",
         len(tasks), len(done_keys), vcfg.n_jobs,
     )
 
@@ -132,5 +129,5 @@ def run_interaction_tests(
         out_df = out_df.dropna(subset=["pval"])
         out_df = out_df[["SNP", "CHR", "POS", "exposure", "beta_I", "SE", "pval", "N", "MAF"]]
         out_df = out_df.sort_values("pval").reset_index(drop=True)
-    log.info("Step 5 completato: %d risultati.", len(out_df))
+    log.info("Step 5 complete: %d results.", len(out_df))
     return out_df

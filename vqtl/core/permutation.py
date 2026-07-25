@@ -1,39 +1,37 @@
 """
-Step 7 - robustezza e permutazioni sui top loci.
+Step 7 - robustness and permutations on the top loci.
 
-1. Ri-esegue il test di interazione dello Step 5 sui top loci con
-   trasformazioni alternative del fenotipo (log, rank-inverse-normal,
-   outlier rimossi |z|>3) per valutare la stabilita' di beta_I.
-2. Test di permutazione Freedman-Lane (invariato dall'audit del progetto
-   originale, vedi README storico punto 3): permuta i RESIDUI del modello
-   ridotto (y ~ SNP + esposizione + covariate, senza interazione), li
-   riaggiunge ai valori stimati dello stesso modello ridotto, poi rifitta il
-   modello COMPLETO (con interazione) sull'esito permutato. Preserva la
-   struttura di effetto principale sotto H0 ("nessuna interazione"), a
-   differenza di permutare direttamente il fenotipo grezzo (distrugge anche
-   la relazione covariate<->fenotipo, che non fa parte di H0).
-3. NELLO STESSO loop del punto 2 (stessa iterazione per locus, non uno step
-   separato): test di Levene permutazionale sulla varianza del fenotipo
-   residualizzato per gruppo genotipico, a conferma assumption-light
-   dell'effetto di varianza rilevato dallo scan QUAIL del Step 3 per questo
-   locus. Procedura: si calcola la statistica di Levene osservata sui gruppi
-   genotipo REALI (dosaggio arrotondato 0/1/2) del fenotipo residualizzato;
-   si permutano le ETICHETTE di genotipo (non i residui, a differenza del
-   punto 2) tenendo fisso il fenotipo residualizzato; si ricalcola la
-   statistica sui gruppi permutati; si ripete N_PERM volte per costruire una
-   distribuzione nulla empirica; la p-value e' la frazione di statistiche
-   permutate >= quella osservata. Qualsiasi asimmetria/non-normalita' della
-   distribuzione reale del fenotipo e' automaticamente assorbita nel null
-   (costruito dagli stessi dati), a differenza del test di Levene "da
-   manuale" che assume normalita' asintotica. Non e' una simulazione a
-   parte: usa la stessa infrastruttura di parallelizzazione (stessi
-   n_splits/joblib) del punto 2, dentro lo stesso ciclo sui top loci. Il
-   risultato dipende solo dal genotipo (non dall'esposizione): per un locus
-   con piu' esposizioni testate, viene calcolato una volta sola e riusato
-   per le righe successive dello stesso SNP.
+1. Re-runs the Step 5 interaction test on the top loci with alternative
+   phenotype transformations (log, rank-inverse-normal, outliers with
+   |z|>3 removed) to assess the stability of beta_I.
+2. Freedman-Lane permutation test: permutes the RESIDUALS of the reduced
+   model (y ~ SNP + exposure + covariates, without the interaction term),
+   adds them back to that same reduced model's fitted values, then refits
+   the FULL model (with interaction) on the permuted outcome. This
+   preserves the main-effect structure under H0 ("no interaction"), unlike
+   directly permuting the raw phenotype, which would also destroy the
+   covariate<->phenotype relationship (not part of H0).
+3. IN THE SAME loop as point 2 (same per-locus iteration, not a separate
+   step): a permutation-based Levene test on the variance of the
+   residualized phenotype by genotype group, as an assumption-light
+   confirmation of the variance effect detected by the Step 3 QUAIL scan
+   for this locus. Procedure: the observed Levene statistic is computed on
+   the REAL genotype groups (rounded 0/1/2 dosage) of the residualized
+   phenotype; the genotype LABELS are permuted (not the residuals, unlike
+   point 2) while keeping the residualized phenotype fixed; the statistic
+   is recomputed on the permuted groups; this is repeated N_PERM times to
+   build an empirical null distribution; the p-value is the fraction of
+   permuted statistics >= the observed one. Any asymmetry/non-normality in
+   the real phenotype distribution is automatically absorbed into the null
+   (built from the same data), unlike a textbook Levene test, which assumes
+   asymptotic normality. This is not a separate simulation: it uses the
+   same parallelization infrastructure (same n_splits/joblib) as point 2,
+   inside the same loop over the top loci. The result depends only on
+   genotype (not on exposure): for a locus with several tested exposures,
+   it is computed once and reused for the subsequent rows of the same SNP.
 
-Come per Step 5/6, il dosaggio arriva da una colonna del DataFrame gia'
-costruito (niente rilettura VCF).
+As in Step 5/6, dosage comes from a column of the DataFrame already built
+(no VCF re-reading).
 """
 from __future__ import annotations
 
@@ -67,11 +65,12 @@ def _fit_reduced_model(y, dosage, exposure_vals, covariates):
 
 
 def _levene_stat(genotype: np.ndarray, r: np.ndarray, min_group_size: int = 2) -> float:
-    """Statistica di Levene (center='median', cioe' Brown-Forsythe: robusta
-    a fenotipi non normali, la scelta standard) sui gruppi genotipici 0/1/2
-    del fenotipo residualizzato r. Gruppi con meno di min_group_size
-    osservazioni vengono esclusi (non abbastanza dati per stimare la
-    varianza in quel gruppo); se restano meno di 2 gruppi, non e' definita."""
+    """Levene statistic (center='median', i.e. Brown-Forsythe: robust to
+    non-normal phenotypes, the standard choice) on the 0/1/2 genotype
+    groups of the residualized phenotype r. Groups with fewer than
+    min_group_size observations are excluded (not enough data to estimate
+    the variance in that group); if fewer than 2 groups remain, the
+    statistic is undefined."""
     groups = [r[genotype == g] for g in (0, 1, 2) if np.sum(genotype == g) >= min_group_size]
     if len(groups) < 2:
         return np.nan
@@ -83,9 +82,9 @@ def _levene_stat(genotype: np.ndarray, r: np.ndarray, min_group_size: int = 2) -
 
 
 def _levene_perm_batch(genotype: np.ndarray, r: np.ndarray, n_perm_local: int, seed: int) -> np.ndarray:
-    """Permuta le ETICHETTE di genotipo (r resta fisso) e ricalcola la
-    statistica di Levene ad ogni iterazione: costruisce la distribuzione
-    nulla empirica per il test di varianza-per-genotipo del locus."""
+    """Permutes the genotype LABELS (r stays fixed) and recomputes the
+    Levene statistic at each iteration: builds the empirical null
+    distribution for the locus's variance-by-genotype test."""
     rng = np.random.default_rng(seed)
     n = len(genotype)
     out = np.empty(n_perm_local)
@@ -98,10 +97,10 @@ def _levene_perm_batch(genotype: np.ndarray, r: np.ndarray, n_perm_local: int, s
 def _run_levene_permutation_test(
     dosage: np.ndarray, y_orig: np.ndarray, covariates: np.ndarray, n_perm: int, n_jobs: int,
 ) -> dict:
-    """Test di Levene permutazionale completo per un locus (un SNP): vedi
-    punto 3 del docstring di modulo. Il fenotipo viene residualizzato sulle
-    STESSE covariate usate dallo scan Step 3 (vqtl.core.scan.residualize),
-    per coerenza con la definizione di "effetto di varianza" li' usata."""
+    """Full permutation-based Levene test for one locus (one SNP): see
+    point 3 of the module docstring. The phenotype is residualized on the
+    SAME covariates used by the Step 3 scan (vqtl.core.scan.residualize),
+    for consistency with the "variance effect" definition used there."""
     r_all, ok_mask = residualize(y_orig, covariates)
     ok = ok_mask & ~np.isnan(dosage)
     genotype = np.round(dosage[ok]).astype(int)
@@ -120,9 +119,10 @@ def _run_levene_permutation_test(
     null_dist = np.concatenate(batches)[:n_perm]
     null_dist = null_dist[~np.isnan(null_dist)]
     n_valid = len(null_dist)
-    # test one-sided: la statistica di Levene e' >= 0, "piu' grande" e' sempre
-    # nella direzione di "piu' eteroschedasticita'" (a differenza di beta_I,
-    # che puo' avere segno, qui non ha senso un confronto in valore assoluto)
+    # one-sided test: the Levene statistic is >= 0, "larger" is always in
+    # the direction of "more heteroscedasticity" (unlike beta_I, which can
+    # have either sign, so an absolute-value comparison would not make
+    # sense here)
     pval = (1 + np.sum(null_dist >= observed)) / (n_valid + 1) if n_valid else np.nan
 
     return {
@@ -138,7 +138,7 @@ def run_robustness_and_permutation(
     from vqtl.db import repository as repo
 
     if interaction_df.empty:
-        log.warning("Nessun risultato di interazione: Step 7 saltato.")
+        log.warning("No interaction results: Step 7 skipped.")
         return pd.DataFrame(), pd.DataFrame()
 
     inv_mapping = {v: k for k, v in dataset.mapping.items()}
@@ -146,7 +146,7 @@ def run_robustness_and_permutation(
     binary_outcome = is_binary(dataset.df[target_col])
 
     top_loci = interaction_df.sort_values("pval").head(vcfg.perm_top_n_loci).copy()
-    log.info("Step 7: top %d loci selezionati per robustezza e permutazioni.", len(top_loci))
+    log.info("Step 7: top %d loci selected for robustness and permutations.", len(top_loci))
 
     y_orig = dataset.df[target_col].to_numpy(dtype=float)
     y_log = dataset.df[f"{target_col}_log"].to_numpy(dtype=float)
@@ -160,7 +160,7 @@ def run_robustness_and_permutation(
         "outliers_removed": (y_orig, outlier_mask),
     }
 
-    # ---- 1. Robustezza su trasformazioni / outlier ----
+    # ---- 1. Robustness across transformations / outliers ----
     robustness_placeholders = [
         {"variant": row["SNP"], "exposure": row["exposure"], "chromosome": row["CHR"], "position": row["POS"], "phenotype_variant": pv}
         for _, row in top_loci.iterrows() for pv in phenotype_variants
@@ -175,7 +175,7 @@ def run_robustness_and_permutation(
         exp_std_col = dataset.exposure_std_cols.get(exp_raw)
         if safe_col is None or exp_std_col is None:
             continue
-        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # bugfix: gestisce i "." (genotipo mancante) come NaN, come fa scan.py
+        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # missing genotypes ('.') are treated as NaN, same as scan.py
         exposure_vals = dataset.df[exp_std_col].to_numpy(dtype=float)
 
         for variant_name, (yv, mask) in phenotype_variants.items():
@@ -196,9 +196,9 @@ def run_robustness_and_permutation(
         robustness_df = robustness_df.rename(columns={"beta_i": "beta_I", "n": "N", "maf": "MAF", "se": "SE", "phenotype_variant": "variant"})
         robustness_df = robustness_df.dropna(subset=["pval"])
 
-    # ---- 2. Permutazioni Freedman-Lane ----
+    # ---- 2. Freedman-Lane permutations ----
     n_perm = vcfg.n_perm
-    log.info("Step 7: %d permutazioni per %d top loci (n_jobs=%s)", n_perm, len(top_loci), vcfg.n_jobs)
+    log.info("Step 7: %d permutations for %d top loci (n_jobs=%s)", n_perm, len(top_loci), vcfg.n_jobs)
 
     perm_placeholders = [
         {"variant": row["SNP"], "exposure": row["exposure"], "chromosome": row["CHR"], "position": row["POS"]}
@@ -227,7 +227,7 @@ def run_robustness_and_permutation(
         exp_std_col = dataset.exposure_std_cols.get(exp_raw)
         if safe_col is None or exp_std_col is None:
             continue
-        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # bugfix: gestisce i "." (genotipo mancante) come NaN, come fa scan.py
+        dosage = dosage_matrix(dataset, [safe_col])[:, 0]  # missing genotypes ('.') are treated as NaN, same as scan.py
         exposure_vals = dataset.df[exp_std_col].to_numpy(dtype=float)
         observed_beta = row["beta_I"]
 
@@ -248,9 +248,9 @@ def run_robustness_and_permutation(
         n_valid = len(all_estimates)
         emp_p = (1 + np.sum(np.abs(all_estimates) >= abs(observed_beta))) / (n_valid + 1) if n_valid else np.nan
 
-        # Test di Levene permutazionale: dipende solo dal genotipo, non
-        # dall'esposizione -- calcolato una volta per SNP e riusato se lo
-        # stesso SNP compare di nuovo in top_loci per un'altra esposizione.
+        # Permutation-based Levene test: depends only on genotype, not on
+        # exposure -- computed once per SNP and reused if the same SNP
+        # appears again in top_loci for another exposure.
         if snp_id not in levene_cache:
             levene_cache[snp_id] = _run_levene_permutation_test(dosage, y_orig, covariates, n_perm, vcfg.n_jobs)
         levene_result = levene_cache[snp_id]
@@ -261,7 +261,7 @@ def run_robustness_and_permutation(
             "asymptotic_pval": row["pval"], **levene_result,
         }])
         log.info(
-            "%s x %s: beta_I=%.4g, p empirica=%.4g (asintotica=%.4g) | Levene stat=%s, p empirica=%s",
+            "%s x %s: beta_I=%.4g, empirical p=%.4g (asymptotic=%.4g) | Levene stat=%s, empirical p=%s",
             snp_id, exp_raw, observed_beta, emp_p, row["pval"],
             levene_result["levene_stat_observed"], levene_result["levene_pval"],
         )

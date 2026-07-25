@@ -1,14 +1,13 @@
 """
-Step 4 - visualizzazione + filtro dei candidati vQTL.
+Step 4 - vQTL candidate visualization and filtering.
 
-Logica statistica invariata rispetto all'originale (correzione genomic
-control lambda_GC, colonna P_gc, filtro di default su P_gc non sulla P
-asintotica grezza -- vedi l'audit descritto nel README storico). L'unica
-aggiunta e' l'FDR (Benjamini-Hochberg) via `gene_environment.utils.
-stats_utils.add_fdr`, riusato cosi' com'e' invece di reimplementare
-multipletests qui: non c'era nel progetto originale ma e' un'informazione
-utile da avere accanto a P_gc, e gene_environment lo fa gia' per il proprio
-test di interazione.
+Applies genomic-control correction (lambda_GC), adds a P_gc column, and by
+default filters candidates on P_gc rather than on the raw asymptotic P
+value. FDR (Benjamini-Hochberg) is added via
+`gene_environment.utils.stats_utils.add_fdr`, reused as-is instead of
+reimplementing multipletests here -- useful information to have alongside
+P_gc, and gene_environment already computes it for its own interaction
+test.
 """
 from __future__ import annotations
 
@@ -63,7 +62,7 @@ def _manhattan_plot(df: pd.DataFrame, out_path: str) -> None:
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    log.info("Scritto %s", out_path)
+    log.info("Wrote %s", out_path)
 
 
 def _qq_plot(pvals: np.ndarray, z_scores: np.ndarray, out_path: str) -> float:
@@ -83,17 +82,17 @@ def _qq_plot(pvals: np.ndarray, z_scores: np.ndarray, out_path: str) -> float:
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    log.info("Scritto %s (lambda_GC = %.3f)", out_path, lam)
+    log.info("Wrote %s (lambda_GC = %.3f)", out_path, lam)
     return lam
 
 
 def regenerate_plots(vqtl_df: pd.DataFrame, fig_dir: str) -> float:
-    """Rigenera SOLO manhattan/qq plot da un vqtl_df gia' completo di P/Z
-    (es. gia' in cache a DB da un run precedente), senza toccare P_gc/
-    candidati/DB -- usata nel percorso di short-circuit di cli.py quando una
-    generazione ha gia' risultati significativi salvati e lo scan viene
-    saltato del tutto, ma le figure vanno comunque (ri)generate per il
-    report."""
+    """Regenerates ONLY the manhattan/qq plots from a vqtl_df that already
+    has P/Z (e.g. already cached in the DB from a previous run), without
+    touching P_gc/candidates/DB -- used by cli.py's short-circuit path when
+    a generation already has significant results saved and the scan is
+    skipped entirely, but the figures still need to be (re)generated for
+    the report."""
     os.makedirs(fig_dir, exist_ok=True)
     if vqtl_df.empty:
         return float("nan")
@@ -102,17 +101,17 @@ def regenerate_plots(vqtl_df: pd.DataFrame, fig_dir: str) -> float:
 
 
 def filter_candidates(vqtl_df: pd.DataFrame, vcfg: VqtlConfig, fig_dir: str, generation: int) -> tuple[pd.DataFrame, pd.DataFrame, float]:
-    """Ritorna (vqtl_df_con_Pgc_e_fdr, candidati, lambda_GC). Persiste anche
-    a DB: P_gc/fdr_gc per tutte le varianti (update_gc_correction),
-    is_candidate per il sottoinsieme selezionato (mark_candidates), e
-    risincronizza vqtl_scan_results_significant (sync_scan_significant) --
-    e' quest'ultima tabella a decidere se un run successivo per la stessa
-    generazione puo' saltare lo scan (vedi cli.py)."""
+    """Returns (vqtl_df_with_Pgc_and_fdr, candidates, lambda_GC). Also
+    persists to the DB: P_gc/fdr_gc for all variants (update_gc_correction),
+    is_candidate for the selected subset (mark_candidates), and
+    resynchronizes vqtl_scan_results_significant (sync_scan_significant) --
+    it is this last table that decides whether a subsequent run for the
+    same generation can skip the scan (see cli.py)."""
     from vqtl.db import repository as repo
 
     os.makedirs(fig_dir, exist_ok=True)
     if vqtl_df.empty:
-        log.warning("vqtl_results vuoto: nessun plot/filtro possibile.")
+        log.warning("vqtl_results is empty: no plot/filter possible.")
         return vqtl_df, vqtl_df, float("nan")
 
     _manhattan_plot(vqtl_df, os.path.join(fig_dir, "manhattan_vqtl.png"))
@@ -122,42 +121,43 @@ def filter_candidates(vqtl_df: pd.DataFrame, vcfg: VqtlConfig, fig_dir: str, gen
     if lam and lam > 0 and not np.isnan(lam):
         chi2_corrected = df["Z"] ** 2 / lam
         df["P_gc"] = 1 - stats.chi2.cdf(chi2_corrected, df=1)
-        log.info("Genomic inflation lambda_GC = %.3f -- aggiunta colonna P_gc.", lam)
+        log.info("Genomic inflation lambda_GC = %.3f -- added P_gc column.", lam)
         if lam > 1.5:
             log.warning(
-                "lambda_GC = %.3f (>> 1). La P asintotica dello Step 3 e' nota per essere "
-                "anti-conservativa con un predittore di dosaggio discreto: trattala come "
-                "screening. Usa P_gc per una lista candidati piu' conservativa e conferma "
-                "sempre i top loci con la p-value empirica delle permutazioni (Step 7).", lam,
+                "lambda_GC = %.3f (>> 1). The asymptotic P from Step 3 is known to be "
+                "anti-conservative with a discrete dosage predictor: treat it as a "
+                "screening statistic. Use P_gc for a more conservative candidate list "
+                "and always confirm top loci with the empirical permutation p-value "
+                "(Step 7).", lam,
             )
     else:
         df["P_gc"] = df["P"]
-        log.warning("Impossibile calcolare lambda_GC; P_gc impostata uguale a P.")
+        log.warning("Could not compute lambda_GC; P_gc set equal to P.")
 
     df = add_fdr(df, p_col="P_gc", fdr_col="fdr_gc")
     repo.update_gc_correction(generation, df[["SNP", "P_gc", "fdr_gc"]].rename(columns={"SNP": "variant", "P_gc": "p_gc"}).to_dict("records"))
 
     p_col = vcfg.filter_p_column
     if p_col not in df.columns:
-        log.warning("filter_p_column='%s' non trovata nei risultati; uso 'P'.", p_col)
+        log.warning("filter_p_column='%s' not found in the results; using 'P'.", p_col)
         p_col = "P"
 
     if vcfg.filter_top_n:
         candidates = df.sort_values(p_col).head(vcfg.filter_top_n)
-        log.info("Filtro: top_n=%d (per %s)", vcfg.filter_top_n, p_col)
+        log.info("Filter: top_n=%d (by %s)", vcfg.filter_top_n, p_col)
     else:
         candidates = df[df[p_col] < vcfg.filter_p_threshold]
-        log.info("Filtro: %s < %s", p_col, vcfg.filter_p_threshold)
+        log.info("Filter: %s < %s", p_col, vcfg.filter_p_threshold)
 
-    log.info("Candidati selezionati: %d / %d", len(candidates), len(df))
+    log.info("Candidates selected: %d / %d", len(candidates), len(df))
 
     old_candidates = set(df[df["is_candidate"] == 1]["SNP"]) if "is_candidate" in df.columns else set()
     new_candidates = set(candidates["SNP"])
     dropped = old_candidates - new_candidates
     if dropped:
         log.warning(
-            "%d varianti erano candidate in un run precedente e non lo sono piu' (soglia/top_n cambiati): "
-            "ripulisco le loro righe da interaction/rge_het/robustness/permutation.", len(dropped),
+            "%d variants were candidates in a previous run and no longer are (threshold/top_n changed): "
+            "clearing their rows from interaction/rge_het/robustness/permutation.", len(dropped),
         )
         repo.clear_downstream_for_variants(generation, list(dropped))
 

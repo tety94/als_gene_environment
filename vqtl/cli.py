@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Entry point della pipeline vQTL, nello stesso stile di `gene_environment.cli`
-(un sottocomando per step, piu' `run-all`). Sostituisce `run_pipeline.sh` +
-gli 8 script `stepN_*.py` invocati singolarmente del progetto originale.
+Entry point of the vQTL pipeline, in the same style as `gene_environment.cli`
+(one subcommand per step, plus `run-all`).
 
-Esempi:
-    python -m vqtl.cli run-all --generation 2   # prima volta: calcola tutto
-    python -m vqtl.cli run-all --generation 1   # se gen1 ha gia' risultati
-                                                 # significativi in cache,
-                                                 # salta lo scan e legge da DB
+Examples:
+    python -m vqtl.cli run-all --generation 2   # first run: compute everything
+    python -m vqtl.cli run-all --generation 1   # if gen1 already has cached
+                                                 # significant results, skips
+                                                 # the scan and reads from DB
     python -m vqtl.cli scan --generation 1
     python -m vqtl.cli filter --generation 1
     python -m vqtl.cli interaction --generation 1
@@ -17,25 +16,25 @@ Esempi:
     python -m vqtl.cli report --generation 1
     python -m vqtl.cli docx --generation 1
 
-STATO: tutto (scan genoma-wide, candidati, interazione, rGE/eteroschedasticita',
-robustezza, permutazioni) e' persistito a DB (tabelle vqtl_*, vedi
-vqtl/db/schema.sql e vqtl/db/repository.py), non piu' in .tsv intermedi.
-Solo i deliverable finali restano file: report.md, report.docx, figures/*.png.
+STATE: everything (genome-wide scan, candidates, interaction, rGE/
+heteroscedasticity, robustness, permutations) is persisted to the DB
+(`vqtl_*` tables, see vqtl/db/schema.sql and vqtl/db/repository.py), not to
+intermediate .tsv files. Only the final deliverables remain files:
+report.md, report.docx, figures/*.png.
 
-SHORT-CIRCUIT: prima di calcolare qualunque cosa per una generazione,
-`run-all` controlla se vqtl_scan_results_significant ha gia' righe per
-quella generazione. Se si' (e non e' stato passato --force), lo scan
-genoma-wide E il filtro vengono saltati del tutto -- i risultati si leggono
-direttamente da DB -- e si passa subito allo Step 5 (interazione) sui
-candidati gia' noti. Se e' la prima volta che una generazione viene
-analizzata, o dopo --force, si calcola tutto da capo (come qualunque altro
-step, resta comunque ripreso automaticamente se interrotto a meta', vedi
-scan.py).
+SHORT-CIRCUIT: before computing anything for a generation, `run-all` checks
+whether vqtl_scan_results_significant already has rows for that generation.
+If so (and --force was not passed), the genome-wide scan AND the filter
+step are skipped entirely -- the results are read directly from the DB --
+and execution jumps straight to Step 5 (interaction) on the already-known
+candidates. If it is the first time a generation is analyzed, or after
+--force, everything is computed from scratch (like any other step, this
+still resumes automatically if interrupted midway, see scan.py).
 
-Il concetto di "coorte" (gen1 / gen2 / gen3 del progetto originale) coincide
-qui con `cfg.generation` di gene_environment (variabile GENERATION nel
-.env): --generation sovrascrive cfg.generation per il singolo comando senza
-toccare il .env.
+The "cohort" concept (gen1 / gen2 / gen3) maps directly onto
+`cfg.generation` from gene_environment (the GENERATION variable in .env):
+--generation overrides cfg.generation for the single command without
+touching the .env file.
 """
 from __future__ import annotations
 
@@ -177,13 +176,13 @@ def cmd_run_all(args) -> None:
     vcfg = get_vqtl_config()
     dataset, cohort_dir, gen = _load_prepared_dataset(args.generation, args.force)
 
-    log.info("=== vQTL run-all: generazione %s ===", gen)
+    log.info("=== vQTL run-all: generation %s ===", gen)
 
     n_sig = 0 if args.force else repo.count_significant_scan(gen)
     if n_sig > 0:
         log.info(
-            "Generazione %s ha gia' %d risultati significativi salvati a DB: "
-            "salto lo scan genoma-wide e il filtro, uso la cache (passa --force per rifare tutto da zero).",
+            "Generation %s already has %d significant results stored in the DB: "
+            "skipping the genome-wide scan and filter step, using the cache (pass --force to recompute everything from scratch).",
             gen, n_sig,
         )
         vqtl_df = repo.get_scan_results(gen)
@@ -217,20 +216,20 @@ def cmd_run_all(args) -> None:
         rge_df=rge_df, perm_df=perm_df, robustness_df=robustness_df,
     )
 
-    log.info("=== vQTL run-all completato: generazione %s -> %s , %s ===", gen, report_path, docx_path)
+    log.info("=== vQTL run-all complete: generation %s -> %s , %s ===", gen, report_path, docx_path)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Pipeline vQTL / G x E")
+    parser = argparse.ArgumentParser(description="vQTL / G x E pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def _add_common(p):
-        p.add_argument("--generation", type=int, default=None, help="Sovrascrive GENERATION del .env (coorte gen1/gen2/gen3) per questo comando")
-        p.add_argument("--force", action="store_true", help="Ricalcola tutto da zero, ignorando cache dataset E cache DB (scan gia' 'done', significativi gia' noti)")
+        p.add_argument("--generation", type=int, default=None, help="Overrides GENERATION from .env (gen1/gen2/gen3 cohort) for this command")
+        p.add_argument("--force", action="store_true", help="Recomputes everything from scratch, ignoring both the dataset cache and the DB cache (scan already 'done', already-known significant results)")
         p.add_argument("--significant-only", action="store_true",
-                       help="Limita alle varianti gia' note come significative (get_significant_results)")
+                       help="Restricts to variants already known to be significant (get_significant_results)")
         p.add_argument("--exposure", type=str, default=None,
-                       help="Filtra get_significant_results per esposizione (richiede --significant-only)")
+                       help="Filters get_significant_results by exposure (requires --significant-only)")
 
     for name in ["scan", "filter", "interaction", "rge-het", "permute", "report", "docx", "run-all"]:
         p = sub.add_parser(name)

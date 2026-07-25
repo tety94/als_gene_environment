@@ -1,37 +1,26 @@
 -- ============================================================
--- Schema per la persistenza a DB della pipeline vqtl.
--- Da eseguire UNA VOLTA sullo stesso database MySQL/MariaDB gia' usato da
--- gene_environment (stesso DB_NAME del .env, stesso pool di connessioni
--- gestito da gene_environment/db/connection.py -- vqtl non apre un DB suo).
+-- Schema for the DB-backed persistence of the vqtl pipeline.
+-- Run this ONCE against the same MySQL/MariaDB database already used by
+-- gene_environment (same DB_NAME from .env, same connection pool managed
+-- by gene_environment/db/connection.py -- vqtl does not open its own DB).
 --
 --   mysql -u <DB_USER> -p <DB_NAME> < vqtl/db/schema.sql
 --
--- NOTA MIGRAZIONE: se hai gia' eseguito una versione precedente di questo
--- schema (prima dell'aggiunta del test di Levene permutazionale in
--- vqtl_permutation_results), il CREATE TABLE IF NOT EXISTS qui sotto NON
--- aggiunge le nuove colonne a una tabella gia' esistente. In quel caso:
---   ALTER TABLE vqtl_permutation_results
---     ADD COLUMN levene_stat_observed DOUBLE,
---     ADD COLUMN levene_pval DOUBLE,
---     ADD COLUMN levene_n_perm_valid INT UNSIGNED;
--- (oppure, se i dati gia' calcolati non servono piu', DROP TABLE
--- vqtl_permutation_results; e rilancia questo file cosi' com'e'.)
---
--- Perche' queste tabelle e non variant_results (gia' esistente): il modello
--- dati e' diverso. variant_results e' una riga per (variant, exposure,
--- generation, test) con UN solo risultato di interazione per riga.
--- vqtl produce invece risultati a piu' stadi via via piu' selettivi (scan
--- genoma-wide -> candidati -> interazione -> rGE/eteroschedasticita' ->
--- permutazione -> robustezza), ciascuno con la propria chiave e le proprie
--- colonne: usare variant_results per tutto avrebbe richiesto o una singola
--- tabella con decine di colonne quasi sempre NULL, o sovraccaricare la
--- semantica delle colonne esistenti. Tabelle separate, stesso pattern
--- (status pending/in_progress/done/failed, insert dei placeholder, poi
--- update in bulk), stesso connection pool.
+-- Why these tables instead of variant_results (already existing): the data
+-- model is different. variant_results is one row per (variant, exposure,
+-- generation, test) with a SINGLE interaction result per row. vqtl instead
+-- produces results across several, progressively more selective stages
+-- (genome-wide scan -> candidates -> interaction -> rGE/heteroscedasticity
+-- -> permutation -> robustness), each with its own key and its own
+-- columns: using variant_results for everything would have required either
+-- a single table with dozens of almost-always-NULL columns, or overloading
+-- the semantics of its existing columns. Separate tables, same pattern
+-- (status pending/in_progress/done/failed, insert placeholders, then
+-- bulk-update), same connection pool.
 -- ============================================================
 
--- ---- Step 3+4: scan genoma-wide + filtro/candidati (stessa riga, il
--- filtro fa solo un UPDATE su is_candidate/p_gc/fdr_gc) ----
+-- ---- Step 3+4: genome-wide scan + filter/candidates (same row; the
+-- filter step only performs an UPDATE on is_candidate/p_gc/fdr_gc) ----
 CREATE TABLE IF NOT EXISTS vqtl_scan_results (
     generation      TINYINT UNSIGNED NOT NULL,
     variant         VARCHAR(191) NOT NULL,
@@ -55,18 +44,18 @@ CREATE TABLE IF NOT EXISTS vqtl_scan_results (
     INDEX idx_vqtl_scan_p (generation, p)
 ) ENGINE=InnoDB;
 
--- "Tabella dove salva solamente le cose significative": mirror di
--- vqtl_scan_results, ma SOLO le varianti candidate (is_candidate=1),
--- risincronizzata (DELETE + INSERT) ogni volta che gira lo Step 4 filter
--- per quella generazione. Ha due scopi:
---   1) e' la fonte diretta per Table 1 (Results) del report.docx, mentre
---      vqtl_scan_results resta la fonte per Supplementary Table S1;
---   2) e' il segnale di "short-circuit": se per una generazione questa
---      tabella ha gia' righe, un nuovo run per quella generazione SALTA
---      del tutto lo scan genoma-wide (il calcolo costoso) e il filtro,
---      e legge direttamente da qui + da vqtl_scan_results -- vedi
---      vqtl/cli.py e la funzione count_significant_scan/sync_scan_significant
---      in vqtl/db/repository.py.
+-- Significant-results mirror of vqtl_scan_results, holding ONLY the
+-- candidate variants (is_candidate=1), resynchronized (DELETE + INSERT)
+-- every time the Step 4 filter runs for that generation. It serves two
+-- purposes:
+--   1) it is the direct source for Table 1 (Results) of report.docx, while
+--      vqtl_scan_results remains the source for Supplementary Table S1;
+--   2) it is the "short-circuit" signal: if this table already has rows
+--      for a generation, a new run for that generation SKIPS the
+--      genome-wide scan (the expensive computation) and the filter step
+--      entirely, and reads directly from here + from vqtl_scan_results --
+--      see vqtl/cli.py and the count_significant_scan/sync_scan_significant
+--      functions in vqtl/db/repository.py.
 CREATE TABLE IF NOT EXISTS vqtl_scan_results_significant (
     generation      TINYINT UNSIGNED NOT NULL,
     variant         VARCHAR(191) NOT NULL,
@@ -84,18 +73,18 @@ CREATE TABLE IF NOT EXISTS vqtl_scan_results_significant (
     PRIMARY KEY (generation, variant)
 ) ENGINE=InnoDB;
 
--- Fingerprint della configurazione statistica corrente per ciascuna
--- generazione (taus, se_method, ...): se cambia rispetto a quanto salvato,
--- il repository ripulisce vqtl_scan_results per quella generazione e
--- reinserisce i placeholder, invece di riusare per sbaglio righe 'done'
--- calcolate con parametri diversi.
+-- Fingerprint of the current statistical configuration for each generation
+-- (taus, se_method, ...): if it differs from what is saved, the repository
+-- clears vqtl_scan_results for that generation and reinserts the
+-- placeholders, instead of accidentally reusing 'done' rows computed with
+-- different parameters.
 CREATE TABLE IF NOT EXISTS vqtl_scan_runs (
     generation   TINYINT UNSIGNED NOT NULL PRIMARY KEY,
     fingerprint  JSON NOT NULL,
     updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
--- ---- Step 5: test di interazione SNP x esposizione (solo candidati) ----
+-- ---- Step 5: SNP x exposure interaction test (candidates only) ----
 CREATE TABLE IF NOT EXISTS vqtl_interaction_results (
     generation      TINYINT UNSIGNED NOT NULL,
     variant         VARCHAR(191) NOT NULL,
@@ -114,17 +103,16 @@ CREATE TABLE IF NOT EXISTS vqtl_interaction_results (
     INDEX idx_vqtl_interaction_status (generation, status)
 ) ENGINE=InnoDB;
 
--- "Tabella dove salva solamente le cose significative" per lo Step 5:
--- mirror di vqtl_interaction_results, solo le coppie SNP x esposizione con
--- pval nominale < VQTL_INTERACTION_SIG_THRESHOLD (default 0.05 -- vedi
--- vqtl/config.py), risincronizzata ogni volta che gira lo Step 5 per quella
--- generazione. Fonte diretta per Table 2 (Results) del report.docx (mentre
--- vqtl_interaction_results resta la fonte per Supplementary Table S2). A
--- differenza della coppia scan/scan_significant, qui NON e' usata come
--- short-circuit per saltare il calcolo: lo Step 5 gira solo sui candidati
--- (gia' un insieme piccolo) e salta gia' da solo le coppie con status='done'
--- individualmente (vedi get_done_keys in repository.py), quindi non serve
--- un meccanismo di short-circuit aggiuntivo a livello di intera generazione.
+-- Significant-results mirror of vqtl_interaction_results for Step 5: only
+-- the SNP x exposure pairs with a nominal pval < VQTL_INTERACTION_SIG_THRESHOLD
+-- (default 0.05 -- see vqtl/config.py), resynchronized every time Step 5
+-- runs for that generation. Direct source for Table 2 (Results) of
+-- report.docx (while vqtl_interaction_results remains the source for
+-- Supplementary Table S2). Unlike the scan/scan_significant pair, this is
+-- NOT used as a short-circuit to skip computation: Step 5 only runs on the
+-- candidates (already a small set) and already skips individual
+-- status='done' pairs on its own (see get_done_keys in repository.py), so
+-- no additional whole-generation short-circuit is needed here.
 CREATE TABLE IF NOT EXISTS vqtl_interaction_results_significant (
     generation   TINYINT UNSIGNED NOT NULL,
     variant      VARCHAR(191) NOT NULL,
@@ -140,7 +128,7 @@ CREATE TABLE IF NOT EXISTS vqtl_interaction_results_significant (
     PRIMARY KEY (generation, variant, exposure)
 ) ENGINE=InnoDB;
 
--- ---- Step 6: rGE + eteroschedasticita' (solo candidati) ----
+-- ---- Step 6: rGE + heteroscedasticity (candidates only) ----
 CREATE TABLE IF NOT EXISTS vqtl_rge_het_results (
     generation                  TINYINT UNSIGNED NOT NULL,
     variant                     VARCHAR(191) NOT NULL,
@@ -163,7 +151,7 @@ CREATE TABLE IF NOT EXISTS vqtl_rge_het_results (
     INDEX idx_vqtl_rgehet_status (generation, status)
 ) ENGINE=InnoDB;
 
--- ---- Step 7a: robustezza a trasformazioni del fenotipo (solo top loci) ----
+-- ---- Step 7a: robustness to phenotype transformations (top loci only) ----
 CREATE TABLE IF NOT EXISTS vqtl_robustness_results (
     generation          TINYINT UNSIGNED NOT NULL,
     variant              VARCHAR(191) NOT NULL,
@@ -182,20 +170,20 @@ CREATE TABLE IF NOT EXISTS vqtl_robustness_results (
     PRIMARY KEY (generation, variant, exposure, phenotype_variant)
 ) ENGINE=InnoDB;
 
--- ---- Step 7b: permutazioni Freedman-Lane (solo top loci) ----
--- Oltre alla permutazione Freedman-Lane sull'interazione (beta_i_observed/
--- empirical_pval), nello STESSO loop (stessa iterazione, non uno step a
--- parte) si calcola anche un test di Levene permutazionale sulla varianza
--- del fenotipo residualizzato per gruppo genotipico: statistica di Levene
--- osservata sui gruppi genotipo reali -> permutazione delle ETICHETTE di
--- genotipo (non dei residui, a differenza del Freedman-Lane sopra) ->
--- statistica ricalcolata sui gruppi permutati -> distribuzione nulla
--- empirica -> p-value empirica. Conferma (o smentisce) in modo
--- assumption-light, sugli stessi dati, l'effetto di varianza rilevato dallo
--- scan QUAIL del Step 3 per il locus, senza le assunzioni asintotiche della
--- quantile regression. Il valore e' lo stesso per tutte le righe dello
--- stesso variant (non dipende dall'esposizione, la Levene e' univariata sul
--- genotipo).
+-- ---- Step 7b: Freedman-Lane permutations (top loci only) ----
+-- Besides the Freedman-Lane permutation on the interaction (beta_i_observed/
+-- empirical_pval), the SAME loop (same iteration, not a separate step)
+-- also computes a permutation-based Levene test on the variance of the
+-- residualized phenotype by genotype group: observed Levene statistic on
+-- the real genotype groups -> permutation of the genotype LABELS (not of
+-- the residuals, unlike the Freedman-Lane test above) -> statistic
+-- recomputed on the permuted groups -> empirical null distribution ->
+-- empirical p-value. This confirms (or does not confirm), on the same
+-- data and with minimal distributional assumptions, the variance effect
+-- detected by the Step 3 QUAIL scan for that locus, without the asymptotic
+-- assumptions of quantile regression. The value is the same across all
+-- rows for the same variant (it does not depend on exposure; the Levene
+-- test is univariate on genotype).
 CREATE TABLE IF NOT EXISTS vqtl_permutation_results (
     generation           TINYINT UNSIGNED NOT NULL,
     variant              VARCHAR(191) NOT NULL,
@@ -211,6 +199,6 @@ CREATE TABLE IF NOT EXISTS vqtl_permutation_results (
     levene_pval          DOUBLE,
     levene_n_perm_valid  INT UNSIGNED,
     error_message        TEXT,
-    updated_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    updated_at            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (generation, variant, exposure)
 ) ENGINE=InnoDB;

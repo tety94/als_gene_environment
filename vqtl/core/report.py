@@ -1,9 +1,8 @@
 """
-Step 8 - figure e report.md sui top loci, invariato nella struttura rispetto
-all'originale (boxplot per genotipo, scatter fenotipo x esposizione colorato
-per genotipo, forest plot di beta_I, executive summary con i caveat
-metodologici). Il dosaggio arriva da colonne del DataFrame gia' costruito
-(niente rilettura VCF).
+Step 8 - figures and report.md for the top loci (per-genotype boxplot,
+phenotype x exposure scatter colored by genotype, beta_I forest plot,
+executive summary with methodological caveats). Dosage comes from columns
+of the DataFrame already built (no VCF re-reading).
 """
 from __future__ import annotations
 
@@ -111,7 +110,7 @@ def build_report(
     forest_path = os.path.join(fig_dir, "forest_top_interactions.png")
     if len(top_interactions) > 0:
         _forest_plot(top_interactions, forest_path)
-    log.info("Generate %d coppie di figure per-locus + forest plot.", len(fig_paths))
+    log.info("Generated %d per-locus figure pairs + forest plot.", len(fig_paths))
 
     lam_note = ""
     if not vqtl_df.empty and "Z" in vqtl_df.columns:
@@ -120,78 +119,79 @@ def build_report(
     p_col_used = vcfg.filter_p_column if (not vqtl_df.empty and vcfg.filter_p_column in vqtl_df.columns) else "P"
 
     md = []
-    md.append(f"# Report vQTL / G x E -- generazione (coorte): {generation}\n")
+    md.append(f"# vQTL / G x E report -- generation (cohort): {generation}\n")
     md.append("## Executive summary\n")
-    md.append(f"- Campioni analisi-ready: **{len(dataset.df)}**\n")
-    md.append(f"- Esposizioni testate: **{', '.join(vcfg.exposures)}**\n")
-    md.append(f"- SNP scansionate (Step 3): **{len(vqtl_df)}**\n")
+    md.append(f"- Analysis-ready samples: **{len(dataset.df)}**\n")
+    md.append(f"- Exposures tested: **{', '.join(vcfg.exposures)}**\n")
+    md.append(f"- SNPs scanned (Step 3): **{len(vqtl_df)}**\n")
     md.append(
-        f"- SNP candidate dopo il filtro Step 4: **{len(candidates)}** (filtrate su `{p_col_used}`"
+        f"- Candidate SNPs after the Step 4 filter: **{len(candidates)}** (filtered on `{p_col_used}`"
         f"{' < ' + str(vcfg.filter_p_threshold) if not vcfg.filter_top_n else ', top_n=' + str(vcfg.filter_top_n)})\n"
     )
-    md.append(f"- Inflazione genomica (lambda_GC): **{lam_note}**\n")
+    md.append(f"- Genomic inflation (lambda_GC): **{lam_note}**\n")
     if lam_note and float(lam_note) > 1.5:
         md.append(
-            "  > **Attenzione:** lambda_GC e' marcatamente > 1. Le p-value asintotiche dello Step 3 sono "
-            "anti-conservative per un predittore di dosaggio discreto (0/1/2) e vanno trattate come "
-            "screening. Preferisci `P_gc` e le p-value empiriche delle permutazioni (Step 7) per l'inferenza "
-            "sui top loci.\n"
+            "  > **Note:** lambda_GC is markedly > 1. The asymptotic p-values from Step 3 are "
+            "anti-conservative for a discrete dosage predictor (0/1/2) and should be treated as "
+            "screening. Prefer `P_gc` and the empirical permutation p-values (Step 7) for inference "
+            "on the top loci.\n"
         )
-    md.append(f"- Test di interazione eseguiti: **{len(interaction_df)}** (coppie SNP candidata x esposizione)\n")
+    md.append(f"- Interaction tests run: **{len(interaction_df)}** (candidate-SNP x exposure pairs)\n")
     if not rge_df.empty:
         n_rge = int(rge_df.get("rGE_flag", pd.Series(dtype=bool)).sum())
         n_het = int(rge_df.get("heteroscedasticity_flag", pd.Series(dtype=bool)).sum())
-        md.append(f"- Coppie SNP x esposizione flaggate per rGE (p<{vcfg.rge_het_alpha}): **{n_rge}** / {len(rge_df)} (flaggate, non escluse)\n")
-        md.append(f"- Coppie flaggate per eteroschedasticita' (Breusch-Pagan p<{vcfg.rge_het_alpha}): **{n_het}** / {len(rge_df)}\n")
+        md.append(f"- SNP x exposure pairs flagged for rGE (p<{vcfg.rge_het_alpha}): **{n_rge}** / {len(rge_df)} (flagged, not excluded)\n")
+        md.append(f"- Pairs flagged for heteroscedasticity (Breusch-Pagan p<{vcfg.rge_het_alpha}): **{n_het}** / {len(rge_df)}\n")
 
-    md.append("\n## Top loci vQTL (scan genoma-wide)\n")
+    md.append("\n## Top vQTL loci (genome-wide scan)\n")
     if not vqtl_df.empty:
         md.append(vqtl_df.sort_values("P").head(10).to_markdown(index=False))
     md.append("\n")
 
-    md.append("\n## Top loci di interazione SNP x esposizione\n")
+    md.append("\n## Top SNP x exposure interaction loci\n")
     if not top_interactions.empty:
         md.append(top_interactions.to_markdown(index=False))
     md.append("\n")
 
     if not perm_df.empty:
-        md.append("\n## Robustezza tramite permutazione dei top loci (interazione + varianza per genotipo)\n")
+        md.append("\n## Permutation-based robustness of the top loci (interaction + variance by genotype)\n")
         md.append(perm_df.to_markdown(index=False))
         md.append(
-            "\n> Interazione: p-value empirica = (1 + #permutazioni con |beta_I_perm| >= |beta_I_osservato|) / (n_perm + 1), "
-            "permutazione Freedman-Lane sui residui del modello ridotto. "
-            "Varianza per genotipo (levene_stat_observed/levene_pval): test di Levene (Brown-Forsythe) "
-            "permutazionale -- si permutano le ETICHETTE di genotipo (non i residui) sul fenotipo "
-            "residualizzato, stessa infrastruttura di permutazione del test di interazione ma statistica "
-            "diversa; conferma assumption-light dell'effetto di varianza rilevato dallo scan Step 3 per "
-            "questo locus, senza le assunzioni asintotiche della quantile regression. Indipendente "
-            "dall'esposizione (stesso valore per righe dello stesso SNP). "
-            "Grosse discrepanze tra p asintotica e p empirica (in entrambi i test) indicano che le SE/i "
-            "p-value asintotici non sono affidabili per quel locus.\n"
+            "\n> Interaction: empirical p-value = (1 + #permutations with |beta_I_perm| >= |beta_I_observed|) / (n_perm + 1), "
+            "Freedman-Lane permutation on the reduced model's residuals. "
+            "Variance by genotype (levene_stat_observed/levene_pval): permutation-based Levene "
+            "(Brown-Forsythe) test -- the genotype LABELS are permuted (not the residuals) on the "
+            "residualized phenotype, using the same permutation infrastructure as the interaction test "
+            "but a different statistic; provides an assumption-light confirmation of the variance effect "
+            "detected by the Step 3 scan for this locus, without the asymptotic assumptions of quantile "
+            "regression. Independent of exposure (same value across rows for the same SNP). "
+            "Large discrepancies between the asymptotic and empirical p-values (in either test) indicate "
+            "that the asymptotic SEs/p-values are not reliable for that locus.\n"
         )
 
     if not robustness_df.empty:
-        md.append("\n## Sensibilita' a trasformazioni del fenotipo / outlier (top loci)\n")
+        md.append("\n## Sensitivity to phenotype transformations / outliers (top loci)\n")
         md.append(robustness_df.to_markdown(index=False))
         md.append(
-            "\n> Un locus la cui direzione/significativita' di beta_I e' stabile su `original`, `log_transform`, "
-            "`rank_inverse_normal` e `outliers_removed` e' piu' verosimilmente un effetto reale che un artefatto "
-            "della distribuzione del fenotipo o di poche osservazioni influenti.\n"
+            "\n> A locus whose direction/significance of beta_I is stable across `original`, "
+            "`log_transform`, `rank_inverse_normal`, and `outliers_removed` is more likely to be a real "
+            "effect than an artifact of the phenotype's distribution or of a few influential "
+            "observations.\n"
         )
 
-    md.append("\n## Limiti metodologici noti (leggere prima di trarre conclusioni)\n")
+    md.append("\n## Known methodological limitations (read before drawing conclusions)\n")
     md.append(
-        "- **Punto cieco del disegno a due step:** lo Step 3 e' uno *screening* per SNP il cui dosaggio modula "
-        "la dispersione del fenotipo; lo Step 5 testa l'interazione solo per le SNP che passano questo filtro. "
-        "Una SNP con vera interazione G x E ma **senza effetto marginale sulla varianza** puo' essere persa "
-        "interamente da questo disegno. Se hai SNP/geni candidati a priori, testali direttamente con lo Step 5 "
-        "indipendentemente dalla loro p-value allo Step 3.\n"
+        "- **Blind spot of the two-step design:** Step 3 is a *screening* step for SNPs whose dosage "
+        "modulates the phenotype's dispersion; Step 5 only tests the interaction for SNPs that pass this "
+        "filter. A SNP with a true G x E interaction but **no marginal effect on variance** can be missed "
+        "entirely by this design. If you have a priori candidate SNPs/genes, test them directly with "
+        "Step 5 regardless of their Step 3 p-value.\n"
     )
-    md.append("- **Inflazione della SE asintotica:** vedi nota su lambda_GC sopra. Usa le p-value da permutazione (Step 7) come parola finale su ogni locus destinato a pubblicazione/follow-up.\n")
-    md.append("- **Loci flaggati per rGE:** un'associazione SNP~esposizione significativa non invalida di per se' un risultato G x E, ma complica l'interpretazione causale e va discussa esplicitamente.\n")
-    md.append("- **Test multipli:** le tabelle di interazione/rGE/eteroschedasticita' riportano p-value nominali, non corrette per il numero di combinazioni testate (usa Bonferroni o FDR).\n")
+    md.append("- **Asymptotic SE inflation:** see the lambda_GC note above. Use the permutation p-values (Step 7) as the final word on any locus intended for publication/follow-up.\n")
+    md.append("- **Loci flagged for rGE:** a significant SNP~exposure association does not by itself invalidate a G x E result, but it complicates causal interpretation and should be discussed explicitly.\n")
+    md.append("- **Multiple testing:** the interaction/rGE/heteroscedasticity tables report nominal p-values, not corrected for the number of tested combinations (use Bonferroni or FDR).\n")
 
-    md.append("\n## Figure\n")
+    md.append("\n## Figures\n")
     md.append("![Manhattan plot](figures/manhattan_vqtl.png)\n")
     md.append("![QQ plot](figures/qq_vqtl.png)\n")
     if os.path.exists(forest_path):
@@ -203,5 +203,5 @@ def build_report(
     report_path = os.path.join(cohort_dir, "report.md")
     with open(report_path, "w") as f:
         f.write("\n".join(md))
-    log.info("Scritto %s", report_path)
+    log.info("Wrote %s", report_path)
     return report_path

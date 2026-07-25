@@ -2,39 +2,32 @@
 Step 9 - Word (.docx) export: Results + Supplementary Material tables/figures
 ready to paste into a manuscript.
 
-Nota sulla lingua: a differenza del resto del repo (commenti in italiano,
-per coerenza con lo stile di gene_environment/quality_control), il
-CONTENUTO di questo documento -- titoli, didascalie, intestazioni di
-colonna, note a pie' di tabella -- e' interamente in INGLESE, perche' e' il
-deliverable che finisce davvero nel paper/supplementary material, non
-codice interno. I commenti del codice restano in italiano come nel resto
-del progetto.
+What it generates, in a single .docx per cohort (VQTL_RESULTS_DIR/gen<N>/report.docx):
 
-Cosa genera, in un unico .docx per coorte (VQTL_RESULTS_DIR/gen<N>/report.docx):
-
-  RESULTS (corpo del paper)
+  RESULTS (main body of the paper)
     Table 1.  Top genome-wide vQTL loci (variance-effect screen)
     Table 2.  SNP x exposure interaction tests reaching nominal significance
-              (candidate loci; il set completo testato e' in Supplementary Table S2)
-    Table 3.  Permutation-based validation of prioritized loci (interazione +
-              test di Levene permutazionale sulla varianza per genotipo)
+              (candidate loci; the full tested set is in Supplementary Table S2)
+    Table 3.  Permutation-based validation of prioritized loci (interaction +
+              permutation-based Levene test on variance by genotype)
     Figure 1. Manhattan plot
     Figure 2. QQ plot
     Figure 3. Forest plot of prioritized interaction loci
 
   SUPPLEMENTARY MATERIAL
-    Table S1. Full genome-wide vQTL scan (troncata a docx_supp_max_rows righe,
-              con nota che rimanda alla tabella DB vqtl_scan_results se lo
-              scan e' piu' lungo)
-    Table S2. Full SNP x exposure interaction results (TUTTI i candidati
-              testati, non solo quelli significativi di Table 2)
+    Table S1. Full genome-wide vQTL scan (truncated to docx_supp_max_rows rows,
+              with a note pointing to the vqtl_scan_results DB table if the
+              scan is longer)
+    Table S2. Full SNP x exposure interaction results (ALL tested candidates,
+              not only the significant ones from Table 2)
     Table S3. Reactive gene-environment correlation (rGE) and heteroscedasticity screen
     Table S4. Robustness of prioritized loci across phenotype transformations
     Supplementary Figures S1..Sn: per-locus genotype/exposure plots (top loci)
 
-Stile tabelle: "three-line table" (bordo sopra, bordo sotto l'header, bordo
-in fondo, nessuna riga/colonna interna) -- la convenzione piu' diffusa nelle
-riviste scientifiche (Nature, Cell, JAMA, ecc.), niente sfondo colorato.
+Table style: "three-line table" (border above, border below the header,
+border at the bottom, no internal rows/columns) -- the convention most
+commonly used by scientific journals (Nature, Cell, JAMA, etc.), no
+colored background.
 """
 from __future__ import annotations
 
@@ -61,23 +54,22 @@ BODY_SIZE = 10
 CAPTION_SIZE = 10
 TABLE_FONT_SIZE = 9
 
-# Documento in landscape con margini ridotti: le tabelle "paper-ready" hanno
-# spesso 8-11 colonne (SNP, Chr, Position, N, MAF, beta, SE, Z, P, P_gc,
-# FDR...) che in portrait/margini standard costringono Word a spezzare le
-# parole a meta' (osservato es. "risaie_1500" -> "risaie_150" + "0",
-# "corrected" -> "correcte" + "d") -- inaccettabile per un documento
-# destinato a un manoscritto. Landscape US Letter + margini 0.6in da'
-# ~9.8in di larghezza utile, sufficiente per le tabelle di questa pipeline
-# senza spezzare i token.
+# Landscape document with reduced margins: "paper-ready" tables often have
+# 8-11 columns (SNP, Chr, Position, N, MAF, beta, SE, Z, P, P_gc, FDR...)
+# that in portrait/standard margins force Word to break words mid-token
+# (observed e.g. "risaie_1500" -> "risaie_150" + "0", "corrected" ->
+# "correcte" + "d") -- unacceptable for a manuscript-bound document.
+# Landscape US Letter + 0.6in margins gives ~9.8in of usable width, enough
+# for this pipeline's tables without breaking tokens.
 PAGE_MARGIN_IN = 0.6
 PAGE_WIDTH_IN = 11.0
 PAGE_HEIGHT_IN = 8.5
 USABLE_WIDTH_IN = PAGE_WIDTH_IN - 2 * PAGE_MARGIN_IN
 
-# Larghezza "preferita" (pollici) per ciascuna colonna, sufficiente a
-# contenere il contenuto piu' lungo atteso senza andare a capo a meta'
-# parola. Se la somma delle colonne di una tabella supera USABLE_WIDTH_IN,
-# _add_data_table la scala proporzionalmente (vedi _set_column_widths).
+# "Preferred" width (inches) for each column, wide enough to hold the
+# longest expected content without wrapping mid-word. If a table's column
+# widths sum to more than USABLE_WIDTH_IN, _add_data_table scales them
+# proportionally (see _set_column_widths).
 _COLUMN_WIDTHS_IN: dict[str, float] = {
     "SNP": 1.15, "CHR": 0.5, "POS": 0.95, "N": 0.5, "MAF": 0.6,
     "beta_QI": 0.75, "SE": 0.75, "Z": 0.6, "P": 0.75, "P_gc": 0.95, "fdr_gc": 0.75,
@@ -92,8 +84,8 @@ _DEFAULT_COLUMN_WIDTH_IN = 0.85
 
 
 # ------------------------------------------------------------------
-# Helper di basso livello per lo stile "three-line table"
-# (python-docx non ha un'API di alto livello per i bordi delle celle)
+# Low-level helpers for the "three-line table" style
+# (python-docx has no high-level API for cell borders)
 # ------------------------------------------------------------------
 def _set_cell_border(cell, edge: str, sz: int = 8, color: str = "000000") -> None:
     tc_pr = cell._tc.get_or_add_tcPr()
@@ -113,8 +105,8 @@ def _set_cell_border(cell, edge: str, sz: int = 8, color: str = "000000") -> Non
 
 
 def _apply_three_line_style(table) -> None:
-    """Bordo doppio-spesso sopra la tabella e sotto l'ultima riga, bordo
-    sottile sotto l'header -- niente altre righe/griglie/sfondi."""
+    """Double-thick border above the table and below the last row, thin
+    border below the header -- no other rows/gridlines/backgrounds."""
     n_rows = len(table.rows)
     for cell in table.rows[0].cells:
         _set_cell_border(cell, "top", sz=12)
@@ -129,7 +121,7 @@ def _set_font(run, bold: bool = False, italic: bool = False, size: float = BODY_
     run.font.size = Pt(size)
     run.font.bold = bold
     run.font.italic = italic
-    # forza il font anche per il rendering "East Asian"/complex script di Word
+    # also force the font for Word's "East Asian"/complex-script rendering
     rpr = run._element.get_or_add_rPr()
     rfonts = rpr.find(qn("w:rFonts"))
     if rfonts is None:
@@ -189,7 +181,7 @@ def _add_footnote_text(doc, text: str):
 
 
 # ------------------------------------------------------------------
-# Formattazione numerica in stile paper
+# Paper-style numeric formatting
 # ------------------------------------------------------------------
 def _fmt_p(p) -> str:
     if p is None or (isinstance(p, float) and np.isnan(p)):
@@ -212,7 +204,7 @@ def _fmt_int(x) -> str:
     return str(int(x))
 
 
-# Colonna sorgente -> (intestazione paper-ready, funzione di formattazione)
+# Source column -> (paper-ready header, formatting function)
 _COLUMN_SPECS: dict[str, tuple[str, callable]] = {
     "SNP": ("Variant", str),
     "CHR": ("Chr", str),
@@ -248,12 +240,12 @@ _COLUMN_SPECS: dict[str, tuple[str, callable]] = {
 
 
 def _set_column_widths(table, widths_in: list[float]) -> None:
-    """Larghezze di colonna FISSE (non autofit): necessario per evitare che
-    Word/LibreOffice spezzino a meta' i token che non contengono spazi
-    (id varianti, nomi esposizione) quando la colonna e' troppo stretta.
-    Va impostata sia a livello di tabella (tblLayout=fixed) sia su ogni
-    singola cella della colonna (Word ignora larghezze parziali/incoerenti
-    tra celle della stessa colonna)."""
+    """FIXED column widths (not autofit): necessary to prevent
+    Word/LibreOffice from breaking mid-token strings that contain no
+    spaces (variant ids, exposure names) when the column is too narrow.
+    Must be set both at the table level (tblLayout=fixed) and on every
+    single cell of the column (Word ignores partial/inconsistent widths
+    across cells of the same column)."""
     table.autofit = False
     tbl_pr = table._tbl.tblPr
     layout = OxmlElement("w:tblLayout")
@@ -269,15 +261,15 @@ def _column_widths_for(cols: list[str]) -> list[float]:
     total = sum(raw)
     if total <= USABLE_WIDTH_IN or total == 0:
         return raw
-    # scala proporzionalmente se la somma eccede la larghezza utile della pagina
+    # scale proportionally if the sum exceeds the page's usable width
     scale = USABLE_WIDTH_IN / total
     return [w * scale for w in raw]
 
 
 def _paper_table(df: pd.DataFrame, columns: list[str]) -> tuple[list[str], list[list[str]], list[float]]:
-    """Ritorna (intestazioni_inglesi, righe_formattate, larghezze_pollici)
-    per le sole colonne richieste che esistono davvero in df, nell'ordine
-    richiesto."""
+    """Returns (english_headers, formatted_rows, widths_in_inches) for only
+    the requested columns that actually exist in df, in the requested
+    order."""
     cols = [c for c in columns if c in df.columns]
     headers = [_COLUMN_SPECS.get(c, (c, str))[0] for c in cols]
     rows = []
@@ -316,7 +308,7 @@ def _add_data_table(doc, headers: list[str], rows: list[list[str]], col_widths_i
 
 def _add_image_full_width(doc, path: str, width_in: float = 6.0) -> bool:
     if not os.path.exists(path):
-        log.warning("Immagine non trovata, saltata nel docx: %s", path)
+        log.warning("Image not found, skipped in the docx: %s", path)
         return False
     doc.add_picture(path, width=Inches(width_in))
     doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -324,10 +316,11 @@ def _add_image_full_width(doc, path: str, width_in: float = 6.0) -> bool:
 
 
 def _add_image_pair(doc, left_path: str, right_path: str, width_in: float = 3.1) -> bool:
-    """Due immagini affiancate in una tabella senza bordi (boxplot + scatter
-    dello stesso locus), per tenerle vicine nello stesso paragrafo/figura."""
+    """Two images side by side in a borderless table (boxplot + scatter for
+    the same locus), to keep them close together in the same paragraph/
+    figure."""
     if not (os.path.exists(left_path) and os.path.exists(right_path)):
-        log.warning("Coppia di immagini incompleta, saltata: %s / %s", left_path, right_path)
+        log.warning("Incomplete image pair, skipped: %s / %s", left_path, right_path)
         return False
     table = doc.add_table(rows=1, cols=2)
     table.autofit = True
@@ -340,7 +333,7 @@ def _add_image_pair(doc, left_path: str, right_path: str, width_in: float = 3.1)
 
 
 # ------------------------------------------------------------------
-# Costruzione del documento
+# Document assembly
 # ------------------------------------------------------------------
 def build_docx_report(
     vcfg: VqtlConfig, cohort_dir: str, generation: int, n_samples: int,
@@ -512,7 +505,7 @@ def build_docx_report(
             "a small number of influential observations.",
         )
 
-    # Supplementary figures: per-locus boxplot + scatter, stessi loci del report.md (top 10)
+    # Supplementary figures: per-locus boxplot + scatter, same loci as report.md (top 10)
     top_interactions = interaction_df.sort_values("pval").head(10).reset_index(drop=True) if not interaction_df.empty else interaction_df
     supp_fig_n = 0
     for i, row in top_interactions.iterrows():
@@ -531,5 +524,5 @@ def build_docx_report(
 
     out_path = os.path.join(cohort_dir, "report.docx")
     doc.save(out_path)
-    log.info("Scritto %s (Results + Supplementary Material, in inglese)", out_path)
+    log.info("Wrote %s (Results + Supplementary Material)", out_path)
     return out_path
