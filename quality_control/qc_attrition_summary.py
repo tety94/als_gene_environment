@@ -2,28 +2,29 @@
 """
 qc_attrition_summary.py
 ========================
-Ricostruisce la tabella "campioni/varianti a ogni step" leggendo i file
-intermedi che 00_run_plink_qc.sh lascia sul disco (non li ricalcola, non
-tocca la pipeline bash). Utile come tabella supplementare per il paper:
-mostra dove e quanto si perde a ogni stage del QC.
+Reconstructs the "samples/variants at each step" table by reading the
+intermediate files 00_run_plink_qc.sh leaves on disk (it does not
+recompute anything, does not touch the bash pipeline). Useful as a
+supplementary table for the paper: shows where and how much is lost at
+each QC stage.
 
-STEP RICOSTRUITI (da quali file):
-  merge (pre-QC)          <- merged_all.psam / merged_all.pvar
-  post --geno             <- merged_geno.psam / merged_geno.pvar
-  post --mind             <- merged_qc.psam   / merged_qc.pvar
-  post LD pruning          <- merged_pruned.psam / pruned.prune.in
-                               (le varianti pruned sono quelle in
-                               pruned.prune.in, non nel .pvar, perche'
-                               --maf viene riapplicato nello stesso step)
+STAGES RECONSTRUCTED (from which files):
+  merge (pre-QC)   <- merged_all.psam / merged_all.pvar
+  post --geno      <- merged_geno.psam / merged_geno.pvar
+  post --mind      <- merged_qc.psam   / merged_qc.pvar
+  post LD pruning  <- merged_pruned.psam / pruned.prune.in
+                       (pruned variants are the ones in pruned.prune.in,
+                       not in the .pvar, because --maf is reapplied in
+                       that same step)
 
-Se qualche file manca (es. --force non ancora rilanciato, o step non
-ancora eseguito), lo step viene semplicemente omesso dalla tabella con un
-avviso, invece di fallire.
+If a file is missing (e.g. --force not re-run yet, or step not yet
+executed), that stage is simply omitted from the table with a warning
+instead of failing.
 
-USO:
+USAGE:
   python3 qc_attrition_summary.py \
-      --qc-dir /mnt/cresla_prod/genome_datasets/qc_output \
-      --out /mnt/cresla_prod/genome_datasets/qc_output/qc_attrition.csv
+      --qc-dir /mnt/genome_datasets/qc_output_cohortA \
+      --out /mnt/genome_datasets/qc_output_cohortA/qc_attrition.csv
 """
 
 import argparse
@@ -45,13 +46,13 @@ def count_lines(path: Path) -> int:
 
 
 def n_samples_from_psam(path: Path) -> int:
-    # .psam ha una riga di header (#FID IID ...) piu' una riga per campione.
+    # .psam has one header line (#FID IID ...) plus one line per sample.
     return count_lines(path) - 1
 
 
 def n_variants_from_pvar(path: Path) -> int:
-    # .pvar ha righe di header che iniziano con '#' (incluso l'header
-    # colonne) piu' una riga per variante.
+    # .pvar has header lines starting with '#' (including the column
+    # header) plus one line per variant.
     with open(path) as f:
         return sum(1 for line in f if not line.startswith("#"))
 
@@ -61,7 +62,7 @@ def n_variants_from_prune_in(path: Path) -> int:
 
 
 STAGES = [
-    # (etichetta, file_psam_o_none, file_varianti_o_none, funzione_conteggio_varianti)
+    # (label, psam_file_or_none, variant_file_or_none, variant_count_function)
     ("post-merge (pre-QC)", "merged_all.psam", "merged_all.pvar", n_variants_from_pvar),
     ("post --geno", "merged_geno.psam", "merged_geno.pvar", n_variants_from_pvar),
     ("post --mind", "merged_qc.psam", "merged_qc.pvar", n_variants_from_pvar),
@@ -75,7 +76,7 @@ def build_attrition_table(qc_dir: Path) -> pd.DataFrame:
         psam_path = qc_dir / psam_name
         var_path = qc_dir / var_name
         if not psam_path.exists() or not var_path.exists():
-            print(f"  [salto '{label}': manca {psam_path.name} o {var_path.name}]")
+            print(f"  [skipping '{label}': missing {psam_path.name} or {var_path.name}]")
             continue
         rows.append({
             "stage": label,
@@ -127,31 +128,31 @@ def plot_attrition(df: pd.DataFrame, out_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Ricostruisce la tabella di attrition campioni/varianti dai file intermedi di 00_run_plink_qc.sh",
+        description="Reconstructs the sample/variant attrition table from 00_run_plink_qc.sh's intermediate files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--qc-dir", required=True, type=Path, help="out_dir passato a 00_run_plink_qc.sh")
-    parser.add_argument("--out", required=True, type=Path, help="path del CSV di output")
+    parser.add_argument("--qc-dir", required=True, type=Path, help="out_dir passed to 00_run_plink_qc.sh")
+    parser.add_argument("--out", required=True, type=Path, help="output CSV path")
     args = parser.parse_args()
 
-    print(f"==> Leggo file intermedi da: {args.qc_dir}")
+    print(f"==> Reading intermediate files from: {args.qc_dir}")
     df = build_attrition_table(args.qc_dir)
 
     if df.empty:
-        print("Nessuno step ricostruibile: controlla che 00_run_plink_qc.sh sia stato eseguito in questa cartella.")
+        print("No stage could be reconstructed: check that 00_run_plink_qc.sh has run in this folder.")
         return
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.out, index=False)
-    print(f"\nTabella salvata in: {args.out}\n")
+    print(f"\nTable saved to: {args.out}\n")
     print(df.to_string(index=False))
 
     plot_path = args.out.with_suffix(".png")
     plot_attrition(df, plot_path)
     if plt is not None:
-        print(f"\nGrafico salvato in: {plot_path}")
+        print(f"\nChart saved to: {plot_path}")
     else:
-        print("\n(matplotlib non disponibile, grafico saltato)")
+        print("\n(matplotlib not available, chart skipped)")
 
 
 if __name__ == "__main__":

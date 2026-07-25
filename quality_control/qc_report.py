@@ -2,168 +2,147 @@
 """
 qc_report.py
 ============
-Controlli QC su kinship (KING) e PCA prodotti da 00_run_plink_qc.sh:
+QC checks on kinship (KING) and PCA produced by 00_run_plink_qc.sh:
 
-  1. Distribuzione del kinship (king.kin0): istogramma + classificazione
-     delle coppie per grado di parentela usando le soglie standard KING,
-     con una tabella separata delle coppie sospette (>= parenti di 3o
-     grado), evidenziando in particolare i casi cross-batch (possibili
-     duplicati/pazienti condivisi tra batch sfuggiti al controllo ID
-     dello Step 0 della pipeline bash).
+  1. Kinship distribution (king.kin0): histogram + classification of
+     pairs by degree of relatedness using the standard KING thresholds,
+     with a separate table of suspicious pairs (>= 3rd-degree relatives),
+     specifically flagging cross-batch cases (possible duplicates/shared
+     patients between batches that slipped past the ID check in Step 0
+     of the bash pipeline).
 
-  2. PCA (pca.eigenvec) colorata per batch di provenienza, per un check
-     visivo di batch effect. La mappa campione -> batch viene derivata
-     interrogando bcftools sui VCF originali (stesso identico criterio
-     usato nello Step 0 di 00_run_plink_qc.sh), quindi richiede che
-     bcftools sia nel PATH e che le directory dei batch siano ancora
-     accessibili.
+  2. PCA (pca.eigenvec) colored by batch of origin, as a visual batch-
+     effect check. The sample -> batch map is derived by querying
+     bcftools on the original VCFs (the same criterion used in Step 0 of
+     00_run_plink_qc.sh), so it requires bcftools in PATH and the batch
+     directories to still be accessible.
 
-REQUISITI: python3 con pandas, numpy, matplotlib. bcftools nel PATH se
-si vuole il grafico PCA colorato per batch (altrimenti usare
---no-batch-plot per un semplice scatter PC1 vs PC2 senza colore).
+     Note: if this cohort was genotyped in a single batch (the common
+     case -- see 00_run_plink_qc.sh's note on "batch" vs. "cohort"), the
+     batch-effect check is not meaningful (everything will be one color)
+     and can be skipped with --no-batch-plot; the kinship section (within-
+     cohort duplicate/relatedness check) and a plain PCA scatter still run
+     regardless.
 
-USO:
+REQUIREMENTS: python3 with pandas, numpy, matplotlib. bcftools in PATH if
+you want the batch-colored PCA plot (otherwise use --no-batch-plot for a
+plain PC1 vs PC2 scatter with no color).
+
+USAGE:
   python3 qc_report.py \
-      --kin /mnt/cresla_prod/genome_datasets/qc_output/king.kin0 \
-      --eigenvec /mnt/cresla_prod/genome_datasets/qc_output/pca.eigenvec \
-      --eigenval /mnt/cresla_prod/genome_datasets/qc_output/pca.eigenval \
-      --vcf-dirs /mnt/cresla_prod/genome_datasets/gen1 \
-                 /mnt/cresla_prod/genome_datasets/gen2 \
-                 /mnt/cresla_prod/genome_datasets/gen3 \
+      --kin /mnt/genome_datasets/qc_output_cohortA/king.kin0 \
+      --eigenvec /mnt/genome_datasets/qc_output_cohortA/pca.eigenvec \
+      --eigenval /mnt/genome_datasets/qc_output_cohortA/pca.eigenval \
+      --vcf-dirs /mnt/genome_datasets/cohortA_batch1 /mnt/genome_datasets/cohortA_batch2 \
       --use-filtered \
-      --out-dir /mnt/cresla_prod/genome_datasets/qc_output/qc_report
+      --out-dir /mnt/genome_datasets/qc_output_cohortA/qc_report
 
-Se non vuoi/puoi derivare i batch (es. le directory VCF non sono piu'
-accessibili da qui), ometti --vcf-dirs: lo script fa comunque tutta la
-parte di kinship e un semplice scatter PCA senza colore per batch.
+If you don't want/can't derive batches (e.g. the VCF directories are no
+longer accessible from here), omit --vcf-dirs: the script still runs the
+full kinship section and a plain PCA scatter with no batch coloring.
 """
 
 import argparse
 import subprocess
-import sys
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")  # nessun display: si lavora su un server headless
+matplotlib.use("Agg")  # no display: this runs on a headless server
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-# Soglie standard KING per il grado di parentela (kinship coefficient).
-# Fonte: documentazione KING / plink2 (Manichaikul et al. 2010).
-KING_THRESHOLDS = [
-    (0.354, "duplicato/gemello monozigote"),
-    (0.177, "parente di 1o grado"),
-    (0.0884, "parente di 2o grado"),
-    (0.0442, "parente di 3o grado"),
-]
+from plink_io import load_eigenval, load_eigenvec, load_kinship
 
-# Etichette inglesi parallele, usate SOLO per il testo del grafico (la
-# classificazione interna/CSV resta in italiano per non rompere i confronti
-# di stringa gia' usati altrove in questo file).
-KING_THRESHOLDS_LABELS_EN = {
-    "duplicato/gemello monozigote": "duplicate/monozygotic twin",
-    "parente di 1o grado": "1st-degree relative",
-    "parente di 2o grado": "2nd-degree relative",
-    "parente di 3o grado": "3rd-degree relative",
-}
+# Standard KING thresholds for degree of relatedness (kinship
+# coefficient). Source: KING / plink2 documentation (Manichaikul et al.
+# 2010).
+KING_THRESHOLDS = [
+    (0.354, "duplicate/monozygotic twin"),
+    (0.177, "1st-degree relative"),
+    (0.0884, "2nd-degree relative"),
+    (0.0442, "3rd-degree relative"),
+]
 
 
 def classify_kinship(k: float) -> str:
     for threshold, label in KING_THRESHOLDS:
         if k >= threshold:
             return label
-    return "non imparentati"
+    return "unrelated"
 
 
 # ---------------------------------------------------------------------------
 # Kinship
 # ---------------------------------------------------------------------------
 
-def load_kinship(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path, sep=r"\s+")
-    df.columns = [c.lstrip("#") for c in df.columns]
-    # Nomi colonna storicamente un po' incoerenti tra versioni plink2:
-    # a volte "ID1"/"ID2", a volte "IID1"/"IID2". Normalizziamo.
-    rename = {"ID1": "IID1", "ID2": "IID2"}
-    df = df.rename(columns=rename)
-    required = {"IID1", "IID2", "NSNP", "KINSHIP"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"Colonne attese mancanti in {path}: {missing}. "
-            f"Colonne trovate: {list(df.columns)}"
-        )
-    return df
-
-
 def summarize_kinship(df: pd.DataFrame, batch_map: dict, out_dir: Path) -> None:
     df = df.copy()
-    df["categoria"] = df["KINSHIP"].apply(classify_kinship)
+    df["category"] = df["KINSHIP"].apply(classify_kinship)
 
     if batch_map:
         df["batch1"] = df["IID1"].map(batch_map)
         df["batch2"] = df["IID2"].map(batch_map)
-        df["stesso_batch"] = df["batch1"] == df["batch2"]
+        df["same_batch"] = df["batch1"] == df["batch2"]
         n_missing_batch = df["batch1"].isna().sum() + df["batch2"].isna().sum()
         if n_missing_batch:
             print(
-                f"  ATTENZIONE: {n_missing_batch} riferimenti campione in king.kin0 "
-                f"non trovati nella mappa batch (ID non corrispondenti?)."
+                f"  WARNING: {n_missing_batch} sample references in king.kin0 "
+                f"were not found in the batch map (mismatched IDs?)."
             )
 
-    counts = df["categoria"].value_counts()
-    print("\n--- Distribuzione coppie per grado di parentela (KING) ---")
-    for _, label in KING_THRESHOLDS + [(0, "non imparentati")]:
+    counts = df["category"].value_counts()
+    print("\n--- Pair distribution by degree of relatedness (KING) ---")
+    for _, label in KING_THRESHOLDS + [(0, "unrelated")]:
         n = counts.get(label, 0)
         print(f"  {label:35s}: {n}")
 
-    # Tabella supplementare: stessa distribuzione ma su file, pronta per il paper.
-    order = [label for _, label in KING_THRESHOLDS] + ["non imparentati"]
+    # Supplementary table: same distribution, on file, ready for the paper.
+    order = [label for _, label in KING_THRESHOLDS] + ["unrelated"]
     counts_df = pd.DataFrame(
-        {"categoria": order, "n_coppie": [int(counts.get(c, 0)) for c in order]}
+        {"category": order, "n_pairs": [int(counts.get(c, 0)) for c in order]}
     )
-    counts_df["pct_coppie"] = 100 * counts_df["n_coppie"] / counts_df["n_coppie"].sum()
+    counts_df["pct_pairs"] = 100 * counts_df["n_pairs"] / counts_df["n_pairs"].sum()
     counts_path = out_dir / "kinship_category_counts.csv"
     counts_df.to_csv(counts_path, index=False)
-    print(f"  Tabella distribuzione salvata in: {counts_path}")
+    print(f"  Distribution table saved to: {counts_path}")
 
-    # Tabella delle coppie sospette: parenti di 3o grado o piu' stretti.
-    flagged = df[df["categoria"] != "non imparentati"].sort_values(
+    # Table of suspicious pairs: 3rd-degree relatives or closer.
+    flagged = df[df["category"] != "unrelated"].sort_values(
         "KINSHIP", ascending=False
     )
     flagged_path = out_dir / "kinship_flagged_pairs.csv"
     flagged.to_csv(flagged_path, index=False)
-    print(f"\n  Coppie con parentela >= 3o grado salvate in: {flagged_path}")
-    print(f"  Totale coppie segnalate: {len(flagged)}")
+    print(f"\n  Pairs with relatedness >= 3rd degree saved to: {flagged_path}")
+    print(f"  Total flagged pairs: {len(flagged)}")
 
     if batch_map:
         dup_or_close = flagged[
-            flagged["categoria"].isin(
-                ["duplicato/gemello monozigote", "parente di 1o grado"]
+            flagged["category"].isin(
+                ["duplicate/monozygotic twin", "1st-degree relative"]
             )
         ]
-        cross_batch_suspect = dup_or_close[dup_or_close["stesso_batch"] == False]
+        cross_batch_suspect = dup_or_close[dup_or_close["same_batch"] == False]
         if len(cross_batch_suspect) > 0:
             print(
-                f"\n  >>> ATTENZIONE: {len(cross_batch_suspect)} coppie con kinship da "
-                f"duplicato/1o grado APPARTENGONO A BATCH DIVERSI."
+                f"\n  >>> WARNING: {len(cross_batch_suspect)} pairs with duplicate/1st-degree "
+                f"kinship BELONG TO DIFFERENT BATCHES."
             )
             print(
-                "  >>> Lo Step 0 della pipeline bash controlla solo ID identici: "
-                "questi casi hanno ID diversi ma DNA quasi identico -- probabile "
-                "stesso paziente genotipizzato in due batch con ID differenti. "
-                "Vanno verificati manualmente prima di procedere con l'analisi."
+                "  >>> Step 0 of the bash pipeline only checks for identical IDs: "
+                "these cases have different IDs but near-identical DNA -- likely "
+                "the same patient genotyped in two batches under different IDs. "
+                "These need manual verification before proceeding with the analysis."
             )
             cross_path = out_dir / "kinship_cross_batch_duplicates_suspect.csv"
             cross_batch_suspect.to_csv(cross_path, index=False)
-            print(f"  >>> Dettaglio salvato in: {cross_path}")
+            print(f"  >>> Details saved to: {cross_path}")
         else:
             print(
-                "\n  Nessuna coppia sospetta di duplicato/1o grado tra batch diversi."
+                "\n  No cross-batch duplicate/1st-degree suspect pairs found."
             )
 
-    # Istogramma della distribuzione del kinship, con le soglie segnate.
+    # Histogram of the kinship distribution, with thresholds marked.
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.hist(df["KINSHIP"], bins=200, color="steelblue", edgecolor="none")
     ax.set_yscale("log")
@@ -174,18 +153,18 @@ def summarize_kinship(df: pd.DataFrame, batch_map: dict, out_dir: Path) -> None:
     for (threshold, label), color in zip(KING_THRESHOLDS, colors):
         ax.axvline(threshold, color=color, linestyle="--", linewidth=1)
         ax.text(
-            threshold, ax.get_ylim()[1] * 0.9, KING_THRESHOLDS_LABELS_EN.get(label, label), rotation=90,
+            threshold, ax.get_ylim()[1] * 0.9, label, rotation=90,
             color=color, fontsize=8, ha="right", va="top",
         )
     fig.tight_layout()
     hist_path = out_dir / "kinship_distribution.png"
     fig.savefig(hist_path, dpi=150)
     plt.close(fig)
-    print(f"\n  Istogramma salvato in: {hist_path}")
+    print(f"\n  Histogram saved to: {hist_path}")
 
 
 # ---------------------------------------------------------------------------
-# Mappa campione -> batch (stesso criterio dello Step 0 della pipeline bash)
+# Sample -> batch map (same criterion as Step 0 of the bash pipeline)
 # ---------------------------------------------------------------------------
 
 def find_chr1_vcf(vcf_dir: Path, use_filtered: bool) -> Path | None:
@@ -208,10 +187,10 @@ def get_batch_sample_map(vcf_dirs: list[Path], use_filtered: bool) -> dict:
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
         print(
-            "  ATTENZIONE: bcftools non trovato nel PATH -- impossibile derivare "
-            "la mappa campione->batch. Il grafico PCA verra' fatto senza colore "
-            "per batch. Attiva l'ambiente conda giusto (es. 'conda activate "
-            "geneenv') e rilancia se vuoi il check per batch effect."
+            "  WARNING: bcftools not found in PATH -- cannot derive the "
+            "sample->batch map. The PCA plot will be produced without batch "
+            "coloring. Activate the right conda environment and re-run if "
+            "you want the batch-effect check."
         )
         return {}
 
@@ -220,7 +199,7 @@ def get_batch_sample_map(vcf_dirs: list[Path], use_filtered: bool) -> dict:
         batch = d.name
         vcf = find_chr1_vcf(d, use_filtered)
         if vcf is None:
-            print(f"  ATTENZIONE: nessun VCF chr1 trovato per il batch {batch} in {d}, salto.")
+            print(f"  WARNING: no chr1 VCF found for batch {batch} in {d}, skipping.")
             continue
         result = subprocess.run(
             ["bcftools", "query", "-l", str(vcf)],
@@ -230,11 +209,11 @@ def get_batch_sample_map(vcf_dirs: list[Path], use_filtered: bool) -> dict:
         for s in samples:
             if s in mapping and mapping[s] != batch:
                 print(
-                    f"  ATTENZIONE: campione {s} presente sia nel batch "
-                    f"{mapping[s]} che in {batch} (ID duplicato tra batch)."
+                    f"  WARNING: sample {s} is present in both batch "
+                    f"{mapping[s]} and {batch} (duplicate ID across batches)."
                 )
             mapping[s] = batch
-        print(f"  {batch}: {len(samples)} campioni mappati")
+        print(f"  {batch}: {len(samples)} samples mapped")
     return mapping
 
 
@@ -242,26 +221,9 @@ def get_batch_sample_map(vcf_dirs: list[Path], use_filtered: bool) -> dict:
 # PCA
 # ---------------------------------------------------------------------------
 
-def load_eigenvec(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path, sep=r"\s+")
-    df.columns = [c.lstrip("#") for c in df.columns]
-    if "IID" not in df.columns:
-        raise ValueError(
-            f"Colonna IID non trovata in {path}. Colonne trovate: {list(df.columns)}"
-        )
-    return df
-
-
-def load_eigenval(path: Path | None) -> list[float] | None:
-    if path is None or not path.exists():
-        return None
-    with open(path) as f:
-        return [float(line.strip()) for line in f if line.strip()]
-
-
 def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, out_dir: Path) -> None:
     if "PC1" not in df.columns or "PC2" not in df.columns:
-        print("  ATTENZIONE: PC1/PC2 non trovate in eigenvec, salto il grafico PCA.")
+        print("  WARNING: PC1/PC2 not found in eigenvec, skipping the PCA plot.")
         return
 
     if eigenval:
@@ -281,8 +243,8 @@ def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, ou
         n_unmapped = df["batch"].isna().sum()
         if n_unmapped:
             print(
-                f"  ATTENZIONE: {n_unmapped} campioni in eigenvec senza batch "
-                f"corrispondente (ID non trovati nella mappa)."
+                f"  WARNING: {n_unmapped} samples in eigenvec have no matching "
+                f"batch (IDs not found in the map)."
             )
         for batch, group in df.groupby("batch", dropna=False):
             label = batch if pd.notna(batch) else "unknown batch"
@@ -300,7 +262,7 @@ def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, ou
     scatter_path = out_dir / "pca_scatter_by_batch.png"
     fig.savefig(scatter_path, dpi=150)
     plt.close(fig)
-    print(f"\n  Scatter PCA salvato in: {scatter_path}")
+    print(f"\n  PCA scatter saved to: {scatter_path}")
 
     if eigenval:
         fig2, ax2 = plt.subplots(figsize=(7, 4))
@@ -316,10 +278,10 @@ def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, ou
         scree_path = out_dir / "pca_scree_plot.png"
         fig2.savefig(scree_path, dpi=150)
         plt.close(fig2)
-        print(f"  Scree plot salvato in: {scree_path}")
+        print(f"  Scree plot saved to: {scree_path}")
 
-    # Check numerico semplice di batch effect: quanta varianza di PC1/PC2 e'
-    # "spiegata" dall'appartenenza al batch (eta-squared, one-way ANOVA-like).
+    # Simple numeric batch-effect check: how much of PC1/PC2's variance is
+    # "explained" by batch membership (eta-squared, one-way ANOVA-like).
     if batch_map and "batch" in df.columns:
         eta_rows = []
         for pc in ["PC1", "PC2"]:
@@ -334,18 +296,18 @@ def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, ou
             )
             eta_sq = ss_between / ss_total if ss_total else float("nan")
             print(
-                f"  Frazione di varianza di {pc} spiegata dal batch (eta^2): {eta_sq:.3f} "
-                f"({'ALTA -- possibile batch effect da correggere' if eta_sq > 0.1 else 'bassa'})"
+                f"  Fraction of {pc} variance explained by batch (eta^2): {eta_sq:.3f} "
+                f"({'HIGH -- possible batch effect to correct for' if eta_sq > 0.1 else 'low'})"
             )
             eta_rows.append({
                 "PC": pc,
                 "eta_squared": round(float(eta_sq), 4),
-                "batch_effect_alto": bool(eta_sq > 0.1),
+                "high_batch_effect": bool(eta_sq > 0.1),
             })
         if eta_rows:
             eta_path = out_dir / "pca_batch_eta2.csv"
             pd.DataFrame(eta_rows).to_csv(eta_path, index=False)
-            print(f"  Tabella eta^2 salvata in: {eta_path}")
+            print(f"  eta^2 table saved to: {eta_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -354,51 +316,51 @@ def plot_pca(df: pd.DataFrame, batch_map: dict, eigenval: list[float] | None, ou
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="QC su kinship (KING) e PCA prodotti da 00_run_plink_qc.sh",
+        description="QC on kinship (KING) and PCA produced by 00_run_plink_qc.sh",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--kin", required=True, type=Path, help="path a king.kin0")
-    parser.add_argument("--eigenvec", required=True, type=Path, help="path a pca.eigenvec")
-    parser.add_argument("--eigenval", type=Path, default=None, help="path a pca.eigenval (opzionale)")
+    parser.add_argument("--kin", required=True, type=Path, help="path to king.kin0")
+    parser.add_argument("--eigenvec", required=True, type=Path, help="path to pca.eigenvec")
+    parser.add_argument("--eigenval", type=Path, default=None, help="path to pca.eigenval (optional)")
     parser.add_argument(
         "--vcf-dirs", nargs="+", type=Path, default=None,
-        help="directory dei batch VCF originali (per derivare la mappa campione->batch)",
+        help="original batch VCF directories for THIS cohort (to derive the sample->batch map)",
     )
     parser.add_argument(
         "--use-filtered", action="store_true",
-        help="usa vcf_filtered/*_filtered.vcf.gz per il chr1, come in 00_run_plink_qc.sh --use-filtered",
+        help="use vcf_filtered/*_filtered.vcf.gz for chr1, as in 00_run_plink_qc.sh --use-filtered",
     )
     parser.add_argument(
         "--out-dir", required=True, type=Path,
-        help="directory dove salvare grafici e tabelle",
+        help="directory where charts and tables are saved",
     )
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("==> Carico kinship")
+    print("==> Loading kinship")
     kin_df = load_kinship(args.kin)
-    print(f"  {len(kin_df):,} coppie caricate da {args.kin}")
+    print(f"  {len(kin_df):,} pairs loaded from {args.kin}")
 
     batch_map = {}
     if args.vcf_dirs:
-        print("\n==> Derivo la mappa campione -> batch (via bcftools, come Step 0 della pipeline)")
+        print("\n==> Deriving the sample -> batch map (via bcftools, as in Step 0 of the bash pipeline)")
         batch_map = get_batch_sample_map(args.vcf_dirs, args.use_filtered)
         if not batch_map:
-            print("  Nessuna mappa batch disponibile, procedo senza.")
+            print("  No batch map available, proceeding without it.")
 
-    print("\n==> Analisi kinship")
+    print("\n==> Kinship analysis")
     summarize_kinship(kin_df, batch_map, args.out_dir)
 
-    print("\n==> Carico PCA")
+    print("\n==> Loading PCA")
     eigen_df = load_eigenvec(args.eigenvec)
     eigenval = load_eigenval(args.eigenval)
-    print(f"  {len(eigen_df):,} campioni caricati da {args.eigenvec}")
+    print(f"  {len(eigen_df):,} samples loaded from {args.eigenvec}")
 
-    print("\n==> Grafico PCA")
+    print("\n==> PCA plot")
     plot_pca(eigen_df, batch_map, eigenval, args.out_dir)
 
-    print(f"\n==> FATTO. Output in: {args.out_dir}")
+    print(f"\n==> DONE. Output in: {args.out_dir}")
 
 
 if __name__ == "__main__":

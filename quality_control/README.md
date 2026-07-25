@@ -1,291 +1,219 @@
 # Genomic QC Pipeline — README
 
-This describes the full order of execution, from raw VCFs to the final
-Word supplementary report. Every script is resumable / non-destructive:
-re-running a step after a crash skips work that is already done (see each
-script's own header for details), and none of the Python reporting
-scripts recompute anything — they only read files produced by earlier
-steps.
-
-## IMPORTANT: run the whole sequence ONCE PER GENERATION, not once for
-## the pooled cohort
-
-This study uses gen1 as the **discovery/validation cohort** and gen2 as
-the **replication cohort** (gen3 is excluded entirely, not used anywhere
-below). Discovery and replication must be analyzed independently — in
-particular the PCA used to correct for population structure in the G×E
-model must be computed **separately per cohort**: a PCA fit on the pooled
-gen1+gen2 data would leak information between the two cohorts and defeats
-the purpose of having a separate replication set.
-
-Concretely, this means running the **entire sequence below twice**, with
-two separate output directories — once with only `gen1` as input to step
-1, once with only `gen2`. You get two independent
-`Supplementary_QC_Report.docx` (one per cohort), two independent
-`pca_covariates.csv`, etc. Nothing is shared between the two runs.
-
-All commands below assume you are on the server that has `plink2` and
-`bcftools` in `PATH` (the `geneenv` conda environment).
+End-to-end genotype QC, from raw per-chromosome VCFs to a Word
+supplementary report, for as many cohorts as your study has. The whole
+thing runs with **one command**:
 
 ```bash
-# Discovery / validation cohort
-export GEN1_DIR=/mnt/cresla_prod/genome_datasets/gen1
-export OUT_DIR_GEN1=/mnt/cresla_prod/genome_datasets/qc_output_gen1
-
-# Replication cohort
-export GEN2_DIR=/mnt/cresla_prod/genome_datasets/gen2
-export OUT_DIR_GEN2=/mnt/cresla_prod/genome_datasets/qc_output_gen2
+python3 run_pipeline.py --config pipeline_config.yaml
 ```
 
-Run everything below with `$OUT_DIR=$OUT_DIR_GEN1` and only `$GEN1_DIR` as
-input to step 1, then again with `$OUT_DIR=$OUT_DIR_GEN2` and only
-`$GEN2_DIR`. The "Full command sequence" section at the bottom has both
-runs spelled out end to end.
+This document explains what that command does, how to configure it, and
+how to run individual steps by hand (useful for debugging, or for
+re-running just one thing without waiting for everything else).
 
 ---
 
-## 1. Main QC pipeline (bash, on the server)
+## 0. Setup (once)
 
-Filters, LD-prunes, computes kinship and PCA for a SINGLE cohort (pass
-only that cohort's VCF directory — do not pass gen1 and gen2 together).
+You need `plink2` and `bcftools` in `PATH` (normally already true inside
+the conda environment used for the rest of the genetics pipeline — check
+with `which plink2 bcftools`), and Python 3 with `pandas`, `numpy`,
+`matplotlib`, `scipy`, `python-docx`, and `pyyaml`
+(`pip install pyyaml --break-system-packages` if missing).
+
+Copy the example config and fill in your real paths:
 
 ```bash
-./00_run_plink_qc.sh --use-filtered --jobs 16 \
-    "$GEN1_DIR" \
-    "$OUT_DIR_GEN1"
+cp pipeline_config.example.yaml pipeline_config.yaml
 ```
 
-Produces (among others): `king.kin0`, `pca.eigenvec`, `pca.eigenval`,
-`merged_all/geno/qc/pruned.*`, `missingness.vmiss`, `missingness.smiss`.
+Open `pipeline_config.yaml` and set, at minimum: each cohort's
+`vcf_dirs` and `out_dir`, `metadata_csv`, and the `exposures` list. Every
+field is documented inline in the file. In particular:
+
+- **One cohort = one entry under `cohorts:`.** `vcf_dirs` is a *list*
+  because a single cohort can have been genotyped in more than one raw
+  VCF batch (see the note at the top of `00_run_plink_qc.sh`); almost
+  always it's a list of one directory.
+- **PCA must be computed separately per cohort.** If your study has a
+  discovery and a replication cohort (as this one does, `gen1` /
+  `gen2`), never merge them into one `cohorts:` entry — a PCA fit on
+  pooled data leaks information between discovery and replication and
+  defeats the point of having an independent replication set. Keep them
+  as separate entries; the orchestrator already runs each one through
+  its own, independent pipeline end to end.
 
 ---
 
-## 2. Extra QC checks (bash, on the server — run after step 1)
-
-Sex check, heterozygosity check, MAF spectrum, and a software/version log.
-Does **not** touch `00_run_plink_qc.sh` or its output; it only adds new
-files to the same `$OUT_DIR`.
+## 1. Running everything: `run_pipeline.py`
 
 ```bash
-./01_run_extra_qc_checks.sh "$OUT_DIR_GEN1"
+python3 run_pipeline.py --config pipeline_config.yaml
 ```
 
-Produces: `sex_check.sexcheck`, `heterozygosity.het`, `maf.afreq`,
-`run_metadata.txt`.
+For every cohort listed in the config, in order, this runs:
 
-**Requires** `merged_qc.*` and `merged_pruned.*` from step 1 to still be
-on disk.
+| # | Step | Script | What it does |
+|---|------|--------|---------------|
+| 1 | `qc` | `00_run_plink_qc.sh` | merge batches, filter, LD-prune, kinship (KING), PCA |
+| 2 | `extra` | `01_run_extra_qc_checks.sh` | sex check, heterozygosity, MAF spectrum, version metadata |
+| 3 | `attrition` | `qc_attrition_summary.py` | sample/variant counts at each QC stage |
+| 4 | `kinship` | `qc_report.py` | kinship distribution + PCA/batch-effect plots |
+| 5 | `diagnostics` | `interpret_plink_output.py` | once per exposure in the config: relatedness verdict, PCs-vs-exposure, lambda GC |
+| 6 | `plots` | `qc_supplementary_plots.py` | missingness/sex-check/heterozygosity/MAF figures |
+| 7 | `covariates` | `extract_pca_covariates.py` | PCs → CSV, ready to merge into the G×E model |
+| 8 | `docx` | `build_supplementary_report.py` | assembles everything above into one Word report |
+
+Steps 1–2 need the server (plink2/bcftools + access to the raw VCF
+storage); steps 3–8 are pure Python and read only the files steps 1–2
+already wrote to `out_dir`.
+
+At the end, each cohort has its own `out_dir` containing everything,
+including `Supplementary_QC_Report_<cohort>.docx`. A full run log is
+also written to `logs/run_pipeline_<timestamp>.log`.
+
+### Useful flags
+
+```bash
+# See every command that would run, without running anything:
+python3 run_pipeline.py --config pipeline_config.yaml --dry-run
+
+# Only one cohort:
+python3 run_pipeline.py --config pipeline_config.yaml --cohorts gen1
+
+# Only re-run the Python reporting steps (e.g. you tweaked a threshold
+# and don't want to wait hours for steps 1-2 to redo the genomic work):
+python3 run_pipeline.py --config pipeline_config.yaml \
+    --only attrition,kinship,diagnostics,plots,covariates,docx
+
+# Redo absolutely everything from scratch, ignoring existing output:
+python3 run_pipeline.py --config pipeline_config.yaml --force
+
+# If gen1 fails, still attempt gen2 instead of stopping:
+python3 run_pipeline.py --config pipeline_config.yaml --keep-going
+```
+
+`--only` and `--skip` are mutually exclusive; both take a comma-separated
+subset of: `qc,extra,attrition,kinship,diagnostics,plots,covariates,docx`.
+
+### Resume behavior
+
+Steps 1–2 (`00_run_plink_qc.sh`, `01_run_extra_qc_checks.sh`) check,
+before doing any work, whether their own final output already exists,
+and skip it if so — this is the expensive, multi-hour part, and it
+resumes automatically after a crash or an interrupted run. Steps 3–8 are
+fast (seconds) and always recompute, so re-running the whole pipeline
+after steps 1–2 have completed just cheaply refreshes the tables,
+figures, and Word report. Use `--force` to ignore all of this and redo
+every step, including 1–2, from scratch.
+
+The "output already exists" check for steps 1–2 looks at whether the
+expected output file is present, not whether its content is complete —
+if a step was killed mid-write, use `--force` or delete the suspect file
+by hand before re-running.
 
 ---
 
-## 3. Python diagnostics and QC reports
+## 2. Running individual steps by hand
 
-These can run on any machine with Python 3 + pandas/numpy/matplotlib/scipy
-(they do not need plink2/bcftools — they only read plink2's output
-files). Order between 3a–3d does not matter; 3e needs all of them to have
-already run.
-
-### 3a. Sample/variant attrition table
-
-```bash
-python3 qc_attrition_summary.py \
-    --qc-dir "$OUT_DIR_GEN1" \
-    --out "$OUT_DIR_GEN1/qc_attrition.csv"
-```
-
-### 3b. Kinship + PCA/batch-effect report
+Every script under here also works stand-alone with its own `--help`;
+this is what `run_pipeline.py` is calling under the hood, so it's useful
+for debugging a single step, or for a one-off analysis outside the
+config. Example, for one cohort's `out_dir` after step 1–2 have already
+run:
 
 ```bash
+python3 qc_attrition_summary.py --qc-dir "$OUT_DIR" --out "$OUT_DIR/qc_attrition.csv"
+
 python3 qc_report.py \
-    --kin "$OUT_DIR_GEN1/king.kin0" \
-    --eigenvec "$OUT_DIR_GEN1/pca.eigenvec" \
-    --eigenval "$OUT_DIR_GEN1/pca.eigenval" \
-    --vcf-dirs "$GEN1_DIR" \
-    --use-filtered \
-    --out-dir "$OUT_DIR_GEN1/qc_report"
-```
+    --kin "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" --eigenval "$OUT_DIR/pca.eigenval" \
+    --vcf-dirs "$VCF_DIR" --use-filtered --out-dir "$OUT_DIR/qc_report"
 
-`--vcf-dirs` here takes ONLY this cohort's directory (not gen1+gen2+gen3
-together as in earlier drafts of this pipeline) — the batch-effect check
-this script does is meaningless within a single cohort/single VCF source
-and will just show one color; the point of running it per-cohort is the
-kinship report (looking for unexpected relatedness/duplicates WITHIN this
-cohort) and a plain PCA scatter to eyeball outliers. Omit
-`--vcf-dirs`/`--use-filtered` entirely if you don't need the batch
-coloring at all.
-
-### 3c. Relatedness / PC-vs-exposure / lambda GC interpretation
-
-```bash
 python3 interpret_plink_output.py \
-    --kin0 "$OUT_DIR_GEN1/king.kin0" \
-    --eigenvec "$OUT_DIR_GEN1/pca.eigenvec" \
-    --metadata sample_metadata_gen1.csv \
-    --exposure-col exposure_agri_score \
-    --pvalues gwas_results_gen1.csv --pvalue-col p \
-    --out-dir "$OUT_DIR_GEN1/diagnostics_output"
-```
+    --kin0 "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
+    --metadata metadata.csv --exposure-col my_exposure --strip-doubled-id \
+    --out-dir "$OUT_DIR/diagnostics_output_my_exposure"
 
-`--pvalues` is optional (only needed for the lambda GC / QQ-plot section).
-`--metadata`/`--pvalues` must be the metadata/results for THIS cohort
-only.
+python3 qc_supplementary_plots.py --qc-dir "$OUT_DIR" --out-dir "$OUT_DIR/supplementary_plots"
 
-### 3d. Supplementary plots (missingness, sex-check, heterozygosity, MAF)
-
-Requires step 2 to have already produced `sex_check.sexcheck`,
-`heterozygosity.het`, `maf.afreq`.
-
-```bash
-python3 qc_supplementary_plots.py \
-    --qc-dir "$OUT_DIR_GEN1" \
-    --out-dir "$OUT_DIR_GEN1/supplementary_plots"
-```
-
-### 3e. PCA covariates for the G×E model (independent of the report — run whenever needed)
-
-This is the file the gene-environment pipeline (`pca_utils.py` /
-`modeling.py`) actually consumes — one per cohort, matched by
-`cfg.generation`.
-
-```bash
 python3 extract_pca_covariates.py \
-    --eigenvec "$OUT_DIR_GEN1/pca.eigenvec" \
-    --n-pcs 10 \
-    --strip-doubled-id \
-    --out "$OUT_DIR_GEN1/pca_covariates.csv"
-```
+    --eigenvec "$OUT_DIR/pca.eigenvec" --n-pcs 10 --strip-doubled-id \
+    --out "$OUT_DIR/pca_covariates.csv"
 
-Use `--strip-doubled-id` consistently with whatever the gene-environment
-dataframe's IID format actually is (doubled `NOME_NOME` vs plain `NOME`)
-— see that script's `--help` for what it does and doesn't touch.
-
----
-
-## 4. Assemble the Word supplementary report
-
-Run after 3a, 3b, 3c, and 3d have all produced their output (missing
-inputs are skipped with a note in the document rather than causing a
-crash, so you can also run this earlier to see what's still missing).
-
-```bash
 python3 build_supplementary_report.py \
-    --qc-dir "$OUT_DIR_GEN1" \
-    --kinship-report-dir "$OUT_DIR_GEN1/qc_report" \
-    --diagnostics-dir "$OUT_DIR_GEN1/diagnostics_output" \
-    --attrition-csv "$OUT_DIR_GEN1/qc_attrition.csv" \
-    --supp-plots-dir "$OUT_DIR_GEN1/supplementary_plots" \
-    --out "$OUT_DIR_GEN1/Supplementary_QC_Report_gen1.docx"
-```
-
-Produces `Supplementary_QC_Report_gen1.docx`: all tables and figures in
-English, numbered (Table S1…, Figure S1…), ready to paste into or attach
-to the paper's Supplementary Materials. Review the auto-generated
-verdicts (LMM needed? PCs in the main model?) before submission — they
-are a starting point, not a final decision. Name the file per cohort
-(`_gen1`/`_gen2`) so the two don't overwrite each other.
-
----
-
-## Full command sequence, copy-paste order (BOTH cohorts)
-
-```bash
-# ============ DISCOVERY / VALIDATION (gen1) ============
-export METADATA=/srv/python-projects/gene_environment_v2/data/componenti_ambientali_full.csv
-
-# ============ DISCOVERY / VALIDATION (gen1) ============
-export OUT_DIR=/mnt/cresla_prod/genome_datasets/qc_output_gen1
-
-bash ./00_run_plink_qc.sh --use-filtered --jobs 16 \
-    /mnt/cresla_prod/genome_datasets/gen1 \
-    "$OUT_DIR"
-bash ./01_run_extra_qc_checks.sh "$OUT_DIR"
-
-python3 qc_attrition_summary.py --qc-dir "$OUT_DIR" --out "$OUT_DIR/qc_attrition.csv"
-python3 qc_report.py --kin "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
-    --eigenval "$OUT_DIR/pca.eigenval" \
-    --vcf-dirs /mnt/cresla_prod/genome_datasets/gen1 --use-filtered \
-    --out-dir "$OUT_DIR/qc_report"
-
-# uno per ciascuna esposizione che usi nel modello
-for EXPOSURE in seminativi_500 vigneti_500 risaie_500 seminativi_1000 vigneti_1000 risaie_1000 seminativi_1500 vigneti_1500 risaie_1500; do
-    python3 interpret_plink_output.py --kin0 "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
-        --metadata "$METADATA" --exposure-col "$EXPOSURE" \
-        --out-dir "$OUT_DIR/diagnostics_output_${EXPOSURE}"
-done
-
-python3 qc_supplementary_plots.py --qc-dir "$OUT_DIR" --out-dir "$OUT_DIR/supplementary_plots"
-python3 extract_pca_covariates.py --eigenvec "$OUT_DIR/pca.eigenvec" --n-pcs 10 \
-    --strip-doubled-id --out "$OUT_DIR/pca_covariates.csv"
-
-python3 build_supplementary_report.py --qc-dir "$OUT_DIR" \
-    --kinship-report-dir "$OUT_DIR/qc_report" \
-    --diagnostics-dir "$OUT_DIR/diagnostics_output_seminativi_1500" \
-    --attrition-csv "$OUT_DIR/qc_attrition.csv" \
-    --supp-plots-dir "$OUT_DIR/supplementary_plots" \
-    --out "$OUT_DIR/Supplementary_QC_Report_gen1.docx"
-
-# ============ REPLICATION (gen2) ============
-export OUT_DIR=/mnt/cresla_prod/genome_datasets/qc_output_gen2
-
-bash ./00_run_plink_qc.sh --use-filtered --jobs 16 \
-    /mnt/cresla_prod/genome_datasets/gen2 \
-    "$OUT_DIR"
-bash ./01_run_extra_qc_checks.sh "$OUT_DIR"
-
-python3 qc_attrition_summary.py --qc-dir "$OUT_DIR" --out "$OUT_DIR/qc_attrition.csv"
-python3 qc_report.py --kin "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
-    --eigenval "$OUT_DIR/pca.eigenval" \
-    --vcf-dirs /mnt/cresla_prod/genome_datasets/gen2 --use-filtered \
-    --out-dir "$OUT_DIR/qc_report"
-
-for EXPOSURE in seminativi_500 vigneti_500 risaie_500 seminativi_1000 vigneti_1000 risaie_1000 seminativi_1500 vigneti_1500 risaie_1500; do
-    python3 interpret_plink_output.py --kin0 "$OUT_DIR/king.kin0" --eigenvec "$OUT_DIR/pca.eigenvec" \
-        --metadata "$METADATA" --exposure-col "$EXPOSURE" \
-        --out-dir "$OUT_DIR/diagnostics_output_${EXPOSURE}"
-done
-
-python3 qc_supplementary_plots.py --qc-dir "$OUT_DIR" --out-dir "$OUT_DIR/supplementary_plots"
-python3 extract_pca_covariates.py --eigenvec "$OUT_DIR/pca.eigenvec" --n-pcs 10 \
-    --strip-doubled-id --out "$OUT_DIR/pca_covariates.csv"
-
-python3 build_supplementary_report.py --qc-dir "$OUT_DIR" \
-    --kinship-report-dir "$OUT_DIR/qc_report" \
-    --diagnostics-dir "$OUT_DIR/diagnostics_output_seminativi_1500" \
-    --attrition-csv "$OUT_DIR/qc_attrition.csv" \
-    --supp-plots-dir "$OUT_DIR/supplementary_plots" \
-    --out "$OUT_DIR/Supplementary_QC_Report_gen2.docx"
-
+    --qc-dir "$OUT_DIR" \
+    --diagnostics-dir "$OUT_DIR/diagnostics_output_my_exposure" \
+    --cohort-label "gen1 (discovery)" \
+    --out "$OUT_DIR/Supplementary_QC_Report.docx"
 ```
 
 ---
 
-## File map (what each script reads and writes)
+## 3. Shared module: `plink_io.py`
 
-| Script | Reads | Writes |
-|---|---|---|
-| `00_run_plink_qc.sh` | raw VCFs (ONE cohort's directory) | `merged_*.{pgen,pvar,psam}`, `king.kin0`, `pca.eigenvec/.eigenval`, `missingness.*` |
-| `01_run_extra_qc_checks.sh` | `merged_qc.*`, `merged_pruned.*` | `sex_check.sexcheck`, `heterozygosity.het`, `maf.afreq`, `run_metadata.txt` |
-| `qc_attrition_summary.py` | `merged_all/geno/qc/pruned.*`, `pruned.prune.in` | `qc_attrition.csv`, `qc_attrition.png` |
-| `qc_report.py` | `king.kin0`, `pca.eigenvec/.eigenval`, (optionally this cohort's raw VCFs) | `kinship_*.csv/png`, `pca_batch_eta2.csv`, `pca_scatter_by_batch.png`, `pca_scree_plot.png` |
-| `interpret_plink_output.py` | `king.kin0`, `pca.eigenvec`, this cohort's metadata, (optionally p-values) | `diagnostics_report.txt`, `pc_exposure_correlation.csv`, `pi_hat_distribution.png`, `pca_vs_exposure.png`, `qq_plot.png` |
-| `qc_supplementary_plots.py` | `missingness.*`, `sex_check.sexcheck`, `heterozygosity.het`, `maf.afreq` | `missingness_distributions.png`, `sex_check_distribution.png`, `heterozygosity_distribution.png`, `maf_spectrum.png`, flagged/outlier sample CSVs |
-| `extract_pca_covariates.py` | `pca.eigenvec` | `pca_covariates.csv` (for the G×E model, not part of the QC report; use `--strip-doubled-id` consistently with the G×E dataframe's ID format) |
-| `build_supplementary_report.py` | all of the above CSVs/PNGs (for THIS cohort) | `Supplementary_QC_Report_<cohort>.docx` |
+Every Python script above imports its plink2-table reading and
+doubled-ID stripping logic from `plink_io.py` instead of re-implementing
+it. Two things live there worth knowing about if you're extending the
+pipeline:
 
-## Notes
+- **`strip_doubled_id(s)`** reduces an IID of the form `NAME_NAME` (the
+  two halves identical, typical when a VCF had `FamilyID == IndividualID`
+  and got a doubled ID) down to `NAME`. It leaves anything else alone.
+  This is **opt-in everywhere** (`--strip-doubled-id`) — it is never
+  applied silently. Both `interpret_plink_output.py` and
+  `extract_pca_covariates.py` take this flag; use the *same* setting for
+  both, for the same cohort, since they need to agree on what an IID
+  looks like when merging against your metadata.
+- **`read_plink_table` / `load_eigenvec` / `load_kinship`** centralize
+  the "strip the leading `#` plink2 puts on header columns" logic and a
+  couple of column-name normalizations (e.g. `ID1`/`ID2` → `IID1`/`IID2`
+  in `.kin0`). If a future plink2 version changes a column name again,
+  fix it once here.
 
-- Everything above is run **once per cohort** (gen1, gen2), each with its
-  own `$OUT_DIR`. Nothing is pooled or shared between the two runs — this
-  is required by the discovery/replication design (see top of this file).
-  gen3 is not used anywhere in this pipeline.
-- If you re-run any step with different data (new samples, changed
-  thresholds), re-run every downstream step in order — nothing is
-  automatically invalidated/re-triggered across scripts.
-- `qc_attrition_summary.py` and `01_run_extra_qc_checks.sh` need the
-  intermediate `merged_*` files from step 1 to still exist on disk. If
-  you've deleted them to save space, those two steps will skip with a
-  warning instead of failing.
-- `build_supplementary_report.py` never recomputes anything; it only
-  formats what's already there. Missing inputs show up as a highlighted
-  note in the document instead of crashing the build, so you can run it
-  at any point to see what's left to generate.
+---
+
+## 4. How `build_supplementary_report.py` gets its numbers
+
+`interpret_plink_output.py` writes two files per run:
+`diagnostics_report.txt` (human-readable log) and
+`diagnostics_summary.json` (the same key numbers, structured).
+`build_supplementary_report.py` reads **only the JSON**. This means a
+future wording change to a log line in `interpret_plink_output.py`
+cannot silently drop a number from the Word report — if the JSON key
+isn't there, the corresponding section prints an explicit
+"[Not available: ...]" note instead of a wrong or missing paragraph.
+
+`primary_exposure_for_report` in the config picks which
+`diagnostics_output_<exposure>/` folder feeds that report (relatedness,
+PC-exposure correlation, lambda GC sections) — all `exposures` are still
+run and get their own diagnostics folder, this setting just decides
+which one's numbers go in the Word document.
+
+---
+
+## 5. What changed in this rewrite
+
+For anyone comparing against an older version of this pipeline:
+
+- Everything is now in English (code, comments, log/print output,
+  generated report), and orchestrated by `run_pipeline.py` /
+  `pipeline_config.yaml` instead of copy-pasted shell commands per
+  cohort.
+- `extract_pca_covariates.py`'s docstring used to claim the PCA was
+  computed on the pooled gen1+gen2 cohort; that was stale and
+  contradicted the actual per-cohort design — fixed, and the config
+  structure now makes per-cohort PCA the only supported path.
+- Doubled-ID stripping (`NAME_NAME` → `NAME`) used to be silent and
+  unconditional in `interpret_plink_output.py`, but opt-in and logged in
+  `extract_pca_covariates.py`. Both now go through the same
+  `plink_io.strip_doubled_ids()`, opt-in and logged in both places.
+- All the repeated plink2-table-reading code (5 near-identical copies
+  across scripts) is now in `plink_io.py`.
+- `build_supplementary_report.py` used to regex-scrape numbers out of
+  `diagnostics_report.txt`; it now reads `diagnostics_summary.json` (see
+  §4 above).
+- Stale references to a third `gen3` cohort (dropped from the study
+  design a while ago) are gone from comments/docstrings; the bash
+  pipeline's multi-directory input is now documented as "batches within
+  one cohort", which is what it's actually for.

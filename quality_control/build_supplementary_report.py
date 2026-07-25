@@ -4,7 +4,7 @@ build_supplementary_report.py
 ==============================
 Assembles a single Word (.docx) supplementary document — tables and
 figures ready to paste into a paper's Supplementary Materials, all in
-English — by reading the CSV/PNG/log outputs already produced by:
+English — by reading the CSV/PNG/JSON outputs already produced by:
 
     00_run_plink_qc.sh
     01_run_extra_qc_checks.sh
@@ -19,6 +19,14 @@ corresponding table/figure is skipped with a placeholder note instead of
 crashing the whole build — run the missing upstream step and re-run this
 script to fill the gap.
 
+The relatedness/PC-exposure/lambda-GC numbers are read from
+diagnostics_summary.json (written by interpret_plink_output.py), not by
+parsing its human-readable diagnostics_report.txt. This is a deliberate
+choice: scraping numbers out of log text with regexes means a future
+wording change to a log line silently drops that number from this
+report instead of failing loudly. The JSON file is the contract between
+the two scripts; the .txt file is for humans only.
+
 USAGE
 -----
 python3 build_supplementary_report.py \
@@ -27,6 +35,7 @@ python3 build_supplementary_report.py \
     --diagnostics-dir /path/to/qc_output/diagnostics_output \
     --attrition-csv /path/to/qc_output/qc_attrition.csv \
     --supp-plots-dir /path/to/qc_output/supplementary_plots \
+    --cohort-label "gen1 (discovery / validation cohort)" \
     --out /path/to/qc_output/Supplementary_QC_Report.docx
 
 All directory/file arguments are optional and default to the standard
@@ -35,7 +44,7 @@ subfolder names used in the pipeline's own examples, relative to
 """
 
 import argparse
-import re
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -45,6 +54,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+
+from plink_io import read_plink_table
 
 
 # ---------------------------------------------------------------------------
@@ -125,55 +136,20 @@ def add_figure(doc, img_path: Path, width_in=6.0):
 
 
 # ---------------------------------------------------------------------------
-# Readers for raw plink2 / pipeline output formats
+# Readers for pipeline output formats
 # ---------------------------------------------------------------------------
 
-def read_plink_table(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path, sep=r"\s+")
-    df.columns = [c.lstrip("#") for c in df.columns]
-    return df
-
-
-def parse_diagnostics_report(path: Path) -> dict:
+def load_diagnostics_summary(diagnostics_dir: Path) -> dict:
     """
-    Pulls the key numbers out of interpret_plink_output.py's
-    diagnostics_report.txt via regex on the fixed log lines it writes.
+    Reads the structured JSON summary written by interpret_plink_output.py.
+    Returns {} if it doesn't exist (older run, or that step hasn't been
+    executed yet) -- callers already handle an empty dict by falling back
+    to "not available" notes.
     """
-    out = {}
+    path = diagnostics_dir / "diagnostics_summary.json"
     if not path.exists():
-        return out
-    text = path.read_text(encoding="utf-8")
-
-    m = re.search(r"Coppie totali riportate da plink2:\s*(\d+)", text)
-    if m:
-        out["n_pairs_total"] = int(m.group(1))
-
-    m = re.search(r"Soglia PI_HAT:\s*([\d.]+)", text)
-    if m:
-        out["pi_hat_threshold"] = float(m.group(1))
-
-    m = re.search(r"Coppie sopra soglia:\s*(\d+)\s*\(([\d.]+)% del totale\)", text)
-    if m:
-        out["n_pairs_above_threshold"] = int(m.group(1))
-        out["pct_pairs_above_threshold"] = float(m.group(2))
-
-    m = re.search(r"R\^2 \([^)]*\):\s*([\d.]+)\s*\(([\d.]+)%", text)
-    if m:
-        out["pc_exposure_r2"] = float(m.group(1))
-        out["pc_exposure_r2_pct"] = float(m.group(2))
-
-    m = re.search(r"N test:\s*(\d+)\s*\|\s*Lambda GC\s*=\s*([\d.]+)", text)
-    if m:
-        out["lambda_gc_n_tests"] = int(m.group(1))
-        out["lambda_gc"] = float(m.group(2))
-
-    m = re.search(r"Campioni in eigenvec:\s*(\d+)\s*\|\s*in metadata:\s*(\d+)\s*\|\s*matchati:\s*(\d+)", text)
-    if m:
-        out["n_eigenvec"] = int(m.group(1))
-        out["n_metadata"] = int(m.group(2))
-        out["n_matched"] = int(m.group(3))
-
-    return out
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def parse_run_metadata(path: Path) -> dict:
@@ -182,7 +158,7 @@ def parse_run_metadata(path: Path) -> dict:
         return out
     lines = path.read_text(encoding="utf-8").splitlines()
     for i, line in enumerate(lines):
-        if line.startswith("Data esecuzione extra checks:"):
+        if line.startswith("Extra checks run date:"):
             out["run_date"] = line.split(":", 1)[1].strip()
         elif line.startswith("Host:"):
             out["host"] = line.split(":", 1)[1].strip()
@@ -197,12 +173,13 @@ def parse_run_metadata(path: Path) -> dict:
 # Section builders
 # ---------------------------------------------------------------------------
 
-def build_title(doc, qc_dir):
+def build_title(doc, qc_dir, cohort_label):
     title = doc.add_heading("Supplementary Material: Genomic Quality Control", level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     sub = doc.add_paragraph()
     sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = sub.add_run(f"QC pipeline output directory: {qc_dir}")
+    label = cohort_label or qc_dir.name
+    run = sub.add_run(f"Cohort: {label}  |  QC pipeline output directory: {qc_dir}")
     run.italic = True
     run.font.size = Pt(10)
     doc.add_paragraph()
@@ -211,7 +188,7 @@ def build_title(doc, qc_dir):
 def build_intro(doc):
     doc.add_heading("1. Overview", level=1)
     doc.add_paragraph(
-        "This document summarizes the genotype quality-control (QC) pipeline applied to the "
+        "This document summarizes the genotype quality-control (QC) pipeline applied to this "
         "study cohort prior to downstream gene-environment interaction analysis. Variant "
         "calling batches were merged, filtered for missingness, LD-pruned, and screened for "
         "cryptic relatedness and population stratification using PLINK2. The tables and "
@@ -249,7 +226,6 @@ def build_attrition(doc, attrition_csv, counters):
         add_missing_note(doc, "sample/variant attrition table", attrition_csv)
         return
     df = pd.read_csv(attrition_csv)
-    # Translate column headers to English for the paper table.
     rename = {
         "stage": "QC stage",
         "n_samples": "N samples",
@@ -285,36 +261,30 @@ def build_attrition(doc, attrition_csv, counters):
 def build_relatedness(doc, kinship_dir, diagnostics_dir, counters):
     doc.add_heading("4. Relatedness (Kinship) Screening", level=1)
 
-    diag_report = diagnostics_dir / "diagnostics_report.txt"
-    diag = parse_diagnostics_report(diag_report)
-    if diag:
+    diag = load_diagnostics_summary(diagnostics_dir)
+    if diag.get("n_pairs_total") is not None:
         p = doc.add_paragraph()
         p.add_run(
-            f"A total of {diag.get('n_pairs_total', 'n/a'):,} sample pairs were evaluated using "
+            f"A total of {diag['n_pairs_total']:,} sample pairs were evaluated using "
             f"KING-robust kinship coefficients (PLINK2 --make-king-table). Using a PI_HAT "
             f"threshold of {diag.get('pi_hat_threshold', 'n/a')}, "
-            f"{diag.get('n_pairs_above_threshold', 'n/a'):,} pairs "
-            f"({diag.get('pct_pairs_above_threshold', 'n/a')}% of all pairs) exceeded the "
-            f"threshold." if isinstance(diag.get('n_pairs_total'), int) else ""
+            f"{diag.get('n_pairs_above_threshold', 0):,} pairs "
+            f"({diag.get('pct_pairs_above_threshold', 0):.2f}% of all pairs) exceeded the "
+            f"threshold."
         )
+    else:
+        add_missing_note(doc, "relatedness summary", diagnostics_dir / "diagnostics_summary.json")
 
     counts_csv = kinship_dir / "kinship_category_counts.csv"
     if counts_csv.exists():
         df = pd.read_csv(counts_csv)
         df = df.rename(columns={
-            "categoria": "Relatedness category",
-            "n_coppie": "N pairs",
-            "pct_coppie": "% of pairs",
+            "category": "Relatedness category",
+            "n_pairs": "N pairs",
+            "pct_pairs": "% of pairs",
         })
-        translate = {
-            "duplicato/gemello monozigote": "Duplicate / monozygotic twin",
-            "parente di 1o grado": "1st-degree relative",
-            "parente di 2o grado": "2nd-degree relative",
-            "parente di 3o grado": "3rd-degree relative",
-            "non imparentati": "Unrelated",
-        }
         if "Relatedness category" in df.columns:
-            df["Relatedness category"] = df["Relatedness category"].replace(translate)
+            df["Relatedness category"] = df["Relatedness category"].str.capitalize()
         if "% of pairs" in df.columns:
             df["% of pairs"] = df["% of pairs"].round(3)
         label = counters.table()
@@ -434,7 +404,7 @@ def build_population_structure(doc, kinship_dir, counters):
         df = df.rename(columns={
             "PC": "Principal component",
             "eta_squared": "Eta-squared (variance explained by batch)",
-            "batch_effect_alto": "Substantial batch effect (eta^2 > 0.1)",
+            "high_batch_effect": "Substantial batch effect (eta^2 > 0.1)",
         })
         label = counters.table()
         add_caption(doc, label, "Fraction of principal-component variance explained by genotyping batch.")
@@ -460,8 +430,7 @@ def build_population_structure(doc, kinship_dir, counters):
 def build_pc_exposure(doc, diagnostics_dir, counters):
     doc.add_heading("8. Principal Components vs. Exposure", level=1)
 
-    diag_report = diagnostics_dir / "diagnostics_report.txt"
-    diag = parse_diagnostics_report(diag_report)
+    diag = load_diagnostics_summary(diagnostics_dir)
     if diag.get("pc_exposure_r2") is not None:
         p = doc.add_paragraph()
         p.add_run(
@@ -479,7 +448,7 @@ def build_pc_exposure(doc, diagnostics_dir, counters):
             "PC": "Principal component",
             "pearson_r": "Pearson r",
             "p_value": "p-value",
-            "notevole": "Notable (|r|>0.2, p<0.05)",
+            "notable": "Notable (|r|>0.2, p<0.05)",
         })
         label = counters.table()
         add_caption(doc, label, "Correlation between each principal component and the exposure variable.")
@@ -518,8 +487,7 @@ def build_maf_and_missingness(doc, supp_plots_dir, counters):
 def build_genomic_inflation(doc, diagnostics_dir, counters):
     doc.add_heading("10. Genomic Inflation", level=1)
 
-    diag_report = diagnostics_dir / "diagnostics_report.txt"
-    diag = parse_diagnostics_report(diag_report)
+    diag = load_diagnostics_summary(diagnostics_dir)
     if diag.get("lambda_gc") is not None:
         label = counters.table()
         add_caption(doc, label, "Genomic inflation factor summary.")
@@ -530,7 +498,7 @@ def build_genomic_inflation(doc, diagnostics_dir, counters):
         add_df_table(doc, df, col_widths_in=[3.0, 3.0])
         doc.add_paragraph()
     else:
-        add_missing_note(doc, "genomic inflation (lambda GC) summary", diag_report)
+        add_missing_note(doc, "genomic inflation (lambda GC) summary", diagnostics_dir / "diagnostics_summary.json")
 
     fig_path = diagnostics_dir / "qq_plot.png"
     if fig_path.exists():
@@ -560,6 +528,9 @@ def main():
                          help="CSV produced by qc_attrition_summary.py (default: <qc-dir>/qc_attrition.csv)")
     parser.add_argument("--supp-plots-dir", type=Path, default=None,
                          help="out-dir used for qc_supplementary_plots.py (default: <qc-dir>/supplementary_plots)")
+    parser.add_argument("--cohort-label", type=str, default=None,
+                         help="human-readable cohort label shown in the document title, e.g. "
+                              "'gen1 (discovery / validation cohort)' (default: qc-dir folder name)")
     parser.add_argument("--out", required=True, type=Path, help="output .docx path")
     args = parser.parse_args()
 
@@ -572,7 +543,7 @@ def main():
     doc = Document()
     counters = FigureCounter()
 
-    build_title(doc, qc_dir)
+    build_title(doc, qc_dir, args.cohort_label)
     build_intro(doc)
     build_reproducibility(doc, qc_dir, counters)
     build_attrition(doc, attrition_csv, counters)

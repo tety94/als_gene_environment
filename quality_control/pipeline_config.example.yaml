@@ -1,0 +1,83 @@
+# pipeline_config.example.yaml
+# ==============================================================================
+# Copy this file (e.g. `cp pipeline_config.example.yaml pipeline_config.yaml`),
+# fill in your real paths below, and run the whole pipeline with:
+#
+#   python3 run_pipeline.py --config pipeline_config.yaml
+#
+# See the "Configuration" section of README.md for the full list of CLI
+# overrides (--force, --jobs, --cohorts, --only, --dry-run, --keep-going).
+# ==============================================================================
+
+# One entry per cohort. Order matters: cohorts are processed in the order
+# listed here. "role" is only used for labeling (log messages, and the
+# title page of the generated Word report) -- it has no effect on the
+# analysis.
+cohorts:
+  gen1:
+    role: discovery
+    # One directory per genotyping batch belonging to this cohort. Almost
+    # always a single directory -- see the note on "batch" vs. "cohort"
+    # at the top of 00_run_plink_qc.sh. Add a second entry here only if
+    # this cohort's raw VCFs were delivered as more than one batch.
+    vcf_dirs:
+      - /mnt/cresla_prod/genome_datasets/gen1
+    out_dir: /mnt/cresla_prod/genome_datasets/qc_output_gen1
+  gen2:
+    role: replication
+    vcf_dirs:
+      - /mnt/cresla_prod/genome_datasets/gen2
+    out_dir: /mnt/cresla_prod/genome_datasets/qc_output_gen2
+
+# CSV/parquet with columns: id, <each exposure column below>. "id" must
+# match plink2's IID column (after --strip-doubled-id is applied, if
+# enabled below).
+metadata_csv: /srv/python-projects/gene_environment_v2/data/exposure_metadata.csv
+
+# interpret_plink_output.py is run once per exposure listed here, for
+# each cohort, producing one diagnostics_output_<exposure>/ folder per
+# exposure. Add/remove entries freely.
+exposures:
+  - seminativi_500
+  - vigneti_500
+  - risaie_500
+  - seminativi_1000
+  - vigneti_1000
+  - risaie_1000
+  - seminativi_1500
+  - vigneti_1500
+  - risaie_1500
+
+# Which of the diagnostics_output_<exposure>/ folders feeds the
+# Relatedness / PC-exposure / lambda-GC sections of the Word report.
+# Must be one of the entries in `exposures` above.
+primary_exposure_for_report: seminativi_1500
+
+# Optional: per-cohort GWAS p-values CSV/parquet for the genomic-inflation
+# (lambda GC) section of interpret_plink_output.py. Leave as null / omit
+# a cohort to skip that section for it.
+gwas_results:
+  gen1: null
+  gen2: null
+gwas_pvalue_col: p
+
+# Parameters shared by the QC steps. All are optional -- anything you
+# omit falls back to each script's own default (see their --help). Kept
+# here mainly so both cohorts always run with the exact same thresholds,
+# and so the values are recorded in one reviewable file for the Methods
+# section.
+qc:
+  use_filtered: true          # 00_run_plink_qc.sh --use-filtered
+  jobs: 16                    # 00_run_plink_qc.sh --jobs
+  force: false                # redo every step from scratch (overridable with --force)
+  maf_threshold: 0.01
+  ld_window_size: 50
+  ld_step: 5
+  ld_r2_threshold: 0.5
+  geno_thresh: 0.05
+  mind_thresh: 0.05
+  exclude_id_prefixes: ""     # comma-separated sample-ID prefixes to exclude, e.g. "ACH"
+  n_pcs: 10
+  strip_doubled_id: true      # applied consistently in both interpret_plink_output.py and extract_pca_covariates.py
+  pi_hat_threshold: 0.125
+  het_sd_threshold: 3.0

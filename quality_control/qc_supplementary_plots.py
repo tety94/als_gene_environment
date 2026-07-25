@@ -2,17 +2,17 @@
 """
 qc_supplementary_plots.py
 ===========================
-Grafici supplementari per il paper, letti dai file gia' prodotti da
-00_run_plink_qc.sh (missingness) e da 01_run_extra_qc_checks.sh
-(sex_check.sexcheck, heterozygosity.het, maf.afreq). Nessuno di questi
-file viene ricalcolato qui: lo script si limita a leggerli e plottarli.
-Ogni grafico viene saltato singolarmente (con avviso) se il file di input
-non e' presente, invece di far fallire l'intero script.
+Supplementary figures for the paper, read from files already produced by
+00_run_plink_qc.sh (missingness) and by 01_run_extra_qc_checks.sh
+(sex_check.sexcheck, heterozygosity.het, maf.afreq). None of these files
+are recomputed here: the script only reads and plots them. Each figure
+is skipped individually (with a warning) if its input file is missing,
+instead of failing the whole script.
 
-USO:
+USAGE:
   python3 qc_supplementary_plots.py \
-      --qc-dir /mnt/cresla_prod/genome_datasets/qc_output \
-      --out-dir /mnt/cresla_prod/genome_datasets/qc_output/supplementary_plots \
+      --qc-dir /mnt/genome_datasets/qc_output_cohortA \
+      --out-dir /mnt/genome_datasets/qc_output_cohortA/supplementary_plots \
       --geno-thresh 0.05 --mind-thresh 0.05
 """
 
@@ -29,11 +29,7 @@ try:
 except ImportError:
     plt = None
 
-
-def _read_plink_table(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path, sep=r"\s+")
-    df.columns = [c.lstrip("#") for c in df.columns]
-    return df
+from plink_io import read_plink_table
 
 
 def plot_missingness(qc_dir: Path, out_dir: Path, geno_thresh: float, mind_thresh: float) -> None:
@@ -41,11 +37,11 @@ def plot_missingness(qc_dir: Path, out_dir: Path, geno_thresh: float, mind_thres
     smiss_path = qc_dir / "missingness.smiss"
 
     if not vmiss_path.exists() or not smiss_path.exists():
-        print(f"  [salto missingness: {vmiss_path.name} o {smiss_path.name} non trovati]")
+        print(f"  [skipping missingness: {vmiss_path.name} or {smiss_path.name} not found]")
         return
 
-    vmiss = _read_plink_table(vmiss_path)
-    smiss = _read_plink_table(smiss_path)
+    vmiss = read_plink_table(vmiss_path)
+    smiss = read_plink_table(smiss_path)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
 
@@ -68,26 +64,26 @@ def plot_missingness(qc_dir: Path, out_dir: Path, geno_thresh: float, mind_thres
     out_path = out_dir / "missingness_distributions.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    print(f"  Salvato: {out_path}")
+    print(f"  Saved: {out_path}")
 
-    # Nota: una distribuzione bimodale in vmiss (blocco intorno a F_MISS
-    # ~1/n_batch) e' la firma di siti presenti solo in alcuni batch -- vedi
-    # commento nello Step 5 di 00_run_plink_qc.sh.
+    # Note: a bimodal distribution in vmiss (a block around F_MISS
+    # ~1/n_batches) is the signature of sites present in only some
+    # batches -- see the Step 5 comment in 00_run_plink_qc.sh.
     frac_above_geno = (vmiss["F_MISS"] > geno_thresh).mean()
     frac_above_mind = (smiss["F_MISS"] > mind_thresh).mean()
-    print(f"  Varianti sopra soglia --geno: {100*frac_above_geno:.2f}%")
-    print(f"  Campioni sopra soglia --mind: {100*frac_above_mind:.2f}%")
+    print(f"  Variants above --geno threshold: {100*frac_above_geno:.2f}%")
+    print(f"  Samples above --mind threshold: {100*frac_above_mind:.2f}%")
 
 
 def plot_sex_check(qc_dir: Path, out_dir: Path) -> None:
     path = qc_dir / "sex_check.sexcheck"
     if not path.exists():
-        print(f"  [salto sex-check: {path.name} non trovato -- lancia prima 01_run_extra_qc_checks.sh]")
+        print(f"  [skipping sex-check: {path.name} not found -- run 01_run_extra_qc_checks.sh first]")
         return
 
-    df = _read_plink_table(path)
+    df = read_plink_table(path)
     if "F" not in df.columns or "STATUS" not in df.columns:
-        print(f"  [salto sex-check: colonne attese (F, STATUS) non trovate in {path}]")
+        print(f"  [skipping sex-check: expected columns (F, STATUS) not found in {path}]")
         return
 
     problem = df["STATUS"] == "PROBLEM"
@@ -105,23 +101,23 @@ def plot_sex_check(qc_dir: Path, out_dir: Path) -> None:
     out_path = out_dir / "sex_check_distribution.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    print(f"  Salvato: {out_path}  ({n_problem} PROBLEM su {len(df)} campioni)")
+    print(f"  Saved: {out_path}  ({n_problem} PROBLEM out of {len(df)} samples)")
 
     if n_problem:
         flagged_path = out_dir / "sex_check_flagged_samples.csv"
         df.loc[problem].to_csv(flagged_path, index=False)
-        print(f"  Campioni flaggati salvati in: {flagged_path}")
+        print(f"  Flagged samples saved to: {flagged_path}")
 
 
 def plot_heterozygosity(qc_dir: Path, out_dir: Path, sd_threshold: float = 3.0) -> None:
     path = qc_dir / "heterozygosity.het"
     if not path.exists():
-        print(f"  [salto heterozygosity: {path.name} non trovato -- lancia prima 01_run_extra_qc_checks.sh]")
+        print(f"  [skipping heterozygosity: {path.name} not found -- run 01_run_extra_qc_checks.sh first]")
         return
 
-    df = _read_plink_table(path)
+    df = read_plink_table(path)
     if "F" not in df.columns:
-        print(f"  [salto heterozygosity: colonna F non trovata in {path}]")
+        print(f"  [skipping heterozygosity: column F not found in {path}]")
         return
 
     mean_f = df["F"].mean()
@@ -142,24 +138,24 @@ def plot_heterozygosity(qc_dir: Path, out_dir: Path, sd_threshold: float = 3.0) 
     out_path = out_dir / "heterozygosity_distribution.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    print(f"  Salvato: {out_path}  ({len(outliers)} outlier su {len(df)} campioni)")
+    print(f"  Saved: {out_path}  ({len(outliers)} outliers out of {len(df)} samples)")
 
     if len(outliers) > 0:
         outliers_path = out_dir / "heterozygosity_outlier_samples.csv"
         outliers.to_csv(outliers_path, index=False)
-        print(f"  Campioni outlier salvati in: {outliers_path}")
+        print(f"  Outlier samples saved to: {outliers_path}")
 
 
 def plot_maf_spectrum(qc_dir: Path, out_dir: Path) -> None:
     path = qc_dir / "maf.afreq"
     if not path.exists():
-        print(f"  [salto MAF spectrum: {path.name} non trovato -- lancia prima 01_run_extra_qc_checks.sh]")
+        print(f"  [skipping MAF spectrum: {path.name} not found -- run 01_run_extra_qc_checks.sh first]")
         return
 
-    df = _read_plink_table(path)
+    df = read_plink_table(path)
     freq_col = "ALT_FREQS" if "ALT_FREQS" in df.columns else None
     if freq_col is None:
-        print(f"  [salto MAF spectrum: colonna ALT_FREQS non trovata in {path}. Colonne: {list(df.columns)}]")
+        print(f"  [skipping MAF spectrum: column ALT_FREQS not found in {path}. Columns: {list(df.columns)}]")
         return
 
     maf = np.minimum(df[freq_col], 1 - df[freq_col])
@@ -173,28 +169,28 @@ def plot_maf_spectrum(qc_dir: Path, out_dir: Path) -> None:
     out_path = out_dir / "maf_spectrum.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    print(f"  Salvato: {out_path}")
+    print(f"  Saved: {out_path}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Grafici supplementari QC (missingness, sex-check, heterozygosity, MAF spectrum)",
+        description="Supplementary QC figures (missingness, sex-check, heterozygosity, MAF spectrum)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--qc-dir", required=True, type=Path, help="out_dir della pipeline (00_run_plink_qc.sh)")
-    parser.add_argument("--out-dir", required=True, type=Path, help="directory dove salvare i grafici")
-    parser.add_argument("--geno-thresh", type=float, default=0.05, help="soglia --geno usata nella pipeline (default 0.05)")
-    parser.add_argument("--mind-thresh", type=float, default=0.05, help="soglia --mind usata nella pipeline (default 0.05)")
-    parser.add_argument("--het-sd-threshold", type=float, default=3.0, help="soglia in SD per outlier di eterozigosita' (default 3)")
+    parser.add_argument("--qc-dir", required=True, type=Path, help="pipeline out_dir (00_run_plink_qc.sh)")
+    parser.add_argument("--out-dir", required=True, type=Path, help="directory where figures are saved")
+    parser.add_argument("--geno-thresh", type=float, default=0.05, help="--geno threshold used in the pipeline (default 0.05)")
+    parser.add_argument("--mind-thresh", type=float, default=0.05, help="--mind threshold used in the pipeline (default 0.05)")
+    parser.add_argument("--het-sd-threshold", type=float, default=3.0, help="SD threshold for heterozygosity outliers (default 3)")
     args = parser.parse_args()
 
     if plt is None:
-        print("ERRORE: matplotlib non disponibile, impossibile generare grafici.")
+        print("ERROR: matplotlib not available, cannot generate figures.")
         return
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("==> Missingness (per variante e per campione)")
+    print("==> Missingness (per variant and per sample)")
     plot_missingness(args.qc_dir, args.out_dir, args.geno_thresh, args.mind_thresh)
 
     print("\n==> Sex check")
@@ -206,7 +202,7 @@ def main() -> None:
     print("\n==> MAF spectrum")
     plot_maf_spectrum(args.qc_dir, args.out_dir)
 
-    print(f"\n==> FATTO. Output in: {args.out_dir}")
+    print(f"\n==> DONE. Output in: {args.out_dir}")
 
 
 if __name__ == "__main__":
