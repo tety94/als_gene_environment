@@ -1238,8 +1238,8 @@ def run_pure_null_ci_check(df: pd.DataFrame, alpha: float = 0.05, near_edge_marg
 # docstring for what each scenario covers.
 # ============================================================
 
-def run_scenario_phase(n_workers: int = 1, names: list[str] | None = None) -> dict:
-    return rs.run_all_scenarios(names=names, n_workers=n_workers)
+def run_scenario_phase(n_workers: int = 1, names: list[str] | None = None, force: bool = False) -> dict:
+    return rs.run_all_scenarios(names=names, n_workers=n_workers, force=force)
 
 
 def main() -> None:
@@ -1251,8 +1251,10 @@ def main() -> None:
                          help="Parallel processes used within each phase (isolated variants, then "
                               "scenarios). Default 1 (sequential).")
     parser.add_argument("--force", action="store_true",
-                         help="Isolated phase only: recompute even variants that already have an "
-                              "isolated_summary.json with status ok (default: cached result reused).")
+                         help="Recompute even variants/scenarios that already have a cached result with "
+                              "status ok (isolated_summary.json for phase 1, scenario_summary.json for "
+                              "phase 2). Default: cached results are reused, only missing/failed ones are "
+                              "(re)computed.")
     parser.add_argument("--skip-isolated", action="store_true", help="Skip phase 1 (isolated per-variant test).")
     parser.add_argument("--skip-scenarios", action="store_true", help="Skip phase 2 (robustness scenario battery).")
     parser.add_argument("--skip-pure-null", action="store_true", help="Skip phase 3 (pure_null zone CI check).")
@@ -1264,8 +1266,8 @@ def main() -> None:
                          help="Phase 3: if the nominal 5%% is INSIDE the CI but closer than this to its "
                               "edge, run the P_boot comparison anyway, out of caution (default 0.02).")
     parser.add_argument("--output-dir", default=None,
-                         help="Cartella dove scrivere isolated/ e scenarios/ (default: la cartella di "
-                              "questo script). Vale per tutte e 3 le fasi.")
+                         help="Folder where isolated/ and scenarios/ are written (default: this "
+                              "script's folder). Applies to all 3 phases.")
     args = parser.parse_args()
 
     if args.output_dir:
@@ -1290,7 +1292,7 @@ def main() -> None:
 
     if not args.skip_scenarios:
         section("PHASE 2/3 — ROBUSTNESS SCENARIO BATTERY")
-        phase_results["scenarios"] = run_scenario_phase(n_workers=n_workers, names=args.scenarios)
+        phase_results["scenarios"] = run_scenario_phase(n_workers=n_workers, names=args.scenarios, force=args.force)
     else:
         print("[skip] phase 2 (scenarios) skipped by --skip-scenarios.")
 

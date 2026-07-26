@@ -592,15 +592,15 @@ def run_scenario(name: str, gen_params: dict, n_workers: int = 1, force: bool = 
     return result
 
 
-def _run_scenario_worker(name: str, n_workers: int) -> dict:
+def _run_scenario_worker(name: str, n_workers: int, force: bool = False) -> dict:
     """Top-level wrapper (needed: ProcessPoolExecutor must be able to
     pickle the submitted function). Every call runs in a new Python
     process -> no sharing of os.environ / module state with the other
     scenarios in progress."""
-    return run_scenario(name, SCENARIOS[name], n_workers=n_workers)
+    return run_scenario(name, SCENARIOS[name], n_workers=n_workers, force=force)
 
 
-def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1) -> dict:
+def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1, force: bool = False) -> dict:
     """Runs the scenario battery (all of them, or only `names` if
     specified), writes the aggregate reports under SCENARIOS_ROOT and
     returns a dict with:
@@ -612,6 +612,13 @@ def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1) -> dic
       - "vqtl_failed":  names of scenarios with has_failures=True on the
                          vQTL pipeline's automated checks
       - "has_failures": True if failed or vqtl_failed are non-empty
+    force: if True, ignore any cached scenario_summary.json (status "ok")
+        found on disk and recompute every scenario from scratch. Default
+        False: a scenario whose scenario_summary.json already has
+        status="ok" is served from cache instead of being rerun (data
+        regeneration + gene-environment + vQTL Step 3-7 all skipped) --
+        a scenario that previously FAILED is always retried regardless of
+        this flag.
     Used both by main() (standalone CLI) and by run_isolated_casual_test.py
     (as the "scenarios phase" of the full test battery)."""
     names = list(names) if names else list(SCENARIOS.keys())
@@ -626,13 +633,13 @@ def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1) -> dic
 
     if n_workers == 1:
         for name in names:
-            all_results.append(run_scenario(name, SCENARIOS[name], n_workers=1))
+            all_results.append(run_scenario(name, SCENARIOS[name], n_workers=1, force=force))
     else:
         print(f"Running {len(names)} scenarios with {n_workers} parallel processes "
               f"(each with at most {max(1, (os.cpu_count() or 2) // n_workers)} internal vQTL jobs)...")
         results_by_name = {}
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_run_scenario_worker, name, n_workers): name for name in names}
+            futures = {pool.submit(_run_scenario_worker, name, n_workers, force): name for name in names}
             for fut in as_completed(futures):
                 name = futures[fut]
                 try:
@@ -713,7 +720,14 @@ def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1) -> dic
     os.makedirs(recap_all_dir, exist_ok=True)
     comparison_table = build_scenario_comparison_table(all_results)
     comparison_table.to_csv(os.path.join(recap_all_dir, "manuscript_scenario_table.csv"), index=False)
-    power_curve_path = os.path.join(SCRIPT_DIR, "isolated", "plots", "manuscript_power_curve.png")
+    # Derived from SCENARIOS_ROOT's parent, NOT from SCRIPT_DIR: SCENARIOS_ROOT
+    # can be overridden at runtime (this script's own --output-dir, or
+    # run_isolated_casual_test.py setting rs.SCENARIOS_ROOT directly), and in
+    # that case isolated/plots/ lives next to the overridden scenarios/, not
+    # next to this file -- using SCRIPT_DIR here was a bug (the figure was
+    # silently never found whenever --output-dir was used).
+    output_root = os.path.dirname(os.path.normpath(SCENARIOS_ROOT))
+    power_curve_path = os.path.join(output_root, "isolated", "plots", "manuscript_power_curve.png")
     write_manuscript_scenario_report(
         comparison_table,
         out_path=os.path.join(recap_all_dir, "manuscript_scenario_report.docx"),
@@ -747,6 +761,9 @@ def main() -> None:
     parser.add_argument("scenarios", nargs="*", help="Scenario names to run (default: all)")
     parser.add_argument("--workers", type=int, default=1,
                          help="Number of scenarios to run in parallel (separate processes). Default 1 (sequential).")
+    parser.add_argument("--force", action="store_true",
+                         help="Ignore any cached scenario_summary.json (status ok) and recompute every "
+                              "scenario from scratch, even if it already completed successfully before.")
     parser.add_argument("--output-dir", default=None,
                          help="Folder where scenarios/ is written (default: this script's folder).")
     args = parser.parse_args()
@@ -756,7 +773,7 @@ def main() -> None:
         SCENARIOS_ROOT = os.path.join(os.path.abspath(args.output_dir), "scenarios")
         print(f"[config] Output: {SCENARIOS_ROOT}")
 
-    result = run_all_scenarios(names=args.scenarios or None, n_workers=args.workers)
+    result = run_all_scenarios(names=args.scenarios or None, n_workers=args.workers, force=args.force)
     if result["has_failures"]:
         sys.exit(1)
 
