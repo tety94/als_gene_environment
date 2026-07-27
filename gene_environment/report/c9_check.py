@@ -44,7 +44,7 @@ OUT_DIR = Path("/mnt/cresla_prod/stefano_ge/c9_check")
 RESTRICTED_CSV = OUT_DIR / "gen_restricted_variants.csv"
 MERGED_CSV = OUT_DIR / "c9_check_merged.csv"
 CODICE_GEN_FILE = OUT_DIR / "codice_gen.csv"
-VCF_FILE_GEN1 = "/mnt/cresla_prod/genome_datasets/gen1/gen1_vcf_chr22.vcf.gz"
+VCF_FILE_GEN1 = "/mnt/cresla_prod/genome_datasets/gen1/gen1_onlycases_vcf_chr22.vcf.gz"
 VCF_FILE_GEN2 = "/mnt/cresla_prod/genome_datasets/gen2/gen2_vcf_chr22.vcf.gz"
 VARIANT_COLS_FILE = OUT_DIR / "variant_columns.json"  # lista colonne-varianti, riusata da generation_stats.py
 
