@@ -4,8 +4,8 @@ Entry point of the vQTL pipeline, in the same style as `gene_environment.cli`
 (one subcommand per step, plus `run-all`).
 
 Examples:
-    python -m vqtl.cli run-all --generation 2   # first run: compute everything
-    python -m vqtl.cli run-all --generation 1   # if gen1 already has cached
+    python -m vqtl.cli run-all --generation 2 --significant-only  # first run: compute everything
+    python -m vqtl.cli run-all --generation 1 --significant-only  # if gen1 already has cached
                                                  # significant results, skips
                                                  # the scan and reads from DB
     python -m vqtl.cli scan --generation 1

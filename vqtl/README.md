@@ -98,7 +98,7 @@ python3 -m vqtl.cli run-all --generation 1   # if gen1 already has significant
                                               # and reads from the DB
 
 # individual steps (for debugging), same cohort:
-python3 -m vqtl.cli scan --generation 1
+python3 -m vqtl.cli scan --generation 1 
 python3 -m vqtl.cli filter --generation 1
 python3 -m vqtl.cli interaction --generation 1
 python3 -m vqtl.cli rge-het --generation 1
