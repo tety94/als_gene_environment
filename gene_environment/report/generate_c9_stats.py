@@ -39,6 +39,8 @@ VARIANT_COLS_FILE = OUT_DIR / "variant_columns.json"
 STATS_DIR = OUT_DIR / "stats"
 PLOTS_DIR = STATS_DIR / "plots"
 REPORTS_DIR = STATS_DIR / "reports"
+C9_DIR = STATS_DIR / "c9_report"
+C9_PLOTS_DIR = C9_DIR / "plots"
 
 ID_COL = "id"
 GENERATION_COL = "generation"
@@ -50,7 +52,7 @@ EDUCATION_YEARS_COL = "education_years"
 SURVIVAL_COL = "survival"
 MUTAZ_RAW_COL = "mutaz"
 
-ALPHA = 0.05
+ALPHA = 0.05  # soglia sul p-value corretto (Bonferroni) per generare grafici/report
 
 CATEGORICAL_VARS = [SEX_COL, ONSET_SITE_COL, "mutaz_bin", "survival_null"]
 CONTINUOUS_VARS = [DIAGNOSTIC_DELAY_COL, EDUCATION_YEARS_COL, SURVIVAL_COL]
@@ -195,7 +197,81 @@ def generate_plots(df_gen: pd.DataFrame, results: pd.DataFrame, generation: int,
 # ----------------------------------------------------------------------
 # Report Word
 # ----------------------------------------------------------------------
-def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int, out_path: Path):
+def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
+    """Report dedicato a mutaz_bin (derivata da C9ORF72): TUTTE le varianti,
+    indipendentemente dalla significatività. CSV + immagini + Word."""
+    from docx import Document
+    from docx.shared import Inches
+
+    C9_DIR.mkdir(parents=True, exist_ok=True)
+    C9_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    doc = Document()
+    doc.add_heading("Report C9ORF72 (mutaz_bin) — tutte le varianti", level=1)
+    doc.add_paragraph(
+        "Questo report include TUTTE le varianti testate contro mutaz_bin, "
+        "indipendentemente dalla significatività statistica."
+    )
+
+    for generation in (1, 2):
+        if generation not in results_by_gen:
+            continue
+        results = results_by_gen[generation]
+        c9_results = results[results["variable"] == "mutaz_bin"].copy()
+        c9_results = c9_results.sort_values("pvalue")
+
+        # CSV dedicato
+        csv_path = C9_DIR / f"c9_mutaz_bin_gen{generation}.csv"
+        c9_results.drop(columns=["table"], errors="ignore").to_csv(csv_path, index=False)
+        log.info("CSV C9 generazione %d salvato: %s (%d varianti)", generation, csv_path, len(c9_results))
+
+        df_gen = df[df[GENERATION_COL] == generation]
+
+        # Immagini per TUTTE le varianti (non solo significative)
+        c9_results["plot_path"] = None
+        for idx, row in c9_results.iterrows():
+            variant = row["variant"]
+            fname = f"gen{generation}_{variant}_mutaz_bin.png".replace("/", "_")
+            out_img = C9_PLOTS_DIR / fname
+            try:
+                plot_categorical(df_gen, variant, "mutaz_bin", generation, out_img)
+                c9_results.at[idx, "plot_path"] = str(out_img)
+            except Exception as e:
+                log.warning("Plot C9 fallito per %s: %s", variant, e)
+
+        # Sezione Word per questa generazione
+        doc.add_heading(f"Generazione {generation}", level=2)
+        doc.add_paragraph(f"Totale varianti testate: {len(c9_results)}.")
+
+        table = doc.add_table(rows=1, cols=6)
+        table.style = "Light Grid Accent 1"
+        hdr = table.rows[0].cells
+        for i, h in enumerate(["Variante", "Test", "p-value", "p-value (Bonferroni)", "N gruppo 0", "N gruppo 1"]):
+            hdr[i].text = h
+        for _, row in c9_results.iterrows():
+            cells = table.add_row().cells
+            cells[0].text = str(row["variant"])
+            cells[1].text = str(row["test"])
+            cells[2].text = f"{row['pvalue']:.4g}" if pd.notna(row["pvalue"]) else "n/d"
+            cells[3].text = f"{row['pvalue_bonf']:.4g}" if pd.notna(row["pvalue_bonf"]) else "n/d"
+            cells[4].text = str(row.get("n0", ""))
+            cells[5].text = str(row.get("n1", ""))
+
+        doc.add_heading(f"Grafici — Generazione {generation}", level=3)
+        for _, row in c9_results.iterrows():
+            if not row["plot_path"]:
+                continue
+            star = " *" if pd.notna(row["pvalue_bonf"]) and row["pvalue_bonf"] < ALPHA else ""
+            doc.add_paragraph(
+                f"{row['variant']} (p = {row['pvalue']:.4g}, p_bonf = {row['pvalue_bonf']:.4g}{star})"
+            )
+            doc.add_picture(row["plot_path"], width=Inches(4.5))
+
+    doc.save(out_path)
+    log.info("Report C9 salvato: %s", out_path)
+
+
+
     from docx import Document
     from docx.shared import Inches
 
@@ -322,6 +398,10 @@ def main():
             sig_by_gen[1], sig_by_gen[2],
             REPORTS_DIR / "combined_report.docx"
         )
+
+    # Report dedicato C9 (mutaz_bin): tutte le varianti, indipendentemente
+    # dalla significatività.
+    build_c9_report(df, results_by_gen, REPORTS_DIR / "c9_report.docx")
 
 
 if __name__ == "__main__":
