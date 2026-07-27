@@ -11,10 +11,6 @@ Pipeline:
 4. Fa il join con ENV_FILE (componenti ambientali) sulla chiave paziente/campione.
 5. Salva il risultato finale in OUT_DIR.
 
-NOTE DA VERIFICARE (marcate anche sotto con TODO):
-- ID_COLS_RAW: nome/i colonna/e identificative nel parquet (es. sample id).
-- ID_COLS_ENV: nome/i colonna/e identificative in ENV_FILE per il join.
-  Se i nomi non coincidono tra i due file, usa JOIN_MAP per rinominare.
 """
 
 import logging
