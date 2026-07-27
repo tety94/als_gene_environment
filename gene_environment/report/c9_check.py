@@ -188,7 +188,7 @@ def main():
     merged[ID_COL_RAW] = merged[ID_COL_RAW].astype(str)
 
     merged = merged.merge(
-        codice_gen_df[["corretto", "parals_codals"]],
+        codice_gen_df[["corretto", "parals_codals", "mutaz"]],
         left_on=ID_COL_RAW,
         right_on="corretto",
         how="left",  # tiene tutte le righe di merged anche senza match
