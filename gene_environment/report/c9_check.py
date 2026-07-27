@@ -114,6 +114,7 @@ def json_dump_list(path: Path, items: list) -> None:
 
 
 
+def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     log.info("ID colonna rilevata nel parquet (RAW): %s", ID_COLS_RAW[0])
