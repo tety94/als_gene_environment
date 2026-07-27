@@ -334,12 +334,36 @@ def build_combined_report(results1: pd.DataFrame, results2: pd.DataFrame,
 # ----------------------------------------------------------------------
 # C9 (mutaz_bin) dedicated report - ALL variants, regardless of significance
 # ----------------------------------------------------------------------
+def _add_c9_contingency_counts(df_gen: pd.DataFrame, c9: pd.DataFrame) -> pd.DataFrame:
+    """For each variant row, compute the actual 2x2 contingency counts
+    against mutaz_bin: how many C9+ / C9- within variant=0 and variant=1."""
+    counts = []
+    for _, row in c9.iterrows():
+        variant = row["variant"]
+        sub = df_gen[[variant, "mutaz_bin"]].dropna()
+        ct = pd.crosstab(sub[variant], sub["mutaz_bin"])
+
+        def get(v, m):
+            return int(ct.loc[v, m]) if v in ct.index and m in ct.columns else 0
+
+        counts.append({
+            "variant0_c9pos": get(0, 1),
+            "variant0_c9neg": get(0, 0),
+            "variant1_c9pos": get(1, 1),
+            "variant1_c9neg": get(1, 0),
+        })
+    counts_df = pd.DataFrame(counts, index=c9.index)
+    return pd.concat([c9, counts_df], axis=1)
+
+
 def _c9_results_for_generation(df: pd.DataFrame, results_by_gen: dict, generation: int) -> pd.DataFrame:
     results = results_by_gen[generation]
     c9 = results[results["variable"] == "mutaz_bin"].copy()
     c9 = c9.sort_values("pvalue")
 
     df_gen = df[df[GENERATION_COL] == generation]
+    c9 = _add_c9_contingency_counts(df_gen, c9)
+
     C9_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     c9["plot_path"] = None
     for idx, row in c9.iterrows():
@@ -368,9 +392,9 @@ def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, gen
         f"Significant p-values are shown in bold."
     )
 
-    table = doc.add_table(rows=1, cols=5)
+    table = doc.add_table(rows=1, cols=7)
     table.style = "Light Grid Accent 1"
-    headers = ["Variant", "Test", "p-value", "N group 0", "N group 1"]
+    headers = ["Variant", "Test", "p-value", "Variant=0 C9+", "Variant=0 C9-", "Variant=1 C9+", "Variant=1 C9-"]
     for i, h in enumerate(headers):
         _set_cell_text(table.rows[0].cells[i], h, bold=True)
     for _, row in c9.iterrows():
@@ -380,8 +404,10 @@ def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, gen
         _set_cell_text(cells[1], str(row["test"]))
         pv_txt = f"{row['pvalue']:.4g}" if pd.notna(row["pvalue"]) else "n/a"
         _set_cell_text(cells[2], pv_txt, bold=is_sig)
-        _set_cell_text(cells[3], str(row.get("n0", "")))
-        _set_cell_text(cells[4], str(row.get("n1", "")))
+        _set_cell_text(cells[3], str(row.get("variant0_c9pos", "")))
+        _set_cell_text(cells[4], str(row.get("variant0_c9neg", "")))
+        _set_cell_text(cells[5], str(row.get("variant1_c9pos", "")))
+        _set_cell_text(cells[6], str(row.get("variant1_c9neg", "")))
 
     doc.add_heading("Plots", level=heading_level + 1)
     for _, row in c9.iterrows():
@@ -434,9 +460,9 @@ def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
         union.to_csv(combined_csv, index=False)
         log.info("C9 combined CSV saved: %s", combined_csv)
 
-        table = doc.add_table(rows=1, cols=6)
+        table = doc.add_table(rows=1, cols=8)
         table.style = "Light Grid Accent 1"
-        headers = ["Generation", "Variant", "Test", "p-value", "N group 0", "N group 1"]
+        headers = ["Generation", "Variant", "Test", "p-value", "Variant=0 C9+", "Variant=0 C9-", "Variant=1 C9+", "Variant=1 C9-"]
         for i, h in enumerate(headers):
             _set_cell_text(table.rows[0].cells[i], h, bold=True)
         for _, row in union.iterrows():
@@ -449,8 +475,10 @@ def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
             _set_cell_text(cells[2], str(row["test"]))
             pv_txt = f"{row['pvalue']:.4g}" if pd.notna(row["pvalue"]) else "n/a"
             _set_cell_text(cells[3], pv_txt, bold=is_sig)
-            _set_cell_text(cells[4], str(row.get("n0", "")))
-            _set_cell_text(cells[5], str(row.get("n1", "")))
+            _set_cell_text(cells[4], str(row.get("variant0_c9pos", "")))
+            _set_cell_text(cells[5], str(row.get("variant0_c9neg", "")))
+            _set_cell_text(cells[6], str(row.get("variant1_c9pos", "")))
+            _set_cell_text(cells[7], str(row.get("variant1_c9neg", "")))
 
     doc.save(out_path)
     log.info("C9 report saved: %s", out_path)
