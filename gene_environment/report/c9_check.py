@@ -28,6 +28,7 @@ import pyarrow.parquet as pq
 # Aggiusta il path del modulo se get_annotated_results vive altrove
 # (es. `from db_utils import get_annotated_results`)
 from gene_environment.db.repository import get_annotated_results
+from gene_environment.utils.id_utils import clean_sample_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -116,7 +117,7 @@ def main():
         thrift_container_size_limit=2_000_000_000,
     )
     raw_df = pf.read(columns=selected_cols, use_pandas_metadata=True).to_pandas()
-    raw_df.index = raw_df.index.astype(str)  # TODO: applica qui clean_sample_id se lo usi altrove
+    raw_df.index = raw_df.index.astype(str).map(clean_sample_id)
     raw_df.index.name = ID_COL_RAW
     raw_df = raw_df.reset_index()
 
