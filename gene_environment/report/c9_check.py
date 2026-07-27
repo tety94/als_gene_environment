@@ -44,7 +44,8 @@ OUT_DIR = Path("/mnt/cresla_prod/stefano_ge/c9_check")
 RESTRICTED_CSV = OUT_DIR / "gen_restricted_variants.csv"
 MERGED_CSV = OUT_DIR / "c9_check_merged.csv"
 CODICE_GEN_FILE = OUT_DIR / "codice_gen.csv"
-VCF_FILE = "/mnt/cresla_prod/genome_datasets/gen2/gen2_vcf_chr22.vcf.gz"
+VCF_FILE_GEN1 = "/mnt/cresla_prod/genome_datasets/gen1/gen1_vcf_chr22.vcf.gz"
+VCF_FILE_GEN2 = "/mnt/cresla_prod/genome_datasets/gen2/gen2_vcf_chr22.vcf.gz"
 VARIANT_COLS_FILE = OUT_DIR / "variant_columns.json"  # lista colonne-varianti, riusata da generation_stats.py
 
 # Nel parquet l'id campione NON è una colonna: è l'indice del DataFrame
@@ -188,7 +189,7 @@ def main():
     merged[ID_COL_RAW] = merged[ID_COL_RAW].astype(str)
 
     merged = merged.merge(
-        codice_gen_df[["corretto", "parals_codals", "mutaz"]],
+        codice_gen_df[["corretto", "parals_codals"]],
         left_on=ID_COL_RAW,
         right_on="corretto",
         how="left",  # tiene tutte le righe di merged anche senza match
@@ -196,10 +197,40 @@ def main():
     merged = merged.drop(columns=["corretto"])
     log.info("Aggiunta parals_codals: %d righe, %d colonne", *merged.shape)
 
-    # 6. Colonna 'generation': default 1, diventa 2 se l'id è tra i sample del VCF gen2
-    log.info("Leggo sample id dal VCF (%s)...", VCF_FILE)
-    vcf_ids = get_vcf_sample_ids(VCF_FILE)
-    merged["generation"] = merged[ID_COL_RAW].astype(str).apply(lambda x: 2 if x in vcf_ids else 1)
+    # 6. Colonna 'generation': 1 se l'id è nel VCF gen1, 2 se è nel VCF gen2.
+    # Le righe il cui id non compare in NESSUNO dei due VCF vengono scartate.
+    log.info("Leggo sample id dal VCF gen1 (%s)...", VCF_FILE_GEN1)
+    vcf1_ids = get_vcf_sample_ids(VCF_FILE_GEN1)
+    log.info("Leggo sample id dal VCF gen2 (%s)...", VCF_FILE_GEN2)
+    vcf2_ids = get_vcf_sample_ids(VCF_FILE_GEN2)
+
+    both = vcf1_ids & vcf2_ids
+    if both:
+        log.warning("%d id compaiono in ENTRAMBI i VCF (gen1 e gen2): %s", len(both), sorted(both)[:5])
+
+    def assign_generation(x):
+        in1 = x in vcf1_ids
+        in2 = x in vcf2_ids
+        if in1 and not in2:
+            return 1
+        if in2 and not in1:
+            return 2
+        if in1 and in2:
+            return 2  # ambiguo: presente in entrambi, priorità a gen2 (vedi warning sopra)
+        return None  # non trovato in nessuno dei due VCF
+
+    merged[ID_COL_RAW] = merged[ID_COL_RAW].astype(str)
+    merged["generation"] = merged[ID_COL_RAW].apply(assign_generation)
+
+    n_before = len(merged)
+    n_dropped = merged["generation"].isna().sum()
+    merged = merged.dropna(subset=["generation"]).copy()
+    merged["generation"] = merged["generation"].astype(int)
+
+    log.info(
+        "Righe scartate perché l'id non è in nessun VCF: %d / %d",
+        n_dropped, n_before,
+    )
     log.info(
         "Generation assegnata: gen1=%d, gen2=%d",
         (merged["generation"] == 1).sum(),
