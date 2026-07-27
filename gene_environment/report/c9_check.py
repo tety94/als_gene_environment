@@ -41,7 +41,10 @@ MERGED_CSV = OUT_DIR / "c9_check_merged.csv"
 # Colonna identificativa: si usa la PRIMA colonna di ciascun file.
 def first_column_name(path: str, is_parquet: bool) -> str:
     if is_parquet:
-        return pq.ParquetFile(path).schema.names[0]
+        return pq.ParquetFile(path,
+                              thrift_string_size_limit=2_000_000_000,
+                              thrift_container_size_limit=2_000_000_000,
+                              ).schema.names[0]
     else:
         return pd.read_csv(path, nrows=0).columns[0]
 
