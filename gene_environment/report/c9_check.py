@@ -42,6 +42,7 @@ OUT_DIR = Path("/mnt/cresla_prod/stefano_ge/c9_check")
 
 RESTRICTED_CSV = OUT_DIR / "gen_restricted_variants.csv"
 MERGED_CSV = OUT_DIR / "c9_check_merged.csv"
+CODICE_GEN_FILE = OUT_DIR / "codice_gen.csv"
 
 # Nel parquet l'id campione NON è una colonna: è l'indice del DataFrame
 # (come in _load_genetic_data). Nel CSV ambientale invece si usa la prima
@@ -145,7 +146,33 @@ def main():
     )
     log.info("Join completato: %d righe, %d colonne", *merged.shape)
 
-    # 5. Salvataggio finale
+    # 5. Join con codice_gen.csv per attaccare la colonna parals_codals
+    log.info("Carico CODICE_GEN_FILE (%s)...", CODICE_GEN_FILE)
+    codice_gen_df = pd.read_csv(CODICE_GEN_FILE)
+    if "corretto" not in codice_gen_df.columns:
+        raise KeyError(
+            f"La colonna 'corretto' non esiste in {CODICE_GEN_FILE}. "
+            f"Colonne disponibili: {list(codice_gen_df.columns)}"
+        )
+    if "parals_codals" not in codice_gen_df.columns:
+        raise KeyError(
+            f"La colonna 'parals_codals' non esiste in {CODICE_GEN_FILE}. "
+            f"Colonne disponibili: {list(codice_gen_df.columns)}"
+        )
+
+    codice_gen_df["corretto"] = codice_gen_df["corretto"].astype(str)
+    merged[ID_COL_RAW] = merged[ID_COL_RAW].astype(str)
+
+    merged = merged.merge(
+        codice_gen_df[["corretto", "parals_codals"]],
+        left_on=ID_COL_RAW,
+        right_on="corretto",
+        how="left",  # tiene tutte le righe di merged anche senza match
+    )
+    merged = merged.drop(columns=["corretto"])
+    log.info("Aggiunta parals_codals: %d righe, %d colonne", *merged.shape)
+
+    # 6. Salvataggio finale
     merged.to_csv(MERGED_CSV, index=False)
     log.info("File finale salvato in %s", MERGED_CSV)
 
