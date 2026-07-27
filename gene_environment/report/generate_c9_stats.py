@@ -11,8 +11,8 @@ Per ciascuna generazione (1 e 2):
 
 Alla fine produce anche un report Word "combinato" che affianca, per ogni
 coppia (variante, variabile) significativa in almeno una generazione, i
-grafici delle due generazioni.
-
+grafici delle due generazioni, e un report Word dedicato a mutaz_bin (C9)
+con tutte le varianti indipendentemente dalla significatività.
 """
 
 import json
@@ -272,11 +272,9 @@ def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
 
 
 
+def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int, out_path: Path):
     from docx import Document
     from docx.shared import Inches
-
-    doc = Document()
-    doc.add_heading(f"Analisi varianti - Generazione {generation}", level=1)
     doc.add_paragraph(
         f"Totale test eseguiti: {len(results)}. "
         f"Risultati significativi dopo correzione Bonferroni (p_bonf < {ALPHA}): "
