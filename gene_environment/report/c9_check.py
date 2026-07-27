@@ -11,6 +11,10 @@ Pipeline:
 4. Fa il join con ENV_FILE (componenti ambientali) sulla chiave paziente/campione.
 5. Salva il risultato finale in OUT_DIR.
 
+NOTE DA VERIFICARE (marcate anche sotto con TODO):
+- ID_COLS_RAW: nome/i colonna/e identificative nel parquet (es. sample id).
+- ID_COLS_ENV: nome/i colonna/e identificative in ENV_FILE per il join.
+  Se i nomi non coincidono tra i due file, usa JOIN_MAP per rinominare.
 """
 
 import logging
@@ -38,16 +42,18 @@ OUT_DIR = Path("/mnt/cresla_prod/stefano_ge/c9_check")
 RESTRICTED_CSV = OUT_DIR / "gen_restricted_variants.csv"
 MERGED_CSV = OUT_DIR / "c9_check_merged.csv"
 
-# Colonna identificativa: si usa la PRIMA colonna di ciascun file.
-def first_column_name(path: str, is_parquet: bool) -> str:
-    if is_parquet:
-        return pq.ParquetFile(path).schema.names[0]
-    else:
-        return pd.read_csv(path, nrows=0).columns[0]
+# Nel parquet l'id campione NON è una colonna: è l'indice del DataFrame
+# (come in _load_genetic_data). Nel CSV ambientale invece si usa la prima
+# colonna, come colonna vera e propria.
+ID_COL_RAW = "id"  # nome che diamo all'indice dopo il reset_index()
 
 
-ID_COLS_RAW = [first_column_name(RAW_FILE, is_parquet=True)]
-ID_COLS_ENV = [first_column_name(ENV_FILE, is_parquet=False)]
+def first_column_name(path: str) -> str:
+    return pd.read_csv(path, nrows=0).columns[0]
+
+
+ID_COLS_RAW = [ID_COL_RAW]
+ID_COLS_ENV = [first_column_name(ENV_FILE)]
 
 # Se i nomi delle colonne id differiscono tra RAW e ENV, mappa qui:
 # {"nome_in_env": "nome_in_raw"}
@@ -62,25 +68,24 @@ def get_target_columns(annotated_df: pd.DataFrame) -> set:
     return targets
 
 
-def filter_parquet_columns(raw_file: str, target_variants: set, id_cols: list) -> list:
+def filter_parquet_columns(raw_file: str, target_variants: set) -> list:
     """Legge solo lo schema del parquet (senza caricarlo tutto in memoria)
-    e restituisce la lista di colonne da leggere davvero: id_cols + varianti
-    che matchano target_variants."""
-    schema_cols = pq.ParquetFile(raw_file).schema.names
+    e restituisce la lista di colonne varianti che matchano target_variants.
+    L'id campione NON è tra queste colonne: è l'indice, gestito a parte
+    in fase di lettura (use_pandas_metadata=True)."""
+    schema_cols = pq.ParquetFile(
+        raw_file,
+        thrift_string_size_limit=2_000_000_000,
+        thrift_container_size_limit=2_000_000_000,
+    ).schema.names
 
     matched = [c for c in schema_cols if c in target_variants]
-    missing_ids = [c for c in id_cols if c not in schema_cols]
-    if missing_ids:
-        raise KeyError(
-            f"Le colonne ID {missing_ids} non esistono nel parquet. "
-            f"Colonne disponibili (prime 20): {schema_cols[:20]}"
-        )
 
     log.info("Colonne varianti trovate nel parquet: %d / %d target", len(matched), len(target_variants))
     if not matched:
         log.warning("Nessuna colonna variante ha fatto match. Controlla il formato dei nomi (char_ prefix?).")
 
-    return id_cols + matched
+    return matched
 
 
 def main():
@@ -98,16 +103,23 @@ def main():
 
     # 2. Colonne target nel parquet
     target_variants = get_target_columns(annotated_df)
-    selected_cols = filter_parquet_columns(RAW_FILE, target_variants, ID_COLS_RAW)
+    selected_cols = filter_parquet_columns(RAW_FILE, target_variants)
 
     # 3. Lettura ristretta del parquet e salvataggio CSV
-    log.info("Leggo il parquet limitandomi a %d colonne...", len(selected_cols))
+    # NB: l'indice (sample id) viene ricostruito automaticamente da
+    # use_pandas_metadata=True anche se non è tra le `columns` richieste,
+    # perché pyarrow lo traccia separatamente dai dati.
+    log.info("Leggo il parquet limitandomi a %d colonne (+ indice)...", len(selected_cols))
     pf = pq.ParquetFile(
         RAW_FILE,
         thrift_string_size_limit=2_000_000_000,
         thrift_container_size_limit=2_000_000_000,
     )
-    raw_df = pf.read(columns=selected_cols).to_pandas()
+    raw_df = pf.read(columns=selected_cols, use_pandas_metadata=True).to_pandas()
+    raw_df.index = raw_df.index.astype(str)  # TODO: applica qui clean_sample_id se lo usi altrove
+    raw_df.index.name = ID_COL_RAW
+    raw_df = raw_df.reset_index()
+
     raw_df.to_csv(RESTRICTED_CSV, index=False)
     log.info("CSV ristretto salvato in %s (%d righe, %d colonne)", RESTRICTED_CSV, *raw_df.shape)
 
