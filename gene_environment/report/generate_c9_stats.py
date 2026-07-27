@@ -275,6 +275,9 @@ def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
 def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int, out_path: Path):
     from docx import Document
     from docx.shared import Inches
+
+    doc = Document()
+    doc.add_heading(f"Analisi varianti - Generazione {generation}", level=1)
     doc.add_paragraph(
         f"Totale test eseguiti: {len(results)}. "
         f"Risultati significativi dopo correzione Bonferroni (p_bonf < {ALPHA}): "
