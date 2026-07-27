@@ -203,7 +203,7 @@ def main():
         right_on="corretto",
         how="left",  # tiene tutte le righe di merged anche senza match
     )
-    merged = merged.drop(columns=["corretto"])
+    merged = merged.drop(columns=["corretto", "mutaz"])
     log.info("Aggiunta parals_codals: %d righe, %d colonne", *merged.shape)
 
     # 6. Colonna 'generation': 1 se l'id è nel VCF gen1, 2 se è nel VCF gen2.
