@@ -11,6 +11,10 @@ Pipeline:
 4. Fa il join con ENV_FILE (componenti ambientali) sulla chiave paziente/campione.
 5. Salva il risultato finale in OUT_DIR.
 
+NOTE DA VERIFICARE (marcate anche sotto con TODO):
+- ID_COLS_RAW: nome/i colonna/e identificative nel parquet (es. sample id).
+- ID_COLS_ENV: nome/i colonna/e identificative in ENV_FILE per il join.
+  Se i nomi non coincidono tra i due file, usa JOIN_MAP per rinominare.
 """
 
 import logging
@@ -41,10 +45,7 @@ MERGED_CSV = OUT_DIR / "c9_check_merged.csv"
 # Colonna identificativa: si usa la PRIMA colonna di ciascun file.
 def first_column_name(path: str, is_parquet: bool) -> str:
     if is_parquet:
-        return pq.ParquetFile(path,
-                              thrift_string_size_limit=2_000_000_000,
-                              thrift_container_size_limit=2_000_000_000,
-                              ).schema.names[0]
+        return pq.ParquetFile(path).schema.names[0]
     else:
         return pd.read_csv(path, nrows=0).columns[0]
 
@@ -69,10 +70,7 @@ def filter_parquet_columns(raw_file: str, target_variants: set, id_cols: list) -
     """Legge solo lo schema del parquet (senza caricarlo tutto in memoria)
     e restituisce la lista di colonne da leggere davvero: id_cols + varianti
     che matchano target_variants."""
-    schema_cols = pq.ParquetFile(raw_file,
-                                 thrift_string_size_limit=2_000_000_000,
-                                 thrift_container_size_limit=2_000_000_000,
-                                 ).schema.names
+    schema_cols = pq.ParquetFile(raw_file).schema.names
 
     matched = [c for c in schema_cols if c in target_variants]
     missing_ids = [c for c in id_cols if c not in schema_cols]
@@ -108,7 +106,12 @@ def main():
 
     # 3. Lettura ristretta del parquet e salvataggio CSV
     log.info("Leggo il parquet limitandomi a %d colonne...", len(selected_cols))
-    raw_df = pd.read_parquet(RAW_FILE, columns=selected_cols)
+    pf = pq.ParquetFile(
+        RAW_FILE,
+        thrift_string_size_limit=2_000_000_000,
+        thrift_container_size_limit=2_000_000_000,
+    )
+    raw_df = pf.read(columns=selected_cols).to_pandas()
     raw_df.to_csv(RESTRICTED_CSV, index=False)
     log.info("CSV ristretto salvato in %s (%d righe, %d colonne)", RESTRICTED_CSV, *raw_df.shape)
 
