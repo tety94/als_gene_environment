@@ -69,7 +69,10 @@ def filter_parquet_columns(raw_file: str, target_variants: set, id_cols: list) -
     """Legge solo lo schema del parquet (senza caricarlo tutto in memoria)
     e restituisce la lista di colonne da leggere davvero: id_cols + varianti
     che matchano target_variants."""
-    schema_cols = pq.ParquetFile(raw_file).schema.names
+    schema_cols = pq.ParquetFile(raw_file,
+                                 thrift_string_size_limit=2_000_000_000,
+                                 thrift_container_size_limit=2_000_000_000,
+                                 ).schema.names
 
     matched = [c for c in schema_cols if c in target_variants]
     missing_ids = [c for c in id_cols if c not in schema_cols]
