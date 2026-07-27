@@ -1,18 +1,24 @@
 """
 generation_stats.py
 
-Per ciascuna generazione (1 e 2):
-  - per ogni colonna-variante (0/1), divide il gruppo in 0 vs 1
-  - calcola test statistici per: sex, onset_site, diagnostic_delay,
+For each generation (1 and 2):
+  - for each variant column (0/1), split the cohort into group 0 vs group 1
+  - run statistical tests against: sex, onset_site, diagnostic_delay,
     education_years, survival, survival_null (missingness), mutaz_bin
-  - salva un CSV con tutti i risultati
-  - genera grafici per i risultati significativi (p < ALPHA)
-  - genera un report Word per generazione
+  - save a CSV with all results (raw p-value always included)
+  - generate plots for results significant after Bonferroni correction
+  - generate a Word report (per generation)
 
-Alla fine produce anche un report Word "combinato" che affianca, per ogni
-coppia (variante, variabile) significativa in almeno una generazione, i
-grafici delle due generazioni, e un report Word dedicato a mutaz_bin (C9)
-con tutte le varianti indipendentemente dalla significatività.
+It also produces:
+  - a "combined" Word report: Generation 1 section + Generation 2 section,
+    each showing its own significant results, followed by a "Combined"
+    section that is the UNION of the two generations' significant results
+    (simple concatenation, no re-running of stats on pooled data).
+  - a dedicated C9 report (mutaz_bin vs every variant), with a Generation 1
+    section, a Generation 2 section (ALL variants, regardless of
+    significance), and a Combined section that is the union of both.
+
+All output (logs, docx content, column headers) is in English.
 """
 
 import json
@@ -52,14 +58,14 @@ EDUCATION_YEARS_COL = "education_years"
 SURVIVAL_COL = "survival"
 MUTAZ_RAW_COL = "mutaz"
 
-ALPHA = 0.05  # soglia sul p-value corretto (Bonferroni) per generare grafici/report
+ALPHA = 0.05  # significance threshold applied to the Bonferroni-corrected p-value
 
 CATEGORICAL_VARS = [SEX_COL, ONSET_SITE_COL, "mutaz_bin", "survival_null"]
 CONTINUOUS_VARS = [DIAGNOSTIC_DELAY_COL, EDUCATION_YEARS_COL, SURVIVAL_COL]
 
 
 # ----------------------------------------------------------------------
-# Preparazione dati
+# Data loading
 # ----------------------------------------------------------------------
 def load_data():
     df = pd.read_csv(MERGED_CSV)
@@ -67,17 +73,16 @@ def load_data():
         variant_cols = json.load(f)
     variant_cols = [c for c in variant_cols if c in df.columns]
 
-    # variabili derivate
     df["mutaz_bin"] = df[MUTAZ_RAW_COL].astype(str).str.contains("C9ORF72", na=False).astype(int)
     df["survival_null"] = df[SURVIVAL_COL].isna()
     df[EDUCATION_YEARS_COL] = pd.to_numeric(df[EDUCATION_YEARS_COL], errors="coerce").astype("Int64")
 
-    log.info("Dati caricati: %d righe, %d colonne-varianti", len(df), len(variant_cols))
+    log.info("Data loaded: %d rows, %d variant columns", len(df), len(variant_cols))
     return df, variant_cols
 
 
 # ----------------------------------------------------------------------
-# Test statistici
+# Statistical tests
 # ----------------------------------------------------------------------
 def test_categorical(df: pd.DataFrame, group_col: str, var_col: str) -> dict:
     sub = df[[group_col, var_col]].dropna()
@@ -94,7 +99,7 @@ def test_categorical(df: pd.DataFrame, group_col: str, var_col: str) -> dict:
 
     n0 = int((sub[group_col] == 0).sum())
     n1 = int((sub[group_col] == 1).sum())
-    return {"test": test_name, "pvalue": p, "n0": n0, "n1": n1, "table": table.to_dict()}
+    return {"test": test_name, "pvalue": p, "n0": n0, "n1": n1}
 
 
 def test_continuous(df: pd.DataFrame, group_col: str, var_col: str) -> dict:
@@ -122,7 +127,7 @@ def run_tests_for_generation(df_gen: pd.DataFrame, variant_cols: list) -> pd.Dat
             continue
         group = df_gen[variant]
         if group.dropna().nunique() < 2:
-            continue  # variante monomorfica in questa generazione, salto
+            continue  # monomorphic variant in this generation, skip
 
         for var_col in CATEGORICAL_VARS:
             res = test_categorical(df_gen.assign(_grp=group), "_grp", var_col)
@@ -134,18 +139,27 @@ def run_tests_for_generation(df_gen: pd.DataFrame, variant_cols: list) -> pd.Dat
 
     results = pd.DataFrame(rows)
 
-    # Correzione Bonferroni: pvalue_bonf = min(1, pvalue * n_test_eseguiti)
-    # n_test_eseguiti = numero di test con un pvalue effettivamente calcolato
-    # (esclude gli 'n/a' per gruppi troppo piccoli/mancanti).
-    n_tests = results["pvalue"].notna().sum()
+    # Bonferroni correction: pvalue_bonf = min(1, pvalue * n_tests_run)
+    # n_tests_run = number of tests with an actual computed p-value
+    # (excludes 'n/a' rows from groups that were too small/missing).
+    n_tests = int(results["pvalue"].notna().sum())
     results["pvalue_bonf"] = (results["pvalue"] * n_tests).clip(upper=1.0)
-    log.info("Correzione Bonferroni applicata su %d test eseguiti", n_tests)
+    results.attrs["n_tests"] = n_tests
+    log.info("Bonferroni correction applied over %d tests run", n_tests)
 
     return results
 
 
+def bonferroni_threshold(results: pd.DataFrame) -> float:
+    """Raw p-value threshold equivalent to pvalue_bonf < ALPHA."""
+    n_tests = results.attrs.get("n_tests") or int(results["pvalue"].notna().sum())
+    if n_tests == 0:
+        return 0.0
+    return ALPHA / n_tests
+
+
 # ----------------------------------------------------------------------
-# Grafici
+# Plots
 # ----------------------------------------------------------------------
 def plot_categorical(df_gen: pd.DataFrame, variant: str, var_col: str, generation: int, out_path: Path):
     sub = df_gen[[variant, var_col]].dropna()
@@ -154,7 +168,7 @@ def plot_categorical(df_gen: pd.DataFrame, variant: str, var_col: str, generatio
     prop.plot(kind="bar", stacked=True, ax=ax)
     ax.set_title(f"gen{generation} | {variant} vs {var_col}")
     ax.set_xlabel(f"{variant} (0/1)")
-    ax.set_ylabel("proporzione")
+    ax.set_ylabel("proportion")
     ax.legend(title=var_col, bbox_to_anchor=(1.05, 1), loc="upper left")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -188,178 +202,258 @@ def generate_plots(df_gen: pd.DataFrame, results: pd.DataFrame, generation: int,
                 plot_continuous(df_gen, variant, var_col, generation, out_path)
             sig.at[idx, "plot_path"] = str(out_path)
         except Exception as e:
-            log.warning("Plot fallito per %s/%s: %s", variant, var_col, e)
+            log.warning("Plot failed for %s/%s: %s", variant, var_col, e)
 
-    log.info("Generation %d: %d grafici generati (p < %.2f)", generation, sig["plot_path"].notna().sum(), ALPHA)
+    log.info("Generation %d: %d plots generated (Bonferroni p < %.2f)", generation, sig["plot_path"].notna().sum(), ALPHA)
     return sig
 
 
 # ----------------------------------------------------------------------
-# Report Word
+# Word report helpers
 # ----------------------------------------------------------------------
-def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
-    """Report dedicato a mutaz_bin (derivata da C9ORF72): TUTTE le varianti,
-    indipendentemente dalla significatività. CSV + immagini + Word."""
-    from docx import Document
+def _set_cell_text(cell, text: str, bold: bool = False):
+    cell.text = ""
+    run = cell.paragraphs[0].add_run(text)
+    run.bold = bold
+
+
+def _add_significant_results_table(doc, sig: pd.DataFrame):
+    """Table WITHOUT a Bonferroni column; the raw p-value is bolded when
+    the result is significant after Bonferroni correction (it always is,
+    for rows already filtered into `sig`, but we keep the bold logic
+    generic in case an unfiltered frame is passed in)."""
+    table = doc.add_table(rows=1, cols=6)
+    table.style = "Light Grid Accent 1"
+    headers = ["Variant", "Variable", "Test", "p-value", "N group 0", "N group 1"]
+    for i, h in enumerate(headers):
+        _set_cell_text(table.rows[0].cells[i], h, bold=True)
+
+    for _, row in sig.sort_values("pvalue_bonf").iterrows():
+        cells = table.add_row().cells
+        is_sig = pd.notna(row["pvalue_bonf"]) and row["pvalue_bonf"] < ALPHA
+        _set_cell_text(cells[0], str(row["variant"]))
+        _set_cell_text(cells[1], str(row["variable"]))
+        _set_cell_text(cells[2], str(row["test"]))
+        _set_cell_text(cells[3], f"{row['pvalue']:.4g}", bold=is_sig)
+        _set_cell_text(cells[4], str(row.get("n0", "")))
+        _set_cell_text(cells[5], str(row.get("n1", "")))
+
+
+def _add_generation_section(doc, results: pd.DataFrame, sig: pd.DataFrame, generation: int, heading_level: int = 2):
     from docx.shared import Inches
 
-    C9_DIR.mkdir(parents=True, exist_ok=True)
-    C9_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    doc = Document()
-    doc.add_heading("Report C9ORF72 (mutaz_bin) — tutte le varianti", level=1)
+    threshold = bonferroni_threshold(results)
+    doc.add_heading(f"Generation {generation}", level=heading_level)
     doc.add_paragraph(
-        "Questo report include TUTTE le varianti testate contro mutaz_bin, "
-        "indipendentemente dalla significatività statistica."
+        f"Total tests run: {len(results)}. "
+        f"Bonferroni-corrected significance threshold: raw p-value < {threshold:.4g} "
+        f"(alpha={ALPHA} / {results.attrs.get('n_tests', len(results))} tests). "
+        f"Significant results: {len(sig)}. Significant p-values are shown in bold."
     )
 
-    for generation in (1, 2):
-        if generation not in results_by_gen:
+    if sig.empty:
+        doc.add_paragraph("No significant results in this generation.")
+        return
+
+    _add_significant_results_table(doc, sig)
+
+    doc.add_heading("Plots", level=heading_level + 1)
+    for _, row in sig.sort_values("pvalue_bonf").iterrows():
+        if not row["plot_path"]:
             continue
-        results = results_by_gen[generation]
-        c9_results = results[results["variable"] == "mutaz_bin"].copy()
-        c9_results = c9_results.sort_values("pvalue")
-
-        # CSV dedicato
-        csv_path = C9_DIR / f"c9_mutaz_bin_gen{generation}.csv"
-        c9_results.drop(columns=["table"], errors="ignore").to_csv(csv_path, index=False)
-        log.info("CSV C9 generazione %d salvato: %s (%d varianti)", generation, csv_path, len(c9_results))
-
-        df_gen = df[df[GENERATION_COL] == generation]
-
-        # Immagini per TUTTE le varianti (non solo significative)
-        c9_results["plot_path"] = None
-        for idx, row in c9_results.iterrows():
-            variant = row["variant"]
-            fname = f"gen{generation}_{variant}_mutaz_bin.png".replace("/", "_")
-            out_img = C9_PLOTS_DIR / fname
-            try:
-                plot_categorical(df_gen, variant, "mutaz_bin", generation, out_img)
-                c9_results.at[idx, "plot_path"] = str(out_img)
-            except Exception as e:
-                log.warning("Plot C9 fallito per %s: %s", variant, e)
-
-        # Sezione Word per questa generazione
-        doc.add_heading(f"Generazione {generation}", level=2)
-        doc.add_paragraph(f"Totale varianti testate: {len(c9_results)}.")
-
-        table = doc.add_table(rows=1, cols=6)
-        table.style = "Light Grid Accent 1"
-        hdr = table.rows[0].cells
-        for i, h in enumerate(["Variante", "Test", "p-value", "p-value (Bonferroni)", "N gruppo 0", "N gruppo 1"]):
-            hdr[i].text = h
-        for _, row in c9_results.iterrows():
-            cells = table.add_row().cells
-            cells[0].text = str(row["variant"])
-            cells[1].text = str(row["test"])
-            cells[2].text = f"{row['pvalue']:.4g}" if pd.notna(row["pvalue"]) else "n/d"
-            cells[3].text = f"{row['pvalue_bonf']:.4g}" if pd.notna(row["pvalue_bonf"]) else "n/d"
-            cells[4].text = str(row.get("n0", ""))
-            cells[5].text = str(row.get("n1", ""))
-
-        doc.add_heading(f"Grafici — Generazione {generation}", level=3)
-        for _, row in c9_results.iterrows():
-            if not row["plot_path"]:
-                continue
-            star = " *" if pd.notna(row["pvalue_bonf"]) and row["pvalue_bonf"] < ALPHA else ""
-            doc.add_paragraph(
-                f"{row['variant']} (p = {row['pvalue']:.4g}, p_bonf = {row['pvalue_bonf']:.4g}{star})"
-            )
-            doc.add_picture(row["plot_path"], width=Inches(4.5))
-
-    doc.save(out_path)
-    log.info("Report C9 salvato: %s", out_path)
-
+        doc.add_paragraph(f"{row['variant']} vs {row['variable']} (p = {row['pvalue']:.4g})")
+        doc.add_picture(row["plot_path"], width=Inches(5))
 
 
 def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int, out_path: Path):
     from docx import Document
-    from docx.shared import Inches
 
     doc = Document()
-    doc.add_heading(f"Analisi varianti - Generazione {generation}", level=1)
-    doc.add_paragraph(
-        f"Totale test eseguiti: {len(results)}. "
-        f"Risultati significativi dopo correzione Bonferroni (p_bonf < {ALPHA}): "
-        f"{(results['pvalue_bonf'] < ALPHA).sum()}."
-    )
-
-    doc.add_heading("Tabella risultati significativi (p_bonf < {:.2f})".format(ALPHA), level=2)
-    table = doc.add_table(rows=1, cols=7)
-    table.style = "Light Grid Accent 1"
-    hdr = table.rows[0].cells
-    for i, h in enumerate(["Variante", "Variabile", "Test", "p-value", "p-value (Bonferroni)", "N gruppo 0", "N gruppo 1"]):
-        hdr[i].text = h
-
-    for _, row in sig.sort_values("pvalue_bonf").iterrows():
-        cells = table.add_row().cells
-        cells[0].text = str(row["variant"])
-        cells[1].text = str(row["variable"])
-        cells[2].text = str(row["test"])
-        cells[3].text = f"{row['pvalue']:.4g}"
-        cells[4].text = f"{row['pvalue_bonf']:.4g}"
-        cells[5].text = str(row.get("n0", ""))
-        cells[6].text = str(row.get("n1", ""))
-
-    doc.add_heading("Grafici", level=2)
-    for _, row in sig.sort_values("pvalue_bonf").iterrows():
-        if not row["plot_path"]:
-            continue
-        doc.add_paragraph(f"{row['variant']} vs {row['variable']} (p = {row['pvalue']:.4g}, p_bonf = {row['pvalue_bonf']:.4g})")
-        doc.add_picture(row["plot_path"], width=Inches(5))
+    doc.add_heading(f"Variant analysis - Generation {generation}", level=1)
+    _add_generation_section(doc, results, sig, generation, heading_level=2)
 
     doc.save(out_path)
-    log.info("Report salvato: %s", out_path)
+    log.info("Report saved: %s", out_path)
 
 
 def build_combined_report(results1: pd.DataFrame, results2: pd.DataFrame,
                            sig1: pd.DataFrame, sig2: pd.DataFrame, out_path: Path):
     from docx import Document
-    from docx.shared import Inches
 
     doc = Document()
-    doc.add_heading("Confronto generazione 1 vs generazione 2", level=1)
-
-    keys1 = set(zip(sig1["variant"], sig1["variable"]))
-    keys2 = set(zip(sig2["variant"], sig2["variable"]))
-    all_keys = sorted(keys1 | keys2)
-
+    doc.add_heading("Variant analysis - Generation 1 vs Generation 2", level=1)
     doc.add_paragraph(
-        f"Coppie (variante, variabile) significative (Bonferroni) in almeno una generazione: {len(all_keys)}. "
-        f"Il p-value mostrato è sempre quello calcolato (su tutti i {len(results1)} test per generazione); "
-        f"l'immagine è presente solo se quella generazione ha raggiunto p_bonf < {ALPHA} per quella coppia."
+        "This report lists Generation 1 and Generation 2 significant results "
+        "separately, followed by a Combined section that is the union of "
+        "both generations' significant results (simple concatenation, "
+        "no statistics re-run on pooled data)."
     )
 
-    def lookup_pvalues(results: pd.DataFrame, variant: str, var_col: str):
-        row = results[(results["variant"] == variant) & (results["variable"] == var_col)]
-        if row.empty or pd.isna(row["pvalue"].iloc[0]):
-            return None, None
-        return row["pvalue"].iloc[0], row["pvalue_bonf"].iloc[0]
+    _add_generation_section(doc, results1, sig1, 1, heading_level=2)
+    _add_generation_section(doc, results2, sig2, 2, heading_level=2)
 
-    for variant, var_col in all_keys:
-        doc.add_heading(f"{variant} vs {var_col}", level=2)
+    # Combined = union of significant results from both generations
+    doc.add_heading("Combined (Generation 1 + Generation 2)", level=2)
+    sig1_tagged = sig1.copy()
+    sig1_tagged["generation"] = 1
+    sig2_tagged = sig2.copy()
+    sig2_tagged["generation"] = 2
+    union = pd.concat([sig1_tagged, sig2_tagged], ignore_index=True)
+    doc.add_paragraph(
+        f"Union of significant (variant, variable) results across both generations: {len(union)} rows "
+        f"({len(sig1)} from Generation 1, {len(sig2)} from Generation 2)."
+    )
 
-        p1, p1b = lookup_pvalues(results1, variant, var_col)
-        p2, p2b = lookup_pvalues(results2, variant, var_col)
+    from docx.shared import Inches
+    table = doc.add_table(rows=1, cols=7)
+    table.style = "Light Grid Accent 1"
+    headers = ["Generation", "Variant", "Variable", "Test", "p-value", "N group 0", "N group 1"]
+    for i, h in enumerate(headers):
+        _set_cell_text(table.rows[0].cells[i], h, bold=True)
+    for _, row in union.sort_values(["generation", "pvalue_bonf"]).iterrows():
+        cells = table.add_row().cells
+        _set_cell_text(cells[0], str(row["generation"]))
+        _set_cell_text(cells[1], str(row["variant"]))
+        _set_cell_text(cells[2], str(row["variable"]))
+        _set_cell_text(cells[3], str(row["test"]))
+        _set_cell_text(cells[4], f"{row['pvalue']:.4g}", bold=True)
+        _set_cell_text(cells[5], str(row.get("n0", "")))
+        _set_cell_text(cells[6], str(row.get("n1", "")))
 
-        def fmt(p, pb):
-            if p is None:
-                return "n/d"
-            star = " *" if pb is not None and pb < ALPHA else ""
-            return f"p={p:.4g}, p_bonf={pb:.4g}{star}"
-
-        doc.add_paragraph(f"Generazione 1: {fmt(p1, p1b)}    |    Generazione 2: {fmt(p2, p2b)}    (* = p_bonf < {ALPHA})")
-
-        row1 = sig1[(sig1["variant"] == variant) & (sig1["variable"] == var_col)]
-        row2 = sig2[(sig2["variant"] == variant) & (sig2["variable"] == var_col)]
-
-        if not row1.empty and row1["plot_path"].iloc[0]:
-            doc.add_picture(row1["plot_path"].iloc[0], width=Inches(3.2))
-        if not row2.empty and row2["plot_path"].iloc[0]:
-            doc.add_picture(row2["plot_path"].iloc[0], width=Inches(3.2))
+    doc.add_heading("Plots", level=2)
+    for _, row in union.sort_values(["generation", "pvalue_bonf"]).iterrows():
+        if not row["plot_path"]:
+            continue
+        doc.add_paragraph(f"Gen{row['generation']} | {row['variant']} vs {row['variable']} (p = {row['pvalue']:.4g})")
+        doc.add_picture(row["plot_path"], width=Inches(5))
 
     doc.save(out_path)
-    log.info("Report combinato salvato: %s", out_path)
+    log.info("Combined report saved: %s", out_path)
+
+
+# ----------------------------------------------------------------------
+# C9 (mutaz_bin) dedicated report - ALL variants, regardless of significance
+# ----------------------------------------------------------------------
+def _c9_results_for_generation(df: pd.DataFrame, results_by_gen: dict, generation: int) -> pd.DataFrame:
+    results = results_by_gen[generation]
+    c9 = results[results["variable"] == "mutaz_bin"].copy()
+    c9 = c9.sort_values("pvalue")
+
+    df_gen = df[df[GENERATION_COL] == generation]
+    C9_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    c9["plot_path"] = None
+    for idx, row in c9.iterrows():
+        variant = row["variant"]
+        fname = f"gen{generation}_{variant}_mutaz_bin.png".replace("/", "_")
+        out_img = C9_PLOTS_DIR / fname
+        try:
+            plot_categorical(df_gen, variant, "mutaz_bin", generation, out_img)
+            c9.at[idx, "plot_path"] = str(out_img)
+        except Exception as e:
+            log.warning("C9 plot failed for %s: %s", variant, e)
+
+    return c9
+
+
+def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, generation: int, heading_level: int = 2):
+    from docx.shared import Inches
+
+    threshold = bonferroni_threshold(results)
+    doc.add_heading(f"Generation {generation}", level=heading_level)
+    doc.add_paragraph(
+        f"All variants tested against mutaz_bin (C9ORF72), regardless of significance. "
+        f"Total variants: {len(c9)}. "
+        f"Bonferroni-corrected significance threshold: raw p-value < {threshold:.4g} "
+        f"(alpha={ALPHA} / {results.attrs.get('n_tests', len(results))} tests). "
+        f"Significant p-values are shown in bold."
+    )
+
+    table = doc.add_table(rows=1, cols=5)
+    table.style = "Light Grid Accent 1"
+    headers = ["Variant", "Test", "p-value", "N group 0", "N group 1"]
+    for i, h in enumerate(headers):
+        _set_cell_text(table.rows[0].cells[i], h, bold=True)
+    for _, row in c9.iterrows():
+        cells = table.add_row().cells
+        is_sig = pd.notna(row["pvalue_bonf"]) and row["pvalue_bonf"] < ALPHA
+        _set_cell_text(cells[0], str(row["variant"]))
+        _set_cell_text(cells[1], str(row["test"]))
+        pv_txt = f"{row['pvalue']:.4g}" if pd.notna(row["pvalue"]) else "n/a"
+        _set_cell_text(cells[2], pv_txt, bold=is_sig)
+        _set_cell_text(cells[3], str(row.get("n0", "")))
+        _set_cell_text(cells[4], str(row.get("n1", "")))
+
+    doc.add_heading("Plots", level=heading_level + 1)
+    for _, row in c9.iterrows():
+        if not row["plot_path"]:
+            continue
+        doc.add_paragraph(f"{row['variant']} (p = {row['pvalue']:.4g})" if pd.notna(row["pvalue"]) else str(row["variant"]))
+        doc.add_picture(row["plot_path"], width=Inches(4.5))
+
+
+def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
+    from docx import Document
+    from docx.shared import Inches
+
+    C9_DIR.mkdir(parents=True, exist_ok=True)
+
+    doc = Document()
+    doc.add_heading("C9ORF72 (mutaz_bin) report - all variants", level=1)
+    doc.add_paragraph(
+        "This report includes ALL tested variants against mutaz_bin, regardless "
+        "of statistical significance. Generation 1 and Generation 2 are shown "
+        "separately, followed by a Combined section that is the union of both "
+        "generations' rows (no statistics re-run on pooled data)."
+    )
+
+    c9_by_gen = {}
+    for generation in (1, 2):
+        if generation not in results_by_gen:
+            continue
+        c9 = _c9_results_for_generation(df, results_by_gen, generation)
+        c9_by_gen[generation] = c9
+
+        csv_path = C9_DIR / f"c9_mutaz_bin_gen{generation}.csv"
+        c9.to_csv(csv_path, index=False)
+        log.info("C9 CSV saved for generation %d: %s (%d variants)", generation, csv_path, len(c9))
+
+        _add_c9_generation_section(doc, results_by_gen[generation], c9, generation, heading_level=2)
+
+    if 1 in c9_by_gen and 2 in c9_by_gen:
+        doc.add_heading("Combined (Generation 1 + Generation 2)", level=2)
+        doc.add_paragraph(
+            "Union of all variant rows from both generations (concatenation, not a joint re-analysis)."
+        )
+        c9_1 = c9_by_gen[1].copy()
+        c9_1["generation"] = 1
+        c9_2 = c9_by_gen[2].copy()
+        c9_2["generation"] = 2
+        union = pd.concat([c9_1, c9_2], ignore_index=True).sort_values(["generation", "pvalue"])
+
+        combined_csv = C9_DIR / "c9_mutaz_bin_combined.csv"
+        union.to_csv(combined_csv, index=False)
+        log.info("C9 combined CSV saved: %s", combined_csv)
+
+        table = doc.add_table(rows=1, cols=6)
+        table.style = "Light Grid Accent 1"
+        headers = ["Generation", "Variant", "Test", "p-value", "N group 0", "N group 1"]
+        for i, h in enumerate(headers):
+            _set_cell_text(table.rows[0].cells[i], h, bold=True)
+        for _, row in union.iterrows():
+            gen_results = results_by_gen[row["generation"]]
+            threshold = bonferroni_threshold(gen_results)
+            is_sig = pd.notna(row["pvalue"]) and row["pvalue"] < threshold
+            cells = table.add_row().cells
+            _set_cell_text(cells[0], str(row["generation"]))
+            _set_cell_text(cells[1], str(row["variant"]))
+            _set_cell_text(cells[2], str(row["test"]))
+            pv_txt = f"{row['pvalue']:.4g}" if pd.notna(row["pvalue"]) else "n/a"
+            _set_cell_text(cells[3], pv_txt, bold=is_sig)
+            _set_cell_text(cells[4], str(row.get("n0", "")))
+            _set_cell_text(cells[5], str(row.get("n1", "")))
+
+    doc.save(out_path)
+    log.info("C9 report saved: %s", out_path)
 
 
 # ----------------------------------------------------------------------
@@ -375,33 +469,29 @@ def main():
     results_by_gen = {}
     for generation in (1, 2):
         df_gen = df[df[GENERATION_COL] == generation].copy()
-        log.info("Generazione %d: %d campioni", generation, len(df_gen))
+        log.info("Generation %d: %d samples", generation, len(df_gen))
         if df_gen.empty:
-            log.warning("Generazione %d vuota, salto.", generation)
+            log.warning("Generation %d is empty, skipping.", generation)
             continue
 
         results = run_tests_for_generation(df_gen, variant_cols)
         results_by_gen[generation] = results
         results_csv = STATS_DIR / f"gen{generation}_variant_stats.csv"
-        results.drop(columns=["table"], errors="ignore").to_csv(results_csv, index=False)
-        log.info("CSV risultati generazione %d salvato: %s", generation, results_csv)
+        results.to_csv(results_csv, index=False)
+        log.info("Results CSV saved for generation %d: %s", generation, results_csv)
 
         sig = generate_plots(df_gen, results, generation, PLOTS_DIR)
         sig_by_gen[generation] = sig
 
-        build_word_report(
-            results, sig, generation, REPORTS_DIR / f"gen{generation}_report.docx"
-        )
+        build_word_report(results, sig, generation, REPORTS_DIR / f"gen{generation}_report.docx")
 
     if 1 in sig_by_gen and 2 in sig_by_gen:
         build_combined_report(
             results_by_gen[1], results_by_gen[2],
             sig_by_gen[1], sig_by_gen[2],
-            REPORTS_DIR / "combined_report.docx"
+            REPORTS_DIR / "combined_report.docx",
         )
 
-    # Report dedicato C9 (mutaz_bin): tutte le varianti, indipendentemente
-    # dalla significatività.
     build_c9_report(df, results_by_gen, REPORTS_DIR / "c9_report.docx")
 
 
