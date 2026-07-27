@@ -82,6 +82,7 @@ def translate_exposure(df: pd.DataFrame) -> pd.DataFrame:
 FULL_COLUMNS = [
     "exposure",
     "gene_name",
+    "gene_symbol",
     "variant",
     "gene_id",
     "gene_symbol",

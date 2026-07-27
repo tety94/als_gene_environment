@@ -19,6 +19,7 @@ NOTE DA VERIFICARE (marcate anche sotto con TODO):
 
 import logging
 import os
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -43,6 +44,8 @@ OUT_DIR = Path("/mnt/cresla_prod/stefano_ge/c9_check")
 RESTRICTED_CSV = OUT_DIR / "gen_restricted_variants.csv"
 MERGED_CSV = OUT_DIR / "c9_check_merged.csv"
 CODICE_GEN_FILE = OUT_DIR / "codice_gen.csv"
+VCF_FILE = "/mnt/cresla_prod/genome_datasets/gen2/gen2_vcf_chr22.vcf.gz"
+VARIANT_COLS_FILE = OUT_DIR / "variant_columns.json"  # lista colonne-varianti, riusata da generation_stats.py
 
 # Nel parquet l'id campione NON è una colonna: è l'indice del DataFrame
 # (come in _load_genetic_data). Nel CSV ambientale invece si usa la prima
@@ -90,7 +93,27 @@ def filter_parquet_columns(raw_file: str, target_variants: set) -> list:
     return matched
 
 
-def main():
+def get_vcf_sample_ids(vcf_path: str) -> set:
+    """Legge SOLO l'header del VCF (bcftools query -l), niente scrittura,
+    niente modifica del file. Applica clean_sample_id per uniformare gli id
+    doppi (es. ACH10008_ACH10008 -> ACH10008)."""
+    result = subprocess.run(
+        ["bcftools", "query", "-l", vcf_path],
+        capture_output=True, text=True, check=True,
+    )
+    raw_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    cleaned = {clean_sample_id(rid) for rid in raw_ids}
+    log.info("Sample id trovati nel VCF: %d (esempio raw: %s)", len(raw_ids), raw_ids[:1])
+    return cleaned
+
+
+def json_dump_list(path: Path, items: list) -> None:
+    import json
+    with open(path, "w") as f:
+        json.dump(items, f, indent=2)
+
+
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     log.info("ID colonna rilevata nel parquet (RAW): %s", ID_COLS_RAW[0])
@@ -164,7 +187,7 @@ def main():
     merged[ID_COL_RAW] = merged[ID_COL_RAW].astype(str)
 
     merged = merged.merge(
-        codice_gen_df[["corretto", "parals_codals", "mutaz"]],
+        codice_gen_df[["corretto", "parals_codals"]],
         left_on=ID_COL_RAW,
         right_on="corretto",
         how="left",  # tiene tutte le righe di merged anche senza match
@@ -172,7 +195,21 @@ def main():
     merged = merged.drop(columns=["corretto"])
     log.info("Aggiunta parals_codals: %d righe, %d colonne", *merged.shape)
 
-    # 6. Salvataggio finale
+    # 6. Colonna 'generation': default 1, diventa 2 se l'id è tra i sample del VCF gen2
+    log.info("Leggo sample id dal VCF (%s)...", VCF_FILE)
+    vcf_ids = get_vcf_sample_ids(VCF_FILE)
+    merged["generation"] = merged[ID_COL_RAW].astype(str).apply(lambda x: 2 if x in vcf_ids else 1)
+    log.info(
+        "Generation assegnata: gen1=%d, gen2=%d",
+        (merged["generation"] == 1).sum(),
+        (merged["generation"] == 2).sum(),
+    )
+
+    # Salvo la lista delle colonne-varianti per riuso in generation_stats.py
+    json_dump_list(VARIANT_COLS_FILE, selected_cols)
+    log.info("Lista colonne-varianti salvata in %s (%d colonne)", VARIANT_COLS_FILE, len(selected_cols))
+
+    # 7. Salvataggio finale
     merged.to_csv(MERGED_CSV, index=False)
     log.info("File finale salvato in %s", MERGED_CSV)
 
