@@ -98,10 +98,19 @@ def get_vcf_sample_ids(vcf_path: str) -> set:
     """Legge SOLO l'header del VCF (bcftools query -l), niente scrittura,
     niente modifica del file. Applica clean_sample_id per uniformare gli id
     doppi (es. ACH10008_ACH10008 -> ACH10008)."""
+    if not os.path.exists(vcf_path):
+        raise FileNotFoundError(f"VCF non trovato: {vcf_path}")
+
     result = subprocess.run(
         ["bcftools", "query", "-l", vcf_path],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"bcftools query -l fallito su {vcf_path} (exit {result.returncode}).\n"
+            f"stderr: {result.stderr.strip()}"
+        )
+
     raw_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     cleaned = {clean_sample_id(rid) for rid in raw_ids}
     log.info("Sample id trovati nel VCF: %d (esempio raw: %s)", len(raw_ids), raw_ids[:1])
