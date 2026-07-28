@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Entry point unico della pipeline. Sostituisce "ordine_comandi.txt" (un file
-di testo con l'elenco degli script da lanciare a mano, nell'ordine giusto,
-sperando di non sbagliare) con un CLI che elenca esplicitamente gli step
-disponibili e l'ordine consigliato.
+Single entry point for the pipeline. Replaces "ordine_comandi.txt" (a text
+file listing the scripts to run by hand, in the right order, hoping not to
+get it wrong) with a CLI that explicitly lists the available steps and the
+recommended order.
 
-Esempi:
+Examples:
     python -m gene_environment.cli filter-vcf
     python -m gene_environment.cli build-matrix
     python -m gene_environment.cli run-model
@@ -16,7 +16,9 @@ Esempi:
     python -m gene_environment.cli assign-genes
     python -m gene_environment.cli annotate-genes
     python -m gene_environment.cli run-gxe-genetlib
-    python -m gene_environment.cli pipeline-order    # stampa l'ordine consigliato
+    python -m gene_environment.cli generate-reports          # Table 1, Table 2, Table 2b, annotated tables
+    python -m gene_environment.cli generate-reports --only table2 table2b
+    python -m gene_environment.cli pipeline-order    # print the recommended order
 """
 from __future__ import annotations
 
@@ -29,66 +31,83 @@ from gene_environment.logging_utils import configure_logging, get_logger
 log = get_logger(__name__)
 
 PIPELINE_ORDER = """
-Ordine consigliato di esecuzione:
+Recommended execution order:
 
-  1. filter-vcf              Filtra i VCF grezzi (MAF, LD pruning) -> VCF filtrati per coorte
-  2. build-matrix             VCF filtrati -> matrice genotipica parquet (per cromosoma + genoma intero)
-  3. run-model                Costruisce il dataset (genetica+ambiente) e lancia il test
-                               per-variante (matching + permutazioni + differenza onset_age),
-                               salvando tutto a DB man mano
-  4. extract-significant      Estrae dai VCF sorgente il genotipo delle sole varianti
-                               risultate significative, per tutte le coorti (1/2/3),
-                               scrivendo il CSV combinato IN MODO INCREMENTALE
-  5. export-significant-csv   (ripetibile in ogni momento) esporta uno snapshot CSV
-                               aggiornato delle varianti significative correnti, in una
-                               cartella separata da quella dello step 4
-  6. report-onset-age         Boxplot + forest plot sulla differenza onset_age, dai dati
-                               già in DB (nessun ricalcolo)
-  7. assign-genes             Assegna il gene Ensembl alle varianti significative
-  8. annotate-genes           Arricchisce i geni con annotazioni neuro (CTD/GO)
-  9. recalculate-final        Ricalcolo a 10000 perm delle varianti significative in
-                               entrambe le coorti, con tutti i beta (JSON) — dopo assign-genes
+  1. filter-vcf              Filter the raw VCFs (MAF, LD pruning) -> filtered VCFs per cohort
+  2. build-matrix             Filtered VCFs -> genotype matrix parquet (per chromosome + whole genome)
+  3. run-model                Builds the dataset (genetics+environment) and runs the
+                               per-variant test (matching + permutations + onset_age
+                               difference), saving everything to the DB as it goes
+  4. extract-significant      Extracts, from the source VCFs, the genotype of only the
+                               variants found significant, for all cohorts (1/2/3),
+                               writing the combined CSV INCREMENTALLY
+  5. export-significant-csv   (repeatable at any time) exports an up-to-date CSV
+                               snapshot of the currently significant variants, into a
+                               folder separate from step 4's
+  6. report-onset-age         Boxplot + forest plot of the onset_age difference, from
+                               data already in the DB (no recalculation)
+  7. assign-genes             Assigns the Ensembl gene to the significant variants
+  8. annotate-genes           Enriches genes with neuro annotations (CTD/GO)
+  9. recalculate-final        High-precision recalculation (10000 perms) of the
+                               significant variants in both cohorts, with all betas
+                               (JSON) -- after assign-genes
+ 10. generate-reports         Generates the Word/CSV/figure reports (Table 1, Table 2,
+                               Table 2b, annotated tables) -- run any time after the
+                               relevant upstream steps have populated the DB/CSVs
 
-Gli step 4 e 5 possono essere ripetuti quante volte serve durante il run di
-"run-model" (es. da cron), per avere sempre uno snapshot aggiornato delle
-varianti significative senza dover aspettare la fine del run completo.
+Steps 4 and 5 can be repeated as many times as needed during the
+"run-model" run (e.g. from cron), to always have an up-to-date snapshot
+of the significant variants without waiting for the full run to finish.
 """
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Pipeline gene-environment")
+    parser = argparse.ArgumentParser(description="Gene-environment pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("filter-vcf", help="Filtra i VCF grezzi (MAF, LD pruning)")
-    sub.add_parser("build-matrix", help="VCF filtrati -> matrice genotipica parquet")
-    sub.add_parser("run-model", help="Dataset + test per-variante + onset_age, salvati a DB")
-    p_extract = sub.add_parser("extract-significant", help="Estrae il genotipo delle varianti significative")
-    p_extract.add_argument("--force", action="store_true", help="Ignora il checkpoint e riparte da zero")
-    p_export = sub.add_parser("export-significant-csv", help="Esporta uno snapshot CSV delle varianti significative")
-    p_export.add_argument("--alpha", type=float, default=None, help="Soglia FDR (default: config.pvalue_threshold)")
+    sub.add_parser("filter-vcf", help="Filter the raw VCFs (MAF, LD pruning)")
+    sub.add_parser("build-matrix", help="Filtered VCFs -> genotype matrix parquet")
+    sub.add_parser("run-model", help="Dataset + per-variant test + onset_age, saved to DB")
+    p_extract = sub.add_parser("extract-significant", help="Extracts the genotype of the significant variants")
+    p_extract.add_argument("--force", action="store_true", help="Ignore the checkpoint and start over")
+    p_export = sub.add_parser("export-significant-csv", help="Exports a CSV snapshot of the significant variants")
+    p_export.add_argument("--alpha", type=float, default=None, help="FDR threshold (default: config.pvalue_threshold)")
     p_repl = sub.add_parser(
         "replicate-significant",
-        help="Ritesta su un'altra generazione SOLO le varianti significative di una generazione già completata",
+        help="Re-tests, on another generation, ONLY the significant variants from an already-completed generation",
     )
-    p_repl.add_argument("--source-generation", type=int, required=True, help="Generazione già completata da cui prendere le varianti significative")
-    p_repl.add_argument("--target-generation", type=int, required=True, help="Generazione su cui ritestare quelle varianti")
+    p_repl.add_argument("--source-generation", type=int, required=True, help="Already-completed generation to take significant variants from")
+    p_repl.add_argument("--target-generation", type=int, required=True, help="Generation to re-test those variants on")
     p_repl.add_argument("--exposure", type=str, default=None, help="Default: config.exposure")
-    p_repl.add_argument("--alpha", type=float, default=None, help="Soglia FDR (default: config.pvalue_threshold)")
+    p_repl.add_argument("--alpha", type=float, default=None, help="FDR threshold (default: config.pvalue_threshold)")
     p_repl.add_argument("--test-label", type=str, default=None, help="Default: replication_of_gen{source}")
-    p_repl.add_argument("--force-rebuild-dataset", action="store_true", help="Ricostruisce il dataset della generazione target anche se già in cache")
-    sub.add_parser("report-onset-age", help="Boxplot + forest plot onset_age")
-    sub.add_parser("assign-genes", help="Assegna il gene Ensembl alle varianti significative")
-    sub.add_parser("annotate-genes", help="Annotazioni neuro sui geni")
-    sub.add_parser("pipeline-order", help="Stampa l'ordine consigliato degli step")
-    sub.add_parser("run-gxe-genetlib", help="Analisi G x E cromosoma-per-cromosoma con GENetLib")
+    p_repl.add_argument("--force-rebuild-dataset", action="store_true", help="Rebuilds the target generation's dataset even if already cached")
+    sub.add_parser("report-onset-age", help="Boxplot + forest plot of onset_age")
+    sub.add_parser("assign-genes", help="Assigns the Ensembl gene to the significant variants")
+    sub.add_parser("annotate-genes", help="Neuro annotations on the genes")
+    sub.add_parser("pipeline-order", help="Prints the recommended step order")
+    sub.add_parser("run-gxe-genetlib", help="Chromosome-by-chromosome G x E analysis with GENetLib")
 
     p_final = sub.add_parser(
         "recalculate-final",
-        help="Ricalcolo ad alta precisione (10000 perm di default) delle varianti significative in entrambe le coorti, con tutti i beta salvati in JSON",
+        help="High-precision recalculation (10000 perms by default) of the significant variants in both cohorts, with all betas saved to JSON",
     )
     p_final.add_argument("--exposure", type=str, default=None, help="Default: config.exposure")
-    p_final.add_argument("--n-perm", type=int, default=10000, help="Numero di permutazioni (default: 10000)")
+    p_final.add_argument("--n-perm", type=int, default=10000, help="Number of permutations (default: 10000)")
     p_final.add_argument("--force-rebuild-dataset", action="store_true")
+
+    p_reports = sub.add_parser(
+        "generate-reports",
+        help="Generates the Word/CSV/figure reports (Table 1, Table 2, Table 2b, annotated tables)",
+    )
+    p_reports.add_argument(
+        "--only", nargs="+", default=None,
+        choices=["table1", "table2", "table2b", "annotated-tables"],
+        help="Generate only these report(s) instead of all of them",
+    )
+
+    sub.add_parser("build-cohort-mapping", help="Rebuilds the id -> generation mapping CSV by reading VCF headers (prerequisite for table1)")
+    sub.add_parser("run-c9-check", help="Restricted genotype/environment/C9orf72-code merge diagnostic (see report/c9_check.py)")
 
     args = parser.parse_args(argv)
 
@@ -153,6 +172,18 @@ def main(argv: list[str] | None = None) -> int:
             n_perm=args.n_perm,
             force_rebuild_dataset=args.force_rebuild_dataset,
         )
+
+    elif args.command == "generate-reports":
+        from gene_environment.report.runner import run_all_reports
+        run_all_reports(only=args.only)
+
+    elif args.command == "build-cohort-mapping":
+        from gene_environment.report.build_cohort_mapping import run_build_cohort_mapping
+        run_build_cohort_mapping()
+
+    elif args.command == "run-c9-check":
+        from gene_environment.report.c9_check import run_c9_check
+        run_c9_check()
 
     else:
         parser.print_help()

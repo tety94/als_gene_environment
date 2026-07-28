@@ -13,32 +13,33 @@ Output (in OUTPUT_DIR):
   - figures/*.png           -> boxplots/barplots comparing the two cohorts
 
 Usage:
-    python build_cohort_mapping.py   # generates id -> generation mapping
-    python generate_table1.py        # generates Table 1
+    python -m gene_environment.report.build_cohort_mapping   # generates id -> generation mapping
+    python -m gene_environment.report.generate_table1        # generates Table 1
 
 Modify only the CONFIG section below to adapt paths/column names.
 """
 
-import os
+from __future__ import annotations
+
 import sys
 import warnings
 from pathlib import Path
-
-import numpy as np
-import pandas as pd
-from scipy import stats
+from typing import Optional
 
 import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import seaborn as sns
-
 from docx import Document
-from docx.shared import Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Cm, Pt
+from scipy import stats
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402  (must come after matplotlib.use)
+
+from gene_environment.report.word_utils import set_cell_bg
 
 warnings.filterwarnings("ignore")
 
@@ -55,7 +56,7 @@ OUTPUT_DIR = Path("output/table1")
 ID_COL_CSV = "id"
 ID_COL_MAPPING = "id"
 
-COHORT_COL = "generazione"
+COHORT_COL = "generation"
 
 # If more than 2 distinct values exist, specify EXACTLY which two to compare.
 # Example: COHORT_VALUES = ["gen1", "gen2"]
@@ -97,19 +98,19 @@ ALPHA = 0.05
 # FUNCTIONS
 # ============================================================
 
-def load_data():
-    print(f"Loading CSV: {CSV_PATH}")
-    df = pd.read_csv(CSV_PATH)
+def load_data(csv_path: str, cohort_mapping_csv: str) -> pd.DataFrame:
+    print(f"Loading CSV: {csv_path}")
+    df = pd.read_csv(csv_path)
     if ID_COL_CSV not in df.columns:
         sys.exit(f"ERROR: id column '{ID_COL_CSV}' not found in CSV. Columns: {list(df.columns)}")
 
-    print(f"Loading cohort mapping from CSV: {COHORT_MAPPING_CSV}")
-    if not Path(COHORT_MAPPING_CSV).exists():
+    print(f"Loading cohort mapping from CSV: {cohort_mapping_csv}")
+    if not Path(cohort_mapping_csv).exists():
         sys.exit(
-            f"ERROR: {COHORT_MAPPING_CSV} not found.\n"
-            f"Generate mapping first with: python build_cohort_mapping.py"
+            f"ERROR: {cohort_mapping_csv} not found.\n"
+            f"Generate the mapping first with: python -m gene_environment.report.build_cohort_mapping"
         )
-    gen = pd.read_csv(COHORT_MAPPING_CSV)
+    gen = pd.read_csv(cohort_mapping_csv)
 
     if ID_COL_MAPPING not in gen.columns:
         sys.exit(f"ERROR: id column '{ID_COL_MAPPING}' not found in mapping CSV. Columns: {list(gen.columns)}")
@@ -128,7 +129,7 @@ def load_data():
     return merged
 
 
-def resolve_cohorts(merged):
+def resolve_cohorts(merged: pd.DataFrame):
     values = sorted(merged[COHORT_COL].dropna().unique().tolist())
 
     if COHORT_VALUES is not None:
@@ -153,7 +154,7 @@ def resolve_cohorts(merged):
     return sub, chosen, labels
 
 
-def is_normal(series, alpha=0.05):
+def is_normal(series: pd.Series, alpha: float = 0.05) -> bool:
     series = series.dropna()
     if len(series) < 8:
         return True
@@ -161,7 +162,7 @@ def is_normal(series, alpha=0.05):
     return p > alpha
 
 
-def fmt_p(p):
+def fmt_p(p) -> str:
     if pd.isna(p):
         return "-"
     if p < 0.001:
@@ -169,7 +170,7 @@ def fmt_p(p):
     return f"{p:.3f}"
 
 
-def summarize_numeric(sub, var, cohort_col, groups):
+def summarize_numeric(sub: pd.DataFrame, var: str, cohort_col: str, groups) -> list[dict]:
     rows = []
     g1 = sub.loc[sub[cohort_col] == groups[0], var].dropna()
     g2 = sub.loc[sub[cohort_col] == groups[1], var].dropna()
@@ -177,8 +178,8 @@ def summarize_numeric(sub, var, cohort_col, groups):
     normal = is_normal(g1) and is_normal(g2)
 
     if normal:
-        desc1 = f"{g1.mean():.2f} ± {g1.std():.2f}"
-        desc2 = f"{g2.mean():.2f} ± {g2.std():.2f}"
+        desc1 = f"{g1.mean():.2f} \u00b1 {g1.std():.2f}"
+        desc2 = f"{g2.mean():.2f} \u00b1 {g2.std():.2f}"
         stat, p = stats.ttest_ind(g1, g2, equal_var=False, nan_policy="omit")
         test_used = "Welch t-test"
     else:
@@ -188,7 +189,7 @@ def summarize_numeric(sub, var, cohort_col, groups):
             stat, p = stats.mannwhitneyu(g1, g2, alternative="two-sided")
         else:
             p = np.nan
-        test_used = "Mann–Whitney U"
+        test_used = "Mann\u2013Whitney U"
 
     rows.append(
         {
@@ -206,7 +207,7 @@ def summarize_numeric(sub, var, cohort_col, groups):
     return rows
 
 
-def summarize_categorical(sub, var, cohort_col, groups):
+def summarize_categorical(sub: pd.DataFrame, var: str, cohort_col: str, groups) -> list[dict]:
     rows = []
     ct = pd.crosstab(sub[var], sub[cohort_col])
     ct = ct[[c for c in groups if c in ct.columns]]
@@ -243,7 +244,7 @@ def summarize_categorical(sub, var, cohort_col, groups):
     return rows
 
 
-def build_stats_table(sub, cohort_col, groups):
+def build_stats_table(sub: pd.DataFrame, cohort_col: str, groups) -> pd.DataFrame:
     all_rows = []
     for var in CATEGORICAL_VARS:
         all_rows.extend(summarize_categorical(sub, var, cohort_col, groups))
@@ -256,7 +257,7 @@ def build_stats_table(sub, cohort_col, groups):
 # FIGURES
 # ------------------------------------------------------------
 
-def make_figures(sub, cohort_col, groups, labels, fig_dir):
+def make_figures(sub: pd.DataFrame, cohort_col: str, groups, labels, fig_dir: Path) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
     sns.set_style("whitegrid")
     palette = {groups[0]: "#4C72B0", groups[1]: "#DD8452"}
@@ -306,16 +307,7 @@ def make_figures(sub, cohort_col, groups, labels, fig_dir):
 # WORD TABLE
 # ------------------------------------------------------------
 
-def set_cell_shading(cell, color_hex):
-    tcPr = cell._tc.get_or_add_tcPr()
-    shd = OxmlElement("w:shd")
-    shd.set(qn("w:val"), "clear")
-    shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"), color_hex)
-    tcPr.append(shd)
-
-
-def make_docx_table(stats_df, groups, labels, n_total, output_path):
+def make_docx_table(stats_df: pd.DataFrame, groups, labels, n_total, output_path: Path) -> None:
     doc = Document()
 
     section = doc.sections[0]
@@ -355,7 +347,7 @@ def make_docx_table(stats_df, groups, labels, n_total, output_path):
             for r in p.runs:
                 r.bold = True
                 r.font.size = Pt(10)
-        set_cell_shading(hdr_cells[i], "D9D9D9")
+        set_cell_bg(hdr_cells[i], "D9D9D9")
 
     for _, row in stats_df.iterrows():
         cells = table.add_row().cells
@@ -378,8 +370,8 @@ def make_docx_table(stats_df, groups, labels, n_total, output_path):
 
     note = doc.add_paragraph()
     note_run = note.add_run(
-        "Numeric variables: mean ± SD (Welch t-test) if normally distributed, "
-        "otherwise median [IQR] (Mann–Whitney U). Categorical variables: n (%) "
+        "Numeric variables: mean \u00b1 SD (Welch t-test) if normally distributed, "
+        "otherwise median [IQR] (Mann\u2013Whitney U). Categorical variables: n (%) "
         "(Chi-square or Fisher exact test if expected counts <5)."
     )
     note_run.italic = True
@@ -390,30 +382,36 @@ def make_docx_table(stats_df, groups, labels, n_total, output_path):
 
 
 # ============================================================
-# MAIN
+# MAIN (callable, reusable from the report runner and the CLI)
 # ============================================================
 
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    fig_dir = OUTPUT_DIR / "figures"
+def run_table1(csv_path: str = CSV_PATH, cohort_mapping_csv: str = COHORT_MAPPING_CSV,
+               output_dir: Path = OUTPUT_DIR) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir = output_dir / "figures"
 
-    merged = load_data()
+    merged = load_data(csv_path, cohort_mapping_csv)
     sub, groups, labels = resolve_cohorts(merged)
 
     n_total = sub[COHORT_COL].value_counts().to_dict()
 
     stats_df = build_stats_table(sub, COHORT_COL, groups)
 
-    csv_out = OUTPUT_DIR / "table1_stats.csv"
+    csv_out = output_dir / "table1_stats.csv"
     stats_df.to_csv(csv_out, index=False)
     print(f"Statistics CSV saved in: {csv_out}")
 
     make_figures(sub, COHORT_COL, groups, labels, fig_dir)
 
-    docx_out = OUTPUT_DIR / "Table1.docx"
+    docx_out = output_dir / "Table1.docx"
     make_docx_table(stats_df, groups, labels, n_total, docx_out)
 
-    print("\nDone. Output in:", OUTPUT_DIR.resolve())
+    print("\nDone. Output in:", output_dir.resolve())
+
+
+def main() -> None:
+    run_table1()
 
 
 if __name__ == "__main__":

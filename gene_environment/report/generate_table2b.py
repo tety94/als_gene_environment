@@ -19,6 +19,10 @@ Behavior:
   get_significant_results_table_2), so this script is purely descriptive:
   no significance highlighting, no chromosome enrichment test. It reports
   gene annotation content instead.
+- Translates the `exposure` column from the source dataset's Italian
+  land-use terms to English (see `gene_environment.report.exposure_labels`)
+  right after fetching, since (unlike Table 2) nothing downstream needs the
+  raw value to query the DB again.
 - Produces:
     output/table2b/Table2b_top10.docx
     output/table2b/Table2b_full_supplementary.docx
@@ -58,12 +62,20 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 from docx import Document
-from docx.enum.section import WD_ORIENT
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Pt, RGBColor
+
+from gene_environment.report.db_utils import call_stored_routine_to_df, chrom_sort_key, extract_chromosome
+from gene_environment.report.exposure_labels import translate_exposure
+from gene_environment.report.word_utils import (
+    add_figure_to_doc,
+    repeat_header_row,
+    set_cell_bg,
+    set_col_width,
+    set_landscape,
+    set_table_borders,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -71,8 +83,6 @@ from docx.shared import Inches, Pt, RGBColor
 
 OUT_DIR = Path("output/table2b")
 FIG_DIR = OUT_DIR / "figures"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 ASTORE_NAME = "get_significant_results_table_2b"
 
@@ -129,57 +139,27 @@ HEADER_FILL = "44546A"
 HEADER_FONT_COLOR = RGBColor(0xFF, 0xFF, 0xFF)
 ZEBRA_FILL = "EEF1F6"
 
+_TRUE_TOKENS = {"1", "1.0", "true", "t", "yes", "y"}
+_FALSE_TOKENS = {"0", "0.0", "false", "f", "no", "n"}
+
 
 # ---------------------------------------------------------------------------
-# docx table helpers (same conventions as generate_table2.py)
+# Formatting helpers
 # ---------------------------------------------------------------------------
 
-def _set_cell_bg(cell, color_hex: str) -> None:
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    shd = OxmlElement("w:shd")
-    shd.set(qn("w:val"), "clear")
-    shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"), color_hex)
-    tcPr.append(shd)
-
-
-def _set_col_width(cell, width_inches: float) -> None:
-    """Twips (1/1440 inch), not EMU -- see note in generate_table2.py."""
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    tcW = OxmlElement("w:tcW")
-    tcW.set(qn("w:w"), str(int(width_inches * 1440)))
-    tcW.set(qn("w:type"), "dxa")
-    tcPr.append(tcW)
-
-
-def _set_table_borders(table, color_hex: str = "BFBFBF", size: int = 4) -> None:
-    tbl = table._tbl
-    tblPr = tbl.tblPr
-    borders = OxmlElement("w:tblBorders")
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-        el = OxmlElement(f"w:{edge}")
-        el.set(qn("w:val"), "single")
-        el.set(qn("w:sz"), str(size))
-        el.set(qn("w:space"), "0")
-        el.set(qn("w:color"), color_hex)
-        borders.append(el)
-    tblPr.append(borders)
-
-
-def make_landscape(doc: Document) -> None:
-    """Switch the current (first) section to landscape with narrow margins,
-    needed because this table has 11 columns."""
-    section = doc.sections[0]
-    section.orientation = WD_ORIENT.LANDSCAPE
-    new_width, new_height = section.page_height, section.page_width
-    section.page_width = new_width
-    section.page_height = new_height
-    section.left_margin = Inches(0.5)
-    section.right_margin = Inches(0.5)
-    section.top_margin = Inches(0.6)
-    section.bottom_margin = Inches(0.6)
+def _format_bool_like(val) -> str:
+    """Best-effort formatting of a value that might be a 0/1 flag, a
+    True/False, or a Y/N string, as 'Yes' / 'No'. Falls back to the raw
+    string if it doesn't look boolean (e.g. a continuous score)."""
+    s = str(val).strip().lower()
+    if s in _TRUE_TOKENS:
+        return "Yes"
+    if s in _FALSE_TOKENS:
+        return "No"
+    try:
+        return "{:.3g}".format(float(val))
+    except (TypeError, ValueError):
+        return str(val)
 
 
 def format_value_for_word(col: str, val) -> str:
@@ -200,24 +180,16 @@ def format_value_for_word(col: str, val) -> str:
     return str(val)
 
 
-_TRUE_TOKENS = {"1", "1.0", "true", "t", "yes", "y"}
-_FALSE_TOKENS = {"0", "0.0", "false", "f", "no", "n"}
+def _split_chemicals(raw) -> List[str]:
+    if pd.isna(raw):
+        return []
+    parts = CHEM_SPLIT_RE.split(str(raw))
+    return [p.strip() for p in parts if p.strip()]
 
 
-def _format_bool_like(val) -> str:
-    """Best-effort formatting of a value that might be a 0/1 flag, a
-    True/False, or a Y/N string, as 'Yes' / 'No'. Falls back to the raw
-    string if it doesn't look boolean (e.g. a continuous score)."""
-    s = str(val).strip().lower()
-    if s in _TRUE_TOKENS:
-        return "Yes"
-    if s in _FALSE_TOKENS:
-        return "No"
-    try:
-        return "{:.3g}".format(float(val))
-    except (TypeError, ValueError):
-        return str(val)
-
+# ---------------------------------------------------------------------------
+# docx table helpers
+# ---------------------------------------------------------------------------
 
 def add_table_to_doc(
     doc: Document,
@@ -241,7 +213,7 @@ def add_table_to_doc(
     table = doc.add_table(rows=1, cols=len(TABLE_COLUMNS))
     table.style = "Table Grid"
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    _set_table_borders(table)
+    set_table_borders(table)
 
     hdr_cells = table.rows[0].cells
     for i, col in enumerate(TABLE_COLUMNS):
@@ -252,8 +224,8 @@ def add_table_to_doc(
         run.font.color.rgb = HEADER_FONT_COLOR
         p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
         hdr_cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-        _set_cell_bg(hdr_cells[i], HEADER_FILL)
-        _set_col_width(hdr_cells[i], COL_WIDTHS_IN.get(col, 1.0))
+        set_cell_bg(hdr_cells[i], HEADER_FILL)
+        set_col_width(hdr_cells[i], COL_WIDTHS_IN.get(col, 1.0))
 
     numeric_cols = ("als_opentargets_score", "neuro_plausibility_score")
     for ridx, (_, row) in enumerate(df_to_use.iterrows()):
@@ -262,7 +234,7 @@ def add_table_to_doc(
         for i, col in enumerate(TABLE_COLUMNS):
             text = format_value_for_word(col, row.get(col, pd.NA))
             cell = cells[i]
-            _set_col_width(cell, COL_WIDTHS_IN.get(col, 1.0))
+            set_col_width(cell, COL_WIDTHS_IN.get(col, 1.0))
             para = cell.paragraphs[0]
             para.alignment = (
                 WD_PARAGRAPH_ALIGNMENT.RIGHT if col in numeric_cols else WD_PARAGRAPH_ALIGNMENT.LEFT
@@ -270,13 +242,9 @@ def add_table_to_doc(
             run = para.add_run(text)
             run.font.size = Pt(8)
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-            _set_cell_bg(cell, shade)
+            set_cell_bg(cell, shade)
 
-    first_tr = table.rows[0]._tr
-    trPr = first_tr.get_or_add_trPr()
-    tbl_header = OxmlElement("w:tblHeader")
-    tbl_header.set(qn("w:val"), "true")
-    trPr.append(tbl_header)
+    repeat_header_row(table)
 
     if caption:
         cap = doc.add_paragraph(caption)
@@ -284,101 +252,11 @@ def add_table_to_doc(
         cap.runs[0].font.size = Pt(9)
 
 
-def add_figure_to_doc(doc: Document, fig_path: Path, caption: str, width_in: float = 6.0) -> None:
-    if not fig_path.exists():
-        return
-    doc.add_picture(str(fig_path), width=Inches(width_in))
-    last_paragraph = doc.paragraphs[-1]
-    last_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-    cap = doc.add_paragraph(caption)
-    cap.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-    cap.runs[0].italic = True
-    cap.runs[0].font.size = Pt(9)
-
-
-# ---------------------------------------------------------------------------
-# Data access
-# ---------------------------------------------------------------------------
-
-def call_stored_routine_to_df(astore_name: str, get_connection, cursor_scope) -> pd.DataFrame:
-    """Call `astore_name()` and return a DataFrame from the first resultset.
-    Identical logic to generate_table2.py's version (handles drivers that
-    need nextset() iteration)."""
-    rows: List[dict] = []
-
-    with get_connection() as conn:
-        with cursor_scope(conn, dictionary=True) as cur:
-            try:
-                cur.execute(f"CALL {astore_name}()")
-            except Exception as e:
-                raise RuntimeError(f"Failed to CALL {astore_name}(). DB error: {e}") from e
-
-            try:
-                fetched = cur.fetchall()
-                if fetched:
-                    rows = fetched
-            except Exception as e:
-                print(f"[warn] initial fetchall() failed, will try nextset(): {e}", file=sys.stderr)
-                rows = []
-
-            try:
-                while (not rows) and cur.nextset():
-                    try:
-                        fetched = cur.fetchall()
-                        if fetched:
-                            rows = fetched
-                            break
-                    except Exception as e:
-                        print(f"[warn] fetchall() on a later resultset failed: {e}", file=sys.stderr)
-                        continue
-            except Exception as e:
-                print(f"[warn] nextset() not supported by this driver: {e}", file=sys.stderr)
-
-    if not rows:
-        return pd.DataFrame(columns=TABLE_COLUMNS)
-
-    df = pd.DataFrame(rows)
-    df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Formatting / parsing helpers
-# ---------------------------------------------------------------------------
-
-def extract_chromosome(variant: str) -> str:
-    """Same convention as generate_table2.py."""
-    if pd.isna(variant):
-        return "NA"
-    if not isinstance(variant, str):
-        variant = str(variant)
-    m = re.match(r"^(?:chr)?([^:]+):", variant, flags=re.IGNORECASE)
-    chrom = m.group(1) if m else re.split(r"[:_\-]", variant)[0]
-    chrom = chrom.lower().lstrip("chr")
-    if chrom.isalpha():
-        chrom = chrom.upper()
-    return chrom
-
-
-def _chrom_sort_key(ch):
-    try:
-        return (0, int(ch))
-    except ValueError:
-        return (1, ch)
-
-
-def _split_chemicals(raw) -> List[str]:
-    if pd.isna(raw):
-        return []
-    parts = CHEM_SPLIT_RE.split(str(raw))
-    return [p.strip() for p in parts if p.strip()]
-
-
 # ---------------------------------------------------------------------------
 # Figures
 # ---------------------------------------------------------------------------
 
-def make_chromosome_figures(df: pd.DataFrame) -> None:
+def make_chromosome_figures(df: pd.DataFrame, fig_dir: Path) -> None:
     """Purely descriptive chromosome-level figures (no significance concept
     here -- every row in this dataset is already the astore's output)."""
     df = df.copy()
@@ -387,7 +265,7 @@ def make_chromosome_figures(df: pd.DataFrame) -> None:
     variants_per_chrom = df.groupby("chromosome")["variant"].nunique().rename("n_variants").reset_index()
     genes_per_chrom = df.groupby("chromosome")["gene_symbol"].nunique().rename("n_genes").reset_index()
     merged = pd.merge(variants_per_chrom, genes_per_chrom, on="chromosome", how="outer").fillna(0)
-    merged = merged.sort_values(by="chromosome", key=lambda s: s.map(_chrom_sort_key))
+    merged = merged.sort_values(by="chromosome", key=lambda s: s.map(chrom_sort_key))
 
     sns.set_theme(style="whitegrid")
 
@@ -398,7 +276,7 @@ def make_chromosome_figures(df: pd.DataFrame) -> None:
     ax.set_title("Variants per chromosome (Table 2b)")
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig(FIG_DIR / "variants_per_chromosome.png", dpi=300)
+    plt.savefig(fig_dir / "variants_per_chromosome.png", dpi=300)
     plt.close()
 
     plt.figure(figsize=(8, 6))
@@ -410,17 +288,17 @@ def make_chromosome_figures(df: pd.DataFrame) -> None:
     ax.set_ylabel("Number of unique variants per chromosome")
     ax.set_title("Genes vs variants per chromosome (Table 2b)")
     plt.tight_layout()
-    plt.savefig(FIG_DIR / "genes_vs_variants_scatter.png", dpi=300)
+    plt.savefig(fig_dir / "genes_vs_variants_scatter.png", dpi=300)
     plt.close()
 
 
-def make_gene_type_figure(df: pd.DataFrame) -> pd.DataFrame:
+def make_gene_type_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path) -> pd.DataFrame:
     """Bar chart of unique genes per gene_type. Returns the counts table,
     also saved to CSV."""
     genes = df.drop_duplicates(subset=["gene_symbol"])
     counts = genes["gene_type"].fillna("Unknown").value_counts().rename_axis("gene_type").reset_index(name="n_genes")
     counts = counts.sort_values("n_genes", ascending=False)
-    counts.to_csv(OUT_DIR / "table2b_gene_type_counts.csv", index=False)
+    counts.to_csv(out_dir / "table2b_gene_type_counts.csv", index=False)
 
     plt.figure(figsize=(max(6, 0.5 * len(counts)), 5))
     ax = sns.barplot(data=counts, x="gene_type", y="n_genes", color="#4472C4")
@@ -429,12 +307,12 @@ def make_gene_type_figure(df: pd.DataFrame) -> pd.DataFrame:
     ax.set_title("Gene type distribution")
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
-    plt.savefig(FIG_DIR / "gene_type_distribution.png", dpi=300)
+    plt.savefig(fig_dir / "gene_type_distribution.png", dpi=300)
     plt.close()
     return counts
 
 
-def make_expression_figure(df: pd.DataFrame) -> str:
+def make_expression_figure(df: pd.DataFrame, fig_dir: Path) -> str:
     """expressed_brain / expressed_neurons / expressed_glia: auto-detects
     whether these look like binary flags (all observed values in {0,1}) or
     continuous scores, and plots accordingly. Returns which mode was used
@@ -450,7 +328,7 @@ def make_expression_figure(df: pd.DataFrame) -> str:
     observed_values = set(numeric_df.stack().dropna().unique().tolist())
     is_binary = observed_values.issubset({0.0, 1.0}) and len(observed_values) > 0
 
-    fig_path = FIG_DIR / "expressed_brain_neurons_glia.png"
+    fig_path = fig_dir / "expressed_brain_neurons_glia.png"
 
     if is_binary:
         print("[info] expressed_brain/neurons/glia detected as binary (0/1) flags -- "
@@ -488,13 +366,13 @@ def make_expression_figure(df: pd.DataFrame) -> str:
         return "continuous"
 
 
-def make_score_histogram(df: pd.DataFrame, col: str, fig_name: str, title: str) -> None:
+def make_score_histogram(df: pd.DataFrame, col: str, fig_dir: Path, fig_name: str, title: str) -> None:
     """Histogram of a numeric score column, deduplicated by gene_symbol so a
     gene tested against multiple exposures/variants isn't overweighted."""
     genes = df.drop_duplicates(subset=["gene_symbol"])
     vals = pd.to_numeric(genes.get(col, pd.Series(dtype=float)), errors="coerce").dropna()
 
-    fig_path = FIG_DIR / fig_name
+    fig_path = fig_dir / fig_name
     plt.figure(figsize=(8, 5))
     if not vals.empty:
         ax = sns.histplot(vals, bins=40, color="#ED7D31")
@@ -509,7 +387,7 @@ def make_score_histogram(df: pd.DataFrame, col: str, fig_name: str, title: str) 
     plt.close()
 
 
-def make_chemicals_figure(df: pd.DataFrame) -> pd.DataFrame:
+def make_chemicals_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path) -> pd.DataFrame:
     """Top-N most frequent CTD chemicals across all rows. Frequency counts
     rows (variant x exposure x gene), not unique genes, since the same
     chemical linked to different genes/variants is still relevant signal.
@@ -518,8 +396,8 @@ def make_chemicals_figure(df: pd.DataFrame) -> pd.DataFrame:
     for raw in df.get("ctd_chemicals", pd.Series(dtype=object)):
         counter.update(_split_chemicals(raw))
 
-    fig_path = FIG_DIR / "ctd_chemicals_top20.png"
-    freq_path = OUT_DIR / "table2b_chemicals_frequency.csv"
+    fig_path = fig_dir / "ctd_chemicals_top20.png"
+    freq_path = out_dir / "table2b_chemicals_frequency.csv"
 
     if not counter:
         freq = pd.DataFrame(columns=["chemical", "n_occurrences"])
@@ -547,32 +425,41 @@ def make_chemicals_figure(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main (callable, reusable from the report runner and the CLI)
 # ---------------------------------------------------------------------------
 
-def main():
+def run_table2b(out_dir: Path = OUT_DIR) -> None:
     from gene_environment.db.connection import cursor_scope, get_connection
 
+    out_dir = Path(out_dir)
+    fig_dir = out_dir / "figures"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"Calling stored routine: {ASTORE_NAME}() ...")
-    df = call_stored_routine_to_df(ASTORE_NAME, get_connection, cursor_scope)
+    df = call_stored_routine_to_df(ASTORE_NAME, get_connection, cursor_scope, columns=TABLE_COLUMNS)
     for c in TABLE_COLUMNS:
         if c not in df.columns:
             df[c] = pd.NA
 
-    df.to_csv(OUT_DIR / "table2b_raw_results.csv", index=False)
+    # No further DB round-trip depends on the raw exposure value here, so
+    # translate immediately -- the CSV export below is English too.
+    df = translate_exposure(df)
+
+    df.to_csv(out_dir / "table2b_raw_results.csv", index=False)
 
     if df.empty:
         print("[warn] no rows returned by the stored routine -- nothing further to do.", file=sys.stderr)
         return
 
-    make_chromosome_figures(df)
-    gene_type_counts = make_gene_type_figure(df)
-    expression_mode = make_expression_figure(df)
-    make_score_histogram(df, "als_opentargets_score", "als_opentargets_score_histogram.png",
+    make_chromosome_figures(df, fig_dir)
+    gene_type_counts = make_gene_type_figure(df, out_dir, fig_dir)
+    expression_mode = make_expression_figure(df, fig_dir)
+    make_score_histogram(df, "als_opentargets_score", fig_dir, "als_opentargets_score_histogram.png",
                           "Distribution of ALS OpenTargets score (unique genes)")
-    make_score_histogram(df, "neuro_plausibility_score", "neuro_plausibility_score_histogram.png",
+    make_score_histogram(df, "neuro_plausibility_score", fig_dir, "neuro_plausibility_score_histogram.png",
                           "Distribution of neuro plausibility score (unique genes)")
-    chemicals_freq = make_chemicals_figure(df)
+    chemicals_freq = make_chemicals_figure(df, out_dir, fig_dir)
 
     n_unique_genes = df["gene_symbol"].nunique()
     n_unique_variants = df["variant"].nunique()
@@ -580,7 +467,7 @@ def main():
 
     # --- Table 2b (top 10) ---
     doc_top10 = Document()
-    make_landscape(doc_top10)
+    set_landscape(doc_top10, top=0.6, bottom=0.6)
     doc_top10.add_heading("Table 2b. Gene annotations for significant variants (top 10)", level=1)
     doc_top10.add_paragraph(
         "Table shows the top 10 rows from get_significant_results_table_2b. This dataset has no "
@@ -590,12 +477,12 @@ def main():
         "returned by the routine."
     )
     add_table_to_doc(doc_top10, df, max_rows=10)
-    top10_path = OUT_DIR / "Table2b_top10.docx"
+    top10_path = out_dir / "Table2b_top10.docx"
     doc_top10.save(top10_path)
 
     # --- Supplementary Word (full results + all figures) ---
     doc_full = Document()
-    make_landscape(doc_full)
+    set_landscape(doc_full, top=0.6, bottom=0.6)
     doc_full.add_heading("Supplementary Table 2b: gene annotations, full results", level=1)
     doc_full.add_paragraph(
         f"Full results from get_significant_results_table_2b. {len(df)} rows covering "
@@ -607,11 +494,11 @@ def main():
     add_table_to_doc(doc_full, df)
 
     doc_full.add_heading("Figures", level=1)
-    add_figure_to_doc(doc_full, FIG_DIR / "variants_per_chromosome.png",
+    add_figure_to_doc(doc_full, fig_dir / "variants_per_chromosome.png",
                        "Figure 1. Number of unique variants per chromosome.")
-    add_figure_to_doc(doc_full, FIG_DIR / "genes_vs_variants_scatter.png",
+    add_figure_to_doc(doc_full, fig_dir / "genes_vs_variants_scatter.png",
                        "Figure 2. Genes vs variants per chromosome.")
-    add_figure_to_doc(doc_full, FIG_DIR / "gene_type_distribution.png",
+    add_figure_to_doc(doc_full, fig_dir / "gene_type_distribution.png",
                        "Figure 3. Distribution of gene types among unique genes.")
     expr_caption = (
         "Figure 4. Proportion of unique genes expressed in brain / neurons / glia."
@@ -619,26 +506,30 @@ def main():
         "Figure 4. Distribution of brain / neuron / glia expression scores among unique genes "
         "(detected as continuous, not binary flags -- see script notes)."
     )
-    add_figure_to_doc(doc_full, FIG_DIR / "expressed_brain_neurons_glia.png", expr_caption, width_in=6.5)
-    add_figure_to_doc(doc_full, FIG_DIR / "als_opentargets_score_histogram.png",
+    add_figure_to_doc(doc_full, fig_dir / "expressed_brain_neurons_glia.png", expr_caption, width_in=6.5)
+    add_figure_to_doc(doc_full, fig_dir / "als_opentargets_score_histogram.png",
                        "Figure 5. Distribution of ALS OpenTargets score among unique genes.")
-    add_figure_to_doc(doc_full, FIG_DIR / "neuro_plausibility_score_histogram.png",
+    add_figure_to_doc(doc_full, fig_dir / "neuro_plausibility_score_histogram.png",
                        "Figure 6. Distribution of neuro plausibility score among unique genes.")
-    add_figure_to_doc(doc_full, FIG_DIR / "ctd_chemicals_top20.png",
+    add_figure_to_doc(doc_full, fig_dir / "ctd_chemicals_top20.png",
                        f"Figure 7. Top {min(CTD_CHEMICALS_TOP_N, len(chemicals_freq))} most frequent "
                        "CTD chemicals across all rows (row-level occurrence count).", width_in=6.5)
 
-    full_path = OUT_DIR / "Table2b_full_supplementary.docx"
+    full_path = out_dir / "Table2b_full_supplementary.docx"
     doc_full.save(full_path)
 
     print("Done.")
     print(f"Top 10 Word: {top10_path}")
     print(f"Full supplementary Word: {full_path}")
-    print(f"Raw results CSV: {OUT_DIR / 'table2b_raw_results.csv'}")
-    print(f"Gene type counts CSV: {OUT_DIR / 'table2b_gene_type_counts.csv'}")
-    print(f"CTD chemicals frequency CSV: {OUT_DIR / 'table2b_chemicals_frequency.csv'}")
-    print(f"Figures saved in: {FIG_DIR}")
+    print(f"Raw results CSV: {out_dir / 'table2b_raw_results.csv'}")
+    print(f"Gene type counts CSV: {out_dir / 'table2b_gene_type_counts.csv'}")
+    print(f"CTD chemicals frequency CSV: {out_dir / 'table2b_chemicals_frequency.csv'}")
+    print(f"Figures saved in: {fig_dir}")
     print(f"Expression columns detected as: {expression_mode}")
+
+
+def main():
+    run_table2b()
 
 
 if __name__ == "__main__":

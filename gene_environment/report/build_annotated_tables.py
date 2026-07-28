@@ -21,6 +21,10 @@ Two documents are produced:
 Rows with a NULL neuro_plausibility_score fall into neither table; they
 are counted and logged, not silently dropped.
 
+The `exposure` column is translated from the source dataset's Italian
+land-use terms to English via `exposure_labels.translate_exposure`
+(shared across every report module).
+
 Usage
 -----
     python3 -m gene_environment.report.build_annotated_tables
@@ -36,44 +40,20 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 from docx import Document
-from docx.enum.section import WD_ORIENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import Inches
+
+from gene_environment.report.exposure_labels import translate_exposure
+from gene_environment.report.word_utils import set_cell_bg, set_landscape, repeat_header_row
 
 log = logging.getLogger("build_annotated_tables")
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+if not log.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-# --------------------------------------------------------------------------
-# Exposure name mapping (Italian land-use category -> English)
-# --------------------------------------------------------------------------
 OUT_DIR = Path("output/annotated_tables")
-
-EXPOSURE_LABELS = {
-    "seminativi_1500": "Arable land 1500mt",
-    "vigneti_1500": "Vineyards 1500mt",
-    "risaie_1500": "Rice fields 1500mt",
-    "seminativi_1000": "Arable land 1000mt",
-    "vigneti_1000": "Vineyards 1000mt",
-    "risaie_1000": "Rice fields 1000mt",
-}
-
-
-def translate_exposure(df: pd.DataFrame) -> pd.DataFrame:
-    """Map the `exposure` column from Italian land-use terms to English.
-    Values not found in EXPOSURE_LABELS are left unchanged, with a warning
-    so unmapped categories don't silently slip into the paper."""
-    df = df.copy()
-    unmapped = sorted(set(df["exposure"].dropna()) - set(EXPOSURE_LABELS))
-    if unmapped:
-        log.warning("Exposure values with no English mapping (left as-is): %s", unmapped)
-    df["exposure"] = df["exposure"].map(lambda v: EXPOSURE_LABELS.get(v, v))
-    return df
-
 
 # --------------------------------------------------------------------------
 # Column sets
@@ -168,40 +148,9 @@ def format_cell(col: str, value) -> str:
     return str(value)
 
 
-def set_repeat_header(row) -> None:
-    """Mark a table row so it repeats on every page it spans."""
-    tr = row._tr
-    trPr = tr.get_or_add_trPr()
-    tblHeader = OxmlElement("w:tblHeader")
-    tblHeader.set(qn("w:val"), "true")
-    trPr.append(tblHeader)
-
-
-def shade_cell(cell, fill: str = "D9D9D9") -> None:
-    """Apply flat grey shading to a table cell (never use w:val=SOLID)."""
-    tcPr = cell._tc.get_or_add_tcPr()
-    shd = OxmlElement("w:shd")
-    shd.set(qn("w:val"), "clear")
-    shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"), fill)
-    tcPr.append(shd)
-
-
 # --------------------------------------------------------------------------
 # Table building
 # --------------------------------------------------------------------------
-
-def set_landscape(doc: Document, margin: float = 0.5) -> None:
-    """Switch the document's section to landscape and use narrower margins
-    (in inches) so wide tables have more room."""
-    section = doc.sections[0]
-    section.orientation = WD_ORIENT.LANDSCAPE
-    section.page_width, section.page_height = section.page_height, section.page_width
-    section.left_margin = Inches(margin)
-    section.right_margin = Inches(margin)
-    section.top_margin = Inches(margin)
-    section.bottom_margin = Inches(margin)
-
 
 def add_table(doc: Document, title: str, df: pd.DataFrame, columns: list[str]) -> None:
     doc.add_heading(title, level=2)
@@ -221,8 +170,8 @@ def add_table(doc: Document, title: str, df: pd.DataFrame, columns: list[str]) -
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             for run in p.runs:
                 run.bold = True
-        shade_cell(header_cells[i])
-    set_repeat_header(table.rows[0])
+        set_cell_bg(header_cells[i])
+    repeat_header_row(table)
 
     for _, row in df.iterrows():
         cells = table.add_row().cells
@@ -262,25 +211,15 @@ def build_document(
 
 
 # --------------------------------------------------------------------------
-# Entry point
+# Entry point (callable, reusable from the report runner and the CLI)
 # --------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--input-csv", type=Path, default=None,
-        help="Skip the DB/stored-procedure call and load results from a CSV "
-             "dump instead (must have the same columns as get_annotated_results()).",
-    )
-    parser.add_argument(
-        "--outdir", type=Path, default=OUT_DIR,
-        help="Directory to write the .docx files into (default: current directory).",
-    )
-    args = parser.parse_args()
-    args.outdir.mkdir(parents=True, exist_ok=True)
+def run_annotated_tables(input_csv: Optional[Path] = None, outdir: Path = OUT_DIR) -> None:
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    if args.input_csv is not None:
-        df = pd.read_csv(args.input_csv)
+    if input_csv is not None:
+        df = pd.read_csv(input_csv)
     else:
         from gene_environment.db.repository import get_annotated_results
         df = get_annotated_results()
@@ -298,33 +237,47 @@ def main() -> None:
     zero = df[df["neuro_plausibility_score"] == 0].reset_index(drop=True)
     null_score = df[df["neuro_plausibility_score"].isna()]
 
-    full_csv_path = args.outdir / "supplementary_tables_full.csv"
+    full_csv_path = outdir / "supplementary_tables_full.csv"
     df[FULL_COLUMNS].to_csv(full_csv_path, index=False)
     log.info("Wrote %s", full_csv_path)
 
-    pos_csv_path = args.outdir / "supplementary_tables_score_gt0.csv"
-    zero_csv_path = args.outdir / "supplementary_tables_score_eq0.csv"
+    pos_csv_path = outdir / "supplementary_tables_score_gt0.csv"
+    zero_csv_path = outdir / "supplementary_tables_score_eq0.csv"
     pos.to_csv(pos_csv_path, index=False)
     zero.to_csv(zero_csv_path, index=False)
     log.info("Wrote %s (%d rows) and %s (%d rows)", pos_csv_path, len(pos), zero_csv_path, len(zero))
 
     if not null_score.empty:
-        null_csv_path = args.outdir / "supplementary_tables_score_null.csv"
+        null_csv_path = outdir / "supplementary_tables_score_null.csv"
         null_score.to_csv(null_csv_path, index=False)
         log.warning("%d rows have a NULL neuro_plausibility_score and were excluded; wrote %s", len(null_score), null_csv_path)
 
-
     build_document(
         df, FULL_COLUMNS,
-        args.outdir / "supplementary_tables.docx",
+        outdir / "supplementary_tables.docx",
         "Supplementary Tables \u2014 Full Gene Neuro-Annotation",
         landscape=True,
     )
     build_document(
         df, SUBSET_COLUMNS,
-        args.outdir / "main_text_tables.docx",
+        outdir / "main_text_tables.docx",
         "Main Text Tables \u2014 Gene Neuro-Annotation Summary",
     )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--input-csv", type=Path, default=None,
+        help="Skip the DB/stored-procedure call and load results from a CSV "
+             "dump instead (must have the same columns as get_annotated_results()).",
+    )
+    parser.add_argument(
+        "--outdir", type=Path, default=OUT_DIR,
+        help="Directory to write the .docx files into (default: current directory).",
+    )
+    args = parser.parse_args()
+    run_annotated_tables(input_csv=args.input_csv, outdir=args.outdir)
 
 
 if __name__ == "__main__":

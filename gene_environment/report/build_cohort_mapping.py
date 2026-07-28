@@ -2,133 +2,140 @@
 """
 build_cohort_mapping.py
 
-Se gen.parquet continua a dare problemi (thrift size limit / file corrotto),
-questa alternativa ricostruisce la mappatura id -> generazione leggendo
-direttamente l'header dei VCF filtrati (i sample id sono le colonne dopo
-#CHROM POS ID REF ALT QUAL FILTER INFO FORMAT).
+If gen.parquet keeps causing problems (thrift size limit / corrupted
+file), this alternative rebuilds the id -> generation mapping by reading
+the header of the filtered VCFs directly (sample ids are the columns
+after #CHROM POS ID REF ALT QUAL FILTER INFO FORMAT).
 
-Basta UN file per generazione per ottenere la lista completa dei sample id
-di quella coorte (le colonne sample sono le stesse su tutti i cromosomi).
-Uso bcftools se disponibile (legge solo l'header, è istantaneo anche su
-file da GB), altrimenti fallback su zcat+parsing.
+Only ONE file per generation is needed to get the full list of sample
+ids for that cohort (the sample columns are the same across all
+chromosomes). Uses bcftools if available (reads only the header, so it's
+instant even on multi-GB files), otherwise falls back to zcat + parsing.
 
-Output: output/table1/id_generation_mapping.csv  (colonne: id, generazione)
+Output: output/table1/id_generation_mapping.csv  (columns: id, generation)
 
-Poi in generate_table1.py imposta:
+Then in generate_table1.py set:
     COHORT_SOURCE = "csv"
     COHORT_MAPPING_CSV = "output/table1/id_generation_mapping.csv"
 """
 
+from __future__ import annotations
+
+import gzip
 import shutil
 import subprocess
 import sys
-import gzip
 from pathlib import Path
 
 import pandas as pd
 
 # ============================================================
-# CONFIG — modifica qui
+# CONFIG — edit here
 # ============================================================
 
-# Per ogni generazione: directory con i VCF filtrati, e QUALE file
-# rappresentativo usare per leggere l'header (basta un cromosoma,
-# uso quello "_filtered.vcf.gz" NON "_selected_filtered", che dovrebbe
-# contenere il set campione completo di quella generazione).
+# For each generation: directory with the filtered VCFs, and WHICH
+# representative file to use to read the header (one chromosome is
+# enough; use the "_filtered.vcf.gz" file, NOT "_selected_filtered",
+# which should contain the full sample set for that generation).
 GENERATION_VCF_DIRS = {
     "gen1": "/mnt/cresla_prod/genome_datasets/gen1/vcf_filtered",
     "gen2": "/mnt/cresla_prod/genome_datasets/gen2/vcf_filtered",
 }
 
-# Pattern del file rappresentativo da usare per estrarre i sample id
-# (viene cercato dentro GENERATION_VCF_DIRS[generazione])
-REPRESENTATIVE_CHR_PATTERN = "*_vcf_chr1_filtered.vcf.gz"  # evita '*_selected_*'
+# Pattern of the representative file used to extract sample ids
+# (looked up inside GENERATION_VCF_DIRS[generation]).
+REPRESENTATIVE_CHR_PATTERN = "*_vcf_chr1_filtered.vcf.gz"  # avoid '*_selected_*'
 
 OUTPUT_CSV = Path("output/table1/id_generation_mapping.csv")
 
 # ============================================================
 
 
-def find_representative_file(vcf_dir):
+def find_representative_file(vcf_dir) -> Path:
     vcf_dir = Path(vcf_dir)
     if not vcf_dir.exists():
-        sys.exit(f"ERRORE: directory non trovata: {vcf_dir}")
+        sys.exit(f"ERROR: directory not found: {vcf_dir}")
 
     candidates = sorted(
         p for p in vcf_dir.glob(REPRESENTATIVE_CHR_PATTERN)
         if "_selected_" not in p.name
     )
     if not candidates:
-        # fallback: qualsiasi *_filtered.vcf.gz non selected, primo trovato
+        # fallback: any *_filtered.vcf.gz that isn't "selected", first match
         candidates = sorted(
             p for p in vcf_dir.glob("*_filtered.vcf.gz")
             if "_selected_" not in p.name and not p.name.endswith(".raw.parquet")
         )
     if not candidates:
-        sys.exit(f"ERRORE: nessun VCF filtrato trovato in {vcf_dir}")
+        sys.exit(f"ERROR: no filtered VCF found in {vcf_dir}")
 
     return candidates[0]
 
 
-def extract_sample_ids_bcftools(vcf_path):
+def extract_sample_ids_bcftools(vcf_path: Path) -> list[str]:
     result = subprocess.run(
         ["bcftools", "query", "-l", str(vcf_path)],
         capture_output=True, text=True, check=True,
     )
-    ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    return ids
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def extract_sample_ids_manual(vcf_path):
-    """Fallback senza bcftools: legge riga per riga finché non trova #CHROM."""
+def extract_sample_ids_manual(vcf_path: Path) -> list[str]:
+    """Fallback without bcftools: reads line by line until it finds #CHROM."""
     with gzip.open(vcf_path, "rt") as f:
         for line in f:
             if line.startswith("#CHROM"):
                 cols = line.rstrip("\n").split("\t")
-                # colonne fisse VCF: CHROM POS ID REF ALT QUAL FILTER INFO FORMAT, poi i sample
+                # fixed VCF columns: CHROM POS ID REF ALT QUAL FILTER INFO FORMAT, then samples
                 fixed = ["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"]
                 return cols[len(fixed):]
             if not line.startswith("##") and not line.startswith("#CHROM"):
-                # header terminato senza trovare #CHROM: file anomalo
+                # header ended without finding #CHROM: malformed file
                 break
-    sys.exit(f"ERRORE: riga #CHROM non trovata nell'header di {vcf_path}")
+    sys.exit(f"ERROR: #CHROM line not found in the header of {vcf_path}")
 
 
-def extract_sample_ids(vcf_path):
+def extract_sample_ids(vcf_path: Path) -> list[str]:
     if shutil.which("bcftools"):
         try:
             return extract_sample_ids_bcftools(vcf_path)
         except subprocess.CalledProcessError as e:
-            print(f"  bcftools ha fallito ({e}), provo parsing manuale...")
+            print(f"  bcftools failed ({e}), trying manual parsing...")
     return extract_sample_ids_manual(vcf_path)
 
 
-def main():
+def run_build_cohort_mapping(output_csv: Path = OUTPUT_CSV) -> Path:
     rows = []
-    for generazione, vcf_dir in GENERATION_VCF_DIRS.items():
+    for generation, vcf_dir in GENERATION_VCF_DIRS.items():
         rep_file = find_representative_file(vcf_dir)
-        print(f"[{generazione}] uso file rappresentativo: {rep_file}")
+        print(f"[{generation}] using representative file: {rep_file}")
         sample_ids = extract_sample_ids(rep_file)
-        print(f"[{generazione}] trovati {len(sample_ids)} sample id")
+        print(f"[{generation}] found {len(sample_ids)} sample ids")
         for sid in sample_ids:
-            rows.append({"id": sid, "generazione": generazione})
+            rows.append({"id": sid, "generation": generation})
 
     if not rows:
-        sys.exit("ERRORE: nessun sample id estratto da nessuna generazione.")
+        sys.exit("ERROR: no sample ids extracted from any generation.")
 
     mapping = pd.DataFrame(rows)
 
-    # controllo duplicati id tra generazioni diverse (non dovrebbe succedere)
+    # check for ids duplicated across different generations (shouldn't happen)
     mapping["id"] = mapping["id"].str.split("_").str[0]
     dup = mapping[mapping.duplicated("id", keep=False)]
     if not dup.empty:
-        print(f"ATTENZIONE: {dup['id'].nunique()} id compaiono in più di una generazione:")
+        print(f"WARNING: {dup['id'].nunique()} id(s) appear in more than one generation:")
         print(dup.sort_values("id").to_string(index=False))
 
-    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    mapping.to_csv(OUTPUT_CSV, index=False)
-    print(f"\nMappatura salvata in: {OUTPUT_CSV.resolve()}")
-    print(mapping["generazione"].value_counts())
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    mapping.to_csv(output_csv, index=False)
+    print(f"\nMapping saved to: {output_csv.resolve()}")
+    print(mapping["generation"].value_counts())
+    return output_csv
+
+
+def main() -> None:
+    run_build_cohort_mapping()
 
 
 if __name__ == "__main__":

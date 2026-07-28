@@ -13,6 +13,9 @@ Behavior:
 - Calls the stored routine `get_significant_results_table_2()` and uses the first
   resultset returned.
 - Drops gna.* columns before producing outputs.
+- Translates the `exposure` column from the source dataset's Italian land-use
+  terms to English (see `gene_environment.report.exposure_labels`) before
+  anything is written to a table, figure, or filename.
 - Produces:
     output/table2/Table2_top10.docx
     output/table2/Table2_full_supplementary.docx   (now includes all figures embedded)
@@ -61,12 +64,18 @@ Statistical model for the per-chromosome enrichment test (both the pooled
     a meaningful "by chance" baseline for these numbers. The proportional
     model above is calibrated to the data instead and is the current,
     correct version.
+
+Note on exposure translation and DB queries: the tested-variant-count
+queries (`fetch_tested_variant_counts_by_chromosome`) filter
+`WHERE exposure = %s` against the *raw* (Italian) values stored in the
+DB, so the exposure column is only translated to English AFTER those
+queries have run, right before anything is written out for the report
+(tables, figure titles, filenames).
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -77,11 +86,25 @@ import seaborn as sns
 from docx import Document
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 from scipy.stats import binomtest
 from statsmodels.stats.multitest import multipletests
+
+from gene_environment.report.db_utils import (
+    call_stored_routine_to_df,
+    chrom_sort_key,
+    extract_chromosome,
+    normalize_chrom_label,
+    slugify,
+)
+from gene_environment.report.exposure_labels import translate_exposure, translate_exposure_value
+from gene_environment.report.word_utils import (
+    add_figure_to_doc,
+    repeat_header_row,
+    set_cell_bg,
+    set_col_width,
+    set_table_borders,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -89,8 +112,6 @@ from statsmodels.stats.multitest import multipletests
 
 OUT_DIR = Path("output/table2")
 FIG_DIR = OUT_DIR / "figures"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 ASTORE_NAME = "get_significant_results_table_2"
 
@@ -98,7 +119,7 @@ ASTORE_NAME = "get_significant_results_table_2"
 # NOTE: "empirical_p_2" (no "g") is kept exactly as in the original script.
 # Every other column follows the "_g1"/"_g2" convention, so this looks like it
 # could be a typo for "empirical_p_g2" -- please confirm against the real
-# astore output before I rename it, otherwise the column will silently come
+# astore output before renaming it, otherwise the column will silently come
 # back empty in the report.
 TABLE_COLUMNS = [
     "exposure",
@@ -155,46 +176,6 @@ SIG_FONT_COLOR = RGBColor(0xC0, 0x00, 0x00)  # highlight p < alpha
 # docx table helpers
 # ---------------------------------------------------------------------------
 
-def _set_cell_bg(cell, color_hex: str) -> None:
-    """Set background color of a table cell (hex without #)."""
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    shd = OxmlElement("w:shd")
-    shd.set(qn("w:val"), "clear")
-    shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"), color_hex)
-    tcPr.append(shd)
-
-
-def _set_col_width(cell, width_inches: float) -> None:
-    """Set a table cell's width. Word column widths (w:type='dxa') are
-    expressed in twips (1/1440 inch) -- NOT EMU (1/914400 inch). The
-    original script multiplied by 914400, which produced widths ~635x too
-    large and likely made Word ignore/garble the layout.
-    """
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    tcW = OxmlElement("w:tcW")
-    tcW.set(qn("w:w"), str(int(width_inches * 1440)))  # twips
-    tcW.set(qn("w:type"), "dxa")
-    tcPr.append(tcW)
-
-
-def _set_table_borders(table, color_hex: str = "BFBFBF", size: int = 4) -> None:
-    """Apply thin, consistent borders to the whole table."""
-    tbl = table._tbl
-    tblPr = tbl.tblPr
-    borders = OxmlElement("w:tblBorders")
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-        el = OxmlElement(f"w:{edge}")
-        el.set(qn("w:val"), "single")
-        el.set(qn("w:sz"), str(size))
-        el.set(qn("w:space"), "0")
-        el.set(qn("w:color"), color_hex)
-        borders.append(el)
-    tblPr.append(borders)
-
-
 def add_table_to_doc(
     doc: Document,
     df: pd.DataFrame,
@@ -227,7 +208,7 @@ def add_table_to_doc(
     table = doc.add_table(rows=1, cols=len(TABLE_COLUMNS))
     table.style = "Table Grid"
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    _set_table_borders(table)
+    set_table_borders(table)
 
     # Header row
     hdr_cells = table.rows[0].cells
@@ -239,8 +220,8 @@ def add_table_to_doc(
         run.font.color.rgb = HEADER_FONT_COLOR
         p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
         hdr_cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-        _set_cell_bg(hdr_cells[i], HEADER_FILL)
-        _set_col_width(hdr_cells[i], COL_WIDTHS_IN.get(col, 1.0))
+        set_cell_bg(hdr_cells[i], HEADER_FILL)
+        set_col_width(hdr_cells[i], COL_WIDTHS_IN.get(col, 1.0))
 
     # Data rows
     for ridx, (_, row) in enumerate(df_to_use.iterrows()):
@@ -250,7 +231,7 @@ def add_table_to_doc(
             raw_val = row.get(col, pd.NA)
             text = format_value_for_word(col, raw_val)
             cell = cells[i]
-            _set_col_width(cell, COL_WIDTHS_IN.get(col, 1.0))
+            set_col_width(cell, COL_WIDTHS_IN.get(col, 1.0))
             para = cell.paragraphs[0]
             para.alignment = (
                 WD_PARAGRAPH_ALIGNMENT.RIGHT
@@ -265,14 +246,9 @@ def add_table_to_doc(
                 run.font.color.rgb = SIG_FONT_COLOR
 
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-            _set_cell_bg(cell, shade)
+            set_cell_bg(cell, shade)
 
-    # Repeat header row on each page
-    first_tr = table.rows[0]._tr
-    trPr = first_tr.get_or_add_trPr()
-    tbl_header = OxmlElement("w:tblHeader")
-    tbl_header.set(qn("w:val"), "true")
-    trPr.append(tbl_header)
+    repeat_header_row(table)
 
     if caption:
         cap = doc.add_paragraph(caption)
@@ -285,19 +261,6 @@ def _is_significant(val, alpha: float) -> bool:
         return pd.notna(val) and float(val) < alpha
     except (TypeError, ValueError):
         return False
-
-
-def add_figure_to_doc(doc: Document, fig_path: Path, caption: str, width_in: float = 6.0) -> None:
-    """Embed a figure (if it exists) into the document with a caption below it."""
-    if not fig_path.exists():
-        return
-    doc.add_picture(str(fig_path), width=Inches(width_in))
-    last_paragraph = doc.paragraphs[-1]
-    last_paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-    cap = doc.add_paragraph(caption)
-    cap.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-    cap.runs[0].italic = True
-    cap.runs[0].font.size = Pt(9)
 
 
 def add_pvalue_table_to_doc(
@@ -333,7 +296,7 @@ def add_pvalue_table_to_doc(
     table = doc.add_table(rows=1, cols=len(cols))
     table.style = "Table Grid"
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    _set_table_borders(table)
+    set_table_borders(table)
 
     hdr_cells = table.rows[0].cells
     for i, col in enumerate(cols):
@@ -344,7 +307,7 @@ def add_pvalue_table_to_doc(
         run.font.color.rgb = HEADER_FONT_COLOR
         p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
         hdr_cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-        _set_cell_bg(hdr_cells[i], HEADER_FILL)
+        set_cell_bg(hdr_cells[i], HEADER_FILL)
 
     for ridx, (_, row) in enumerate(df[cols].iterrows()):
         cells = table.add_row().cells
@@ -363,13 +326,9 @@ def add_pvalue_table_to_doc(
                 run.bold = True
                 run.font.color.rgb = SIG_FONT_COLOR
             cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-            _set_cell_bg(cells[i], shade)
+            set_cell_bg(cells[i], shade)
 
-    first_tr = table.rows[0]._tr
-    trPr = first_tr.get_or_add_trPr()
-    tbl_header = OxmlElement("w:tblHeader")
-    tbl_header.set(qn("w:val"), "true")
-    trPr.append(tbl_header)
+    repeat_header_row(table)
 
     if caption:
         cap = doc.add_paragraph(caption)
@@ -380,49 +339,6 @@ def add_pvalue_table_to_doc(
 # ---------------------------------------------------------------------------
 # Data access
 # ---------------------------------------------------------------------------
-
-def call_stored_routine_to_df(astore_name: str, get_connection, cursor_scope) -> pd.DataFrame:
-    """
-    Call the stored routine `astore_name()` and return a pandas DataFrame built
-    from the first resultset. Handles drivers that require iterating nextset().
-    """
-    rows: List[dict] = []
-
-    with get_connection() as conn:
-        with cursor_scope(conn, dictionary=True) as cur:
-            try:
-                cur.execute(f"CALL {astore_name}()")
-            except Exception as e:
-                raise RuntimeError(f"Failed to CALL {astore_name}(). DB error: {e}") from e
-
-            try:
-                fetched = cur.fetchall()
-                if fetched:
-                    rows = fetched
-            except Exception as e:
-                print(f"[warn] initial fetchall() failed, will try nextset(): {e}", file=sys.stderr)
-                rows = []
-
-            try:
-                while (not rows) and cur.nextset():
-                    try:
-                        fetched = cur.fetchall()
-                        if fetched:
-                            rows = fetched
-                            break
-                    except Exception as e:
-                        print(f"[warn] fetchall() on a later resultset failed: {e}", file=sys.stderr)
-                        continue
-            except Exception as e:
-                print(f"[warn] nextset() not supported by this driver: {e}", file=sys.stderr)
-
-    if not rows:
-        return pd.DataFrame(columns=TABLE_COLUMNS)
-
-    df = pd.DataFrame(rows)
-    df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
-    return df
-
 
 def drop_gna_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Drop gna.* columns if present."""
@@ -435,18 +351,6 @@ def drop_gna_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=to_drop, errors="ignore") if to_drop else df
 
 
-def _normalize_chrom_label(chrom) -> str:
-    """Same normalization as `extract_chromosome`'s tail, applied to a raw
-    DB chromosome value so DB counts and variant-string-derived chromosomes
-    are guaranteed to line up (e.g. 'chr1' / '1' both become '1')."""
-    if chrom is None:
-        return "NA"
-    c = str(chrom).lower().lstrip("chr")
-    if c.isalpha():
-        c = c.upper()
-    return c
-
-
 def fetch_tested_variant_counts_by_chromosome(get_connection, cursor_scope, exposure: str, generation: int) -> Dict[str, int]:
     """
     Tested-variant counts per chromosome for a single exposure, mirroring:
@@ -454,6 +358,8 @@ def fetch_tested_variant_counts_by_chromosome(get_connection, cursor_scope, expo
         FROM variant_results
         WHERE exposure = <exposure> AND generation = <generation>
         GROUP BY chromosome
+    `exposure` must be the RAW (source-language) value here, since it is
+    matched against the DB, not the translated display label.
     """
     sql = (
         "SELECT chromosome, COUNT(*) "
@@ -468,7 +374,7 @@ def fetch_tested_variant_counts_by_chromosome(get_connection, cursor_scope, expo
             for chrom, cnt in cur.fetchall():
                 if chrom is None:
                     continue
-                label = _normalize_chrom_label(chrom)
+                label = normalize_chrom_label(chrom)
                 counts[label] = counts.get(label, 0) + int(cnt)
     return counts
 
@@ -495,26 +401,6 @@ def fetch_tested_variant_counts_for_exposures(get_connection, cursor_scope, expo
 # Formatting / parsing helpers
 # ---------------------------------------------------------------------------
 
-def extract_chromosome(variant: str) -> str:
-    """
-    Extract chromosome from variant strings like:
-      - chr1:12345_A/T
-      - 1:12345_A/T
-      - chrX:...
-      - X:...
-    """
-    if pd.isna(variant):
-        return "NA"
-    if not isinstance(variant, str):
-        variant = str(variant)
-    m = re.match(r"^(?:chr)?([^:]+):", variant, flags=re.IGNORECASE)
-    chrom = m.group(1) if m else re.split(r"[:_\-]", variant)[0]
-    chrom = chrom.lower().lstrip("chr")
-    if chrom.isalpha():
-        chrom = chrom.upper()
-    return chrom
-
-
 def format_value_for_word(col: str, val) -> str:
     """empirical_p_*: 3 significant digits; obs_coef_*: 2 decimals; else str()."""
     if pd.isna(val):
@@ -533,7 +419,7 @@ def format_value_for_word(col: str, val) -> str:
 # Figures
 # ---------------------------------------------------------------------------
 
-def make_figures(df: pd.DataFrame) -> None:
+def make_figures(df: pd.DataFrame, fig_dir: Path) -> None:
     """Chromosome-level descriptive figures (unchanged grouping)."""
     df = df.copy()
     df["chromosome"] = df["variant"].apply(lambda v: extract_chromosome(v) if pd.notna(v) else "NA")
@@ -541,12 +427,6 @@ def make_figures(df: pd.DataFrame) -> None:
     variants_per_chrom = df.groupby("chromosome")["variant"].nunique().rename("n_variants").reset_index()
     genes_per_chrom = df.groupby("chromosome")["exposure"].nunique().rename("n_genes").reset_index()
     merged = pd.merge(variants_per_chrom, genes_per_chrom, on="chromosome", how="outer").fillna(0)
-
-    def chrom_sort_key(ch):
-        try:
-            return (0, int(ch))
-        except ValueError:
-            return (1, ch)
 
     merged = merged.sort_values(by="chromosome", key=lambda s: s.map(chrom_sort_key))
 
@@ -559,7 +439,7 @@ def make_figures(df: pd.DataFrame) -> None:
     ax.set_title("Variants per chromosome")
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig(FIG_DIR / "variants_per_chromosome.png", dpi=300)
+    plt.savefig(fig_dir / "variants_per_chromosome.png", dpi=300)
     plt.close()
 
     plt.figure(figsize=(8, 6))
@@ -571,12 +451,12 @@ def make_figures(df: pd.DataFrame) -> None:
     ax.set_ylabel("Number of unique variants per chromosome")
     ax.set_title("Genes vs variants per chromosome")
     plt.tight_layout()
-    plt.savefig(FIG_DIR / "genes_vs_variants_scatter.png", dpi=300)
+    plt.savefig(fig_dir / "genes_vs_variants_scatter.png", dpi=300)
     plt.close()
 
     plt.figure(figsize=(8, 5))
     pvals = pd.to_numeric(df.get("empirical_p_g1", pd.Series(dtype=float)), errors="coerce").dropna()
-    hist_path = FIG_DIR / "empirical_p_g1_histogram.png"
+    hist_path = fig_dir / "empirical_p_g1_histogram.png"
     if not pvals.empty:
         ax = sns.histplot(pvals, bins=50, kde=False, color="#548235")
         ax.set_xlabel("empirical_p_g1")
@@ -596,19 +476,6 @@ def _empty_placeholder_figure(path: Path, message: str) -> None:
     plt.axis("off")
     plt.savefig(path, dpi=300)
     plt.close()
-
-
-def _slugify(text) -> str:
-    """Turn an exposure name into a filesystem-safe filename fragment."""
-    s = re.sub(r"[^0-9A-Za-z_\-]+", "_", str(text)).strip("_")
-    return s or "exposure"
-
-
-def _chrom_sort_key(ch):
-    try:
-        return (0, int(ch))
-    except ValueError:
-        return (1, ch)
 
 
 def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
@@ -670,18 +537,9 @@ def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
 
 
 def _draw_chrom_bars(ax, merged: pd.DataFrame, title: str) -> None:
-    """Draw one observed-vs-expected-per-chromosome panel on `ax`.
-    Chromosomes with 0 observed significant variants still get a (zero-height)
-    bar. No in-plot highlighting of which variants are significant -- that
-    detail lives in the accompanying CSV (`sig_variants` column)."""
-    if merged.empty:
-        ax.text(0.5, 0.5, "No tested variants", ha="center", va="center", transform=ax.transAxes)
-        ax.set_title(title, fontsize=10)
-        ax.axis("off")
-        return
-
-    x_labels = merged["chromosome"].astype(str)
-    xi = range(len(merged))
+    """Draw one observed-vs-expected-per-chromosome panel on `ax`."""
+    x_labels = merged["chromosome"].astype(str).tolist()
+    xi = range(len(x_labels))
     bar_w = 0.4
 
     ax.bar([i - bar_w / 2 for i in xi], merged["n_significant_observed"], width=bar_w,
@@ -761,7 +619,7 @@ def compute_chromosome_enrichment_global(
     # pooled test on the totals would be tautological. The real answer to
     # "is there chromosome-level concentration of hits" lives in the
     # per-chromosome binom_p / binom_p_adj columns.
-    merged = merged.sort_values(by="chromosome", key=lambda s: s.map(_chrom_sort_key))
+    merged = merged.sort_values(by="chromosome", key=lambda s: s.map(chrom_sort_key))
     merged.to_csv(stats_path, index=False)
 
     plt.figure(figsize=(max(8, 0.5 * len(merged)), 6))
@@ -801,6 +659,10 @@ def compute_chromosome_enrichment_by_exposure(
     Exposures with no tested-variant rows for this generation are skipped
     (nothing to compare against); exposures with tested variants but zero
     significant hits still get a panel, with every bar at zero height.
+
+    Chart titles and filenames use the English exposure label
+    (translate_exposure_value); grouping/matching against `df` and
+    `tested_df` still uses the raw exposure value passed in from `main`.
     """
     fig_path = out_dir / "figures" / "observed_vs_expected_by_chromosome_per_exposure.png"
     stats_path = out_dir / "table2_chromosome_enrichment_by_exposure_stats.csv"
@@ -840,7 +702,7 @@ def compute_chromosome_enrichment_by_exposure(
         merged["n_tested"] = merged["n_tested"].astype(int)
 
         merged = _add_binomial_enrichment_stats(merged)
-        merged = merged.sort_values(by="chromosome", key=lambda s: s.map(_chrom_sort_key))
+        merged = merged.sort_values(by="chromosome", key=lambda s: s.map(chrom_sort_key))
         merged["exposure"] = exposure
 
         per_exposure_tables[exposure] = merged
@@ -867,11 +729,12 @@ def compute_chromosome_enrichment_by_exposure(
     individual_paths = []
     individual_csv_paths = []
     for exposure, merged in per_exposure_tables.items():
-        slug = _slugify(exposure)
+        label = translate_exposure_value(exposure)
+        slug = slugify(label)
 
         indiv_path = by_exposure_dir / f"observed_vs_expected_chrom_{slug}.png"
         plt.figure(figsize=(max(6, 0.6 * len(merged)), 4.5))
-        _draw_chrom_bars(plt.gca(), merged, title=str(exposure))
+        _draw_chrom_bars(plt.gca(), merged, title=str(label))
         plt.tight_layout()
         plt.savefig(indiv_path, dpi=200)
         plt.close()
@@ -888,7 +751,7 @@ def compute_chromosome_enrichment_by_exposure(
     fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.6 * nrows), squeeze=False)
     for idx, (exposure, merged) in enumerate(per_exposure_tables.items()):
         r, c = divmod(idx, ncols)
-        _draw_chrom_bars(axes[r][c], merged, title=str(exposure))
+        _draw_chrom_bars(axes[r][c], merged, title=str(translate_exposure_value(exposure)))
     for idx in range(n, nrows * ncols):
         r, c = divmod(idx, ncols)
         axes[r][c].axis("off")
@@ -910,8 +773,124 @@ def compute_chromosome_enrichment_by_exposure(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main (callable, reusable from the report runner and the CLI)
 # ---------------------------------------------------------------------------
+
+def run_table2(generation: int = 2, alpha: float = SIG_ALPHA_DEFAULT, out_dir: Path = OUT_DIR) -> None:
+    from gene_environment.db.connection import cursor_scope, get_connection
+
+    out_dir = Path(out_dir)
+    fig_dir = out_dir / "figures"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Calling stored routine: {ASTORE_NAME}() ...")
+    df = call_stored_routine_to_df(ASTORE_NAME, get_connection, cursor_scope, columns=TABLE_COLUMNS)
+    df = drop_gna_columns(df)
+    for c in TABLE_COLUMNS:
+        if c not in df.columns:
+            df[c] = pd.NA
+
+    make_figures(df, fig_dir)
+
+    # Raw (source-language) exposure values, needed to query the DB below.
+    raw_exposures = sorted(df["exposure"].dropna().unique().tolist())
+    tested_df = fetch_tested_variant_counts_for_exposures(get_connection, cursor_scope, raw_exposures, generation)
+
+    chrom_stats_df, chrom_summary = compute_chromosome_enrichment_global(
+        df, tested_df, alpha=alpha, out_dir=out_dir
+    )
+    print("Chromosome enrichment summary (all exposures):", chrom_summary)
+
+    chrom_by_exposure_df, chrom_by_exposure_summary = compute_chromosome_enrichment_by_exposure(
+        df, tested_df, alpha=alpha, out_dir=out_dir
+    )
+    print("Chromosome enrichment summary (by exposure):",
+          {k: v for k, v in chrom_by_exposure_summary.items() if k != "per_exposure_tables"})
+
+    # Every DB-dependent computation above needed the raw exposure values;
+    # from here on only display (tables/captions) is left, so translate now.
+    df = translate_exposure(df)
+
+    # --- Table 2 (top 10) ---
+    doc_top10 = Document()
+    doc_top10.add_heading("Table 2. Significant variants (top 10)", level=1)
+    doc_top10.add_paragraph(
+        "Table shows the top 10 significant variants from get_significant_results_table_2. "
+        "p-values highlighted in red are below the significance threshold "
+        f"(alpha = {alpha}). gna.* columns omitted."
+    )
+    add_table_to_doc(doc_top10, df, max_rows=10, alpha=alpha)
+    top10_path = out_dir / "Table2_top10.docx"
+    doc_top10.save(top10_path)
+
+    # --- Supplementary Word (full results + all figures) ---
+    doc_full = Document()
+    doc_full.add_heading("Supplementary Table: full results", level=1)
+    doc_full.add_paragraph(
+        "Full results from get_significant_results_table_2. All rows included. "
+        "gna.* columns omitted from the table but available in the database."
+    )
+    add_table_to_doc(doc_full, df, alpha=alpha)
+
+    doc_full.add_heading("Figures", level=1)
+    add_figure_to_doc(doc_full, fig_dir / "variants_per_chromosome.png",
+                       "Figure 1. Number of unique variants per chromosome.")
+    add_figure_to_doc(doc_full, fig_dir / "genes_vs_variants_scatter.png",
+                       "Figure 2. Genes vs variants per chromosome.")
+    add_figure_to_doc(doc_full, fig_dir / "empirical_p_g1_histogram.png",
+                       "Figure 3. Distribution of empirical_p_g1.")
+    add_figure_to_doc(doc_full, fig_dir / "observed_vs_expected_by_chromosome.png",
+                       "Figure 4. Observed vs expected significant variants per chromosome, all exposures pooled "
+                       f"(generation {generation}). Expected = n_tested \u00d7 (total significant / total "
+                       "tested, pooled across all exposures); p-values from a one-sided binomial test, "
+                       "BH-adjusted across chromosomes.")
+    add_figure_to_doc(doc_full, fig_dir / "observed_vs_expected_by_chromosome_per_exposure.png",
+                       "Figure 5. Observed vs expected significant variants per chromosome, one panel per exposure "
+                       f"(generation {generation}). Same proportional null model as Figure 4, but computed "
+                       "independently for each exposure (using that exposure's own significance rate).",
+                       width_in=6.5)
+
+    # --- Per-exposure enrichment tables (chromosome-by-chromosome p-values) ---
+    per_exposure_tables = chrom_by_exposure_summary.get("per_exposure_tables", {})
+    if per_exposure_tables:
+        doc_full.add_heading("Per-exposure chromosome enrichment", level=1)
+        doc_full.add_paragraph(
+            f"For each exposure and chromosome: n_tested variants (COUNT(*) FROM variant_results "
+            f"WHERE exposure=... AND generation={generation} GROUP BY chromosome), the number "
+            f"found significant (empirical_p_g1 < {alpha}), the expected count under a "
+            "proportional-allocation null (n_tested \u00d7 the exposure's own overall significance "
+            "rate, i.e. that exposure's total significant / total tested), and a one-sided binomial "
+            f"p-value testing chromosome-level concentration of hits (BH-adjusted within each "
+            f"exposure). Adjusted p-values below {alpha} are highlighted."
+        )
+        for exposure, merged in per_exposure_tables.items():
+            label = translate_exposure_value(exposure)
+            add_pvalue_table_to_doc(
+                doc_full, merged,
+                title=f"Exposure: {label}",
+                caption=f"Chromosome-level enrichment for {label} (generation {generation}).",
+                alpha=alpha,
+            )
+            slug = slugify(label)
+            add_figure_to_doc(
+                doc_full, fig_dir / "by_exposure" / f"observed_vs_expected_chrom_{slug}.png",
+                f"Observed vs expected significant variants per chromosome -- {label}.",
+                width_in=5.5,
+            )
+
+    full_path = out_dir / "Table2_full_supplementary.docx"
+    doc_full.save(full_path)
+
+    print("Done.")
+    print(f"Top 10 Word: {top10_path}")
+    print(f"Full supplementary Word: {full_path}")
+    print(f"Figures saved in: {fig_dir}")
+    print(f"Chromosome enrichment CSV (pooled): {chrom_summary['per_chromosome_csv']}")
+    print(f"Chromosome enrichment CSV (by exposure, combined): {chrom_by_exposure_summary['per_exposure_csv']}")
+    print(f"Per-exposure figures + p-value CSVs ({chrom_by_exposure_summary['n_exposures_plotted']}): "
+          f"{fig_dir / 'by_exposure'}")
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Generate Table 2 report (Word + figures).")
@@ -924,110 +903,8 @@ def parse_args():
 
 
 def main():
-    from gene_environment.db.connection import cursor_scope, get_connection
-
     args = parse_args()
-
-    print(f"Calling stored routine: {ASTORE_NAME}() ...")
-    df = call_stored_routine_to_df(ASTORE_NAME, get_connection, cursor_scope)
-    df = drop_gna_columns(df)
-    for c in TABLE_COLUMNS:
-        if c not in df.columns:
-            df[c] = pd.NA
-
-    make_figures(df)
-
-    exposures = sorted(df["exposure"].dropna().unique().tolist())
-    tested_df = fetch_tested_variant_counts_for_exposures(get_connection, cursor_scope, exposures, args.generation)
-
-    chrom_stats_df, chrom_summary = compute_chromosome_enrichment_global(
-        df, tested_df, alpha=args.alpha, out_dir=OUT_DIR
-    )
-    print("Chromosome enrichment summary (all exposures):", chrom_summary)
-
-    chrom_by_exposure_df, chrom_by_exposure_summary = compute_chromosome_enrichment_by_exposure(
-        df, tested_df, alpha=args.alpha, out_dir=OUT_DIR
-    )
-    print("Chromosome enrichment summary (by exposure):",
-          {k: v for k, v in chrom_by_exposure_summary.items() if k != "per_exposure_tables"})
-
-    # --- Table 2 (top 10) ---
-    doc_top10 = Document()
-    doc_top10.add_heading("Table 2. Significant variants (top 10)", level=1)
-    doc_top10.add_paragraph(
-        "Table shows the top 10 significant variants from get_significant_results_table_2. "
-        "p-values highlighted in red are below the significance threshold "
-        f"(alpha = {args.alpha}). gna.* columns omitted."
-    )
-    add_table_to_doc(doc_top10, df, max_rows=10, alpha=args.alpha)
-    top10_path = OUT_DIR / "Table2_top10.docx"
-    doc_top10.save(top10_path)
-
-    # --- Supplementary Word (full results + all figures) ---
-    doc_full = Document()
-    doc_full.add_heading("Supplementary Table: full results", level=1)
-    doc_full.add_paragraph(
-        "Full results from get_significant_results_table_2. All rows included. "
-        "gna.* columns omitted from the table but available in the database."
-    )
-    add_table_to_doc(doc_full, df, alpha=args.alpha)
-
-    doc_full.add_heading("Figures", level=1)
-    add_figure_to_doc(doc_full, FIG_DIR / "variants_per_chromosome.png",
-                       "Figure 1. Number of unique variants per chromosome.")
-    add_figure_to_doc(doc_full, FIG_DIR / "genes_vs_variants_scatter.png",
-                       "Figure 2. Genes vs variants per chromosome.")
-    add_figure_to_doc(doc_full, FIG_DIR / "empirical_p_g1_histogram.png",
-                       "Figure 3. Distribution of empirical_p_g1.")
-    add_figure_to_doc(doc_full, FIG_DIR / "observed_vs_expected_by_chromosome.png",
-                       "Figure 4. Observed vs expected significant variants per chromosome, all exposures pooled "
-                       f"(generation {args.generation}). Expected = n_tested \u00d7 (total significant / total "
-                       "tested, pooled across all exposures); p-values from a one-sided binomial test, "
-                       "BH-adjusted across chromosomes.")
-    add_figure_to_doc(doc_full, FIG_DIR / "observed_vs_expected_by_chromosome_per_exposure.png",
-                       "Figure 5. Observed vs expected significant variants per chromosome, one panel per exposure "
-                       f"(generation {args.generation}). Same proportional null model as Figure 4, but computed "
-                       "independently for each exposure (using that exposure's own significance rate).",
-                       width_in=6.5)
-
-    # --- Per-exposure enrichment tables (chromosome-by-chromosome p-values) ---
-    per_exposure_tables = chrom_by_exposure_summary.get("per_exposure_tables", {})
-    if per_exposure_tables:
-        doc_full.add_heading("Per-exposure chromosome enrichment", level=1)
-        doc_full.add_paragraph(
-            f"For each exposure and chromosome: n_tested variants (COUNT(*) FROM variant_results "
-            f"WHERE exposure=... AND generation={args.generation} GROUP BY chromosome), the number "
-            f"found significant (empirical_p_g1 < {args.alpha}), the expected count under a "
-            "proportional-allocation null (n_tested \u00d7 the exposure's own overall significance "
-            "rate, i.e. that exposure's total significant / total tested), and a one-sided binomial "
-            f"p-value testing chromosome-level concentration of hits (BH-adjusted within each "
-            f"exposure). Adjusted p-values below {args.alpha} are highlighted."
-        )
-        for exposure, merged in per_exposure_tables.items():
-            add_pvalue_table_to_doc(
-                doc_full, merged,
-                title=f"Exposure: {exposure}",
-                caption=f"Chromosome-level enrichment for {exposure} (generation {args.generation}).",
-                alpha=args.alpha,
-            )
-            slug = _slugify(exposure)
-            add_figure_to_doc(
-                doc_full, FIG_DIR / "by_exposure" / f"observed_vs_expected_chrom_{slug}.png",
-                f"Observed vs expected significant variants per chromosome -- {exposure}.",
-                width_in=5.5,
-            )
-
-    full_path = OUT_DIR / "Table2_full_supplementary.docx"
-    doc_full.save(full_path)
-
-    print("Done.")
-    print(f"Top 10 Word: {top10_path}")
-    print(f"Full supplementary Word: {full_path}")
-    print(f"Figures saved in: {FIG_DIR}")
-    print(f"Chromosome enrichment CSV (pooled): {chrom_summary['per_chromosome_csv']}")
-    print(f"Chromosome enrichment CSV (by exposure, combined): {chrom_by_exposure_summary['per_exposure_csv']}")
-    print(f"Per-exposure figures + p-value CSVs ({chrom_by_exposure_summary['n_exposures_plotted']}): "
-          f"{FIG_DIR / 'by_exposure'}")
+    run_table2(generation=args.generation, alpha=args.alpha)
 
 
 if __name__ == "__main__":
