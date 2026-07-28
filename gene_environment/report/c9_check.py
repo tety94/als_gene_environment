@@ -210,12 +210,17 @@ def main():
             f"La colonna 'parals_codals' non esiste in {CODICE_GEN_FILE}. "
             f"Colonne disponibili: {list(codice_gen_df.columns)}"
         )
+    if "mutaz" not in codice_gen_df.columns:
+        raise KeyError(
+            f"La colonna 'mutaz' non esiste in {CODICE_GEN_FILE}. "
+            f"Colonne disponibili: {list(codice_gen_df.columns)}"
+        )
 
     codice_gen_df["corretto"] = codice_gen_df["corretto"].astype(str)
     merged[ID_COL_RAW] = merged[ID_COL_RAW].astype(str)
 
     merged = merged.merge(
-        codice_gen_df[["corretto", "parals_codals"]],
+        codice_gen_df[["corretto", "parals_codals", "mutaz"]],
         left_on=ID_COL_RAW,
         right_on="corretto",
         how="left",  # tiene tutte le righe di merged anche senza match
