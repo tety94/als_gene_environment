@@ -1,22 +1,27 @@
 """
 generation_stats.py
 
-For each generation (1 and 2):
-  - for each variant column (0/1), split the cohort into group 0 vs group 1
-  - run statistical tests against: sex, onset_site, diagnostic_delay,
-    education_years, survival, survival_null (missingness), mutaz_bin
-  - save a CSV with all results (raw p-value always included)
-  - generate plots for results significant after Bonferroni correction
-  - generate a Word report (per generation)
+For each environmental component E (e.g. seminativi_1500, risaie_1500,
+vigneti_1500):
+  1. Restrict the cohort to "close" samples only (E > 0).
+  2. Use ONLY the variants that get_annotated_results() associated with
+     that specific exposure (variant_exposure_map.json, built by
+     build_c9_check.py).
+  3. Within that restricted cohort, for each variant column (0/1), split
+     mutated vs non-mutated and test against: sex, onset_site,
+     diagnostic_delay, education_years, survival, survival_null, mutaz_bin
+     (mutaz_bin / C9ORF72 is treated like the other variables here, but
+     also gets its own advanced dedicated report).
+  4. Everything is still split by generation (1 / 2), with a combined
+     section that is the union of the two generations' significant
+     results (no re-running of stats on pooled data).
 
-It also produces:
-  - a "combined" Word report: Generation 1 section + Generation 2 section,
-    each showing its own significant results, followed by a "Combined"
-    section that is the UNION of the two generations' significant results
-    (simple concatenation, no re-running of stats on pooled data).
-  - a dedicated C9 report (mutaz_bin vs every variant), with a Generation 1
-    section, a Generation 2 section (ALL variants, regardless of
-    significance), and a Combined section that is the union of both.
+Output layout per component E:
+  stats/by_exposure/E/gen{1,2}_variant_stats.csv
+  stats/by_exposure/E/plots/...
+  stats/by_exposure/E/reports/gen{1,2}_report.docx
+  stats/by_exposure/E/reports/combined_report.docx
+  stats/by_exposure/E/reports/c9_report.docx (+ c9 CSVs/plots)
 
 All output (logs, docx content, column headers) is in English.
 """
@@ -40,13 +45,10 @@ log = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 OUT_DIR = Path("/mnt/cresla_prod/stefano_ge/c9_check")
 MERGED_CSV = OUT_DIR / "c9_check_merged.csv"
-VARIANT_COLS_FILE = OUT_DIR / "variant_columns.json"
+VARIANT_EXPOSURE_MAP_FILE = OUT_DIR / "variant_exposure_map.json"
 
 STATS_DIR = OUT_DIR / "stats"
-PLOTS_DIR = STATS_DIR / "plots"
-REPORTS_DIR = STATS_DIR / "reports"
-C9_DIR = STATS_DIR / "c9_report"
-C9_PLOTS_DIR = C9_DIR / "plots"
+BY_EXPOSURE_DIR = STATS_DIR / "by_exposure"
 
 ID_COL = "id"
 GENERATION_COL = "generation"
@@ -69,16 +71,36 @@ CONTINUOUS_VARS = [DIAGNOSTIC_DELAY_COL, EDUCATION_YEARS_COL, SURVIVAL_COL]
 # ----------------------------------------------------------------------
 def load_data():
     df = pd.read_csv(MERGED_CSV)
-    with open(VARIANT_COLS_FILE) as f:
-        variant_cols = json.load(f)
-    variant_cols = [c for c in variant_cols if c in df.columns]
+    with open(VARIANT_EXPOSURE_MAP_FILE) as f:
+        variant_exposure_map = json.load(f)  # {column_name: [exposure, ...]}
 
     df["mutaz_bin"] = df[MUTAZ_RAW_COL].astype(str).str.contains("C9ORF72", na=False).astype(int)
     df["survival_null"] = df[SURVIVAL_COL].isna()
     df[EDUCATION_YEARS_COL] = pd.to_numeric(df[EDUCATION_YEARS_COL], errors="coerce").astype("Int64")
 
-    log.info("Data loaded: %d rows, %d variant columns", len(df), len(variant_cols))
-    return df, variant_cols
+    log.info("Data loaded: %d rows, %d variant columns in exposure map", len(df), len(variant_exposure_map))
+    return df, variant_exposure_map
+
+
+def get_components(variant_exposure_map: dict, df_columns) -> dict:
+    """Returns {exposure: [variant_columns...]} restricted to exposures
+    that also exist as a column in the merged dataframe (needed to define
+    'close' vs 'far'). Logs a warning for exposures without a matching
+    column."""
+    exposure_to_variants = {}
+    for col, exposures in variant_exposure_map.items():
+        for exp in exposures:
+            exposure_to_variants.setdefault(exp, []).append(col)
+
+    valid = {}
+    for exp, cols in exposure_to_variants.items():
+        if exp in df_columns:
+            valid[exp] = sorted(set(cols))
+        else:
+            log.warning("Exposure '%s' has %d variants but no matching column in the merged CSV, skipping.", exp, len(cols))
+
+    log.info("Environmental components found: %s", list(valid.keys()))
+    return valid
 
 
 # ----------------------------------------------------------------------
@@ -121,13 +143,16 @@ def test_continuous(df: pd.DataFrame, group_col: str, var_col: str) -> dict:
 
 
 def run_tests_for_generation(df_gen: pd.DataFrame, variant_cols: list) -> pd.DataFrame:
+    """df_gen must already be restricted to the 'close' cohort (exposure > 0)
+    and to a single generation. variant_cols must already be restricted to
+    the variants relevant for the current exposure."""
     rows = []
     for variant in variant_cols:
         if variant not in df_gen.columns:
             continue
         group = df_gen[variant]
         if group.dropna().nunique() < 2:
-            continue  # monomorphic variant in this generation, skip
+            continue  # monomorphic variant in this subset, skip
 
         for var_col in CATEGORICAL_VARS:
             res = test_categorical(df_gen.assign(_grp=group), "_grp", var_col)
@@ -139,11 +164,11 @@ def run_tests_for_generation(df_gen: pd.DataFrame, variant_cols: list) -> pd.Dat
 
     results = pd.DataFrame(rows)
 
-    # Bonferroni correction: pvalue_bonf = min(1, pvalue * n_tests_run)
-    # n_tests_run = number of tests with an actual computed p-value
-    # (excludes 'n/a' rows from groups that were too small/missing).
-    n_tests = int(results["pvalue"].notna().sum())
-    results["pvalue_bonf"] = (results["pvalue"] * n_tests).clip(upper=1.0)
+    n_tests = int(results["pvalue"].notna().sum()) if not results.empty else 0
+    if n_tests > 0:
+        results["pvalue_bonf"] = (results["pvalue"] * n_tests).clip(upper=1.0)
+    else:
+        results["pvalue_bonf"] = pd.Series(dtype=float)
     results.attrs["n_tests"] = n_tests
     log.info("Bonferroni correction applied over %d tests run", n_tests)
 
@@ -151,7 +176,6 @@ def run_tests_for_generation(df_gen: pd.DataFrame, variant_cols: list) -> pd.Dat
 
 
 def bonferroni_threshold(results: pd.DataFrame) -> float:
-    """Raw p-value threshold equivalent to pvalue_bonf < ALPHA."""
     n_tests = results.attrs.get("n_tests") or int(results["pvalue"].notna().sum())
     if n_tests == 0:
         return 0.0
@@ -161,12 +185,12 @@ def bonferroni_threshold(results: pd.DataFrame) -> float:
 # ----------------------------------------------------------------------
 # Plots
 # ----------------------------------------------------------------------
-def plot_categorical(df_gen: pd.DataFrame, variant: str, var_col: str, generation: int, out_path: Path):
+def plot_categorical(df_gen: pd.DataFrame, variant: str, var_col: str, label: str, out_path: Path):
     sub = df_gen[[variant, var_col]].dropna()
     prop = pd.crosstab(sub[variant], sub[var_col], normalize="index")
     fig, ax = plt.subplots(figsize=(6, 4))
     prop.plot(kind="bar", stacked=True, ax=ax)
-    ax.set_title(f"gen{generation} | {variant} vs {var_col}")
+    ax.set_title(f"{label} | {variant} vs {var_col}")
     ax.set_xlabel(f"{variant} (0/1)")
     ax.set_ylabel("proportion")
     ax.legend(title=var_col, bbox_to_anchor=(1.05, 1), loc="upper left")
@@ -175,36 +199,36 @@ def plot_categorical(df_gen: pd.DataFrame, variant: str, var_col: str, generatio
     plt.close(fig)
 
 
-def plot_continuous(df_gen: pd.DataFrame, variant: str, var_col: str, generation: int, out_path: Path):
+def plot_continuous(df_gen: pd.DataFrame, variant: str, var_col: str, label: str, out_path: Path):
     sub = df_gen[[variant, var_col]].dropna()
     fig, ax = plt.subplots(figsize=(5, 4))
     sns.boxplot(data=sub, x=variant, y=var_col, ax=ax)
     sns.stripplot(data=sub, x=variant, y=var_col, ax=ax, color="black", alpha=0.4, size=3)
-    ax.set_title(f"gen{generation} | {variant} vs {var_col}")
+    ax.set_title(f"{label} | {variant} vs {var_col}")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
-def generate_plots(df_gen: pd.DataFrame, results: pd.DataFrame, generation: int, plots_dir: Path) -> pd.DataFrame:
+def generate_plots(df_gen: pd.DataFrame, results: pd.DataFrame, label: str, plots_dir: Path) -> pd.DataFrame:
     plots_dir.mkdir(parents=True, exist_ok=True)
     sig = results[results["pvalue_bonf"].notna() & (results["pvalue_bonf"] < ALPHA)].copy()
     sig["plot_path"] = None
 
     for idx, row in sig.iterrows():
         variant, var_col, vtype = row["variant"], row["variable"], row["type"]
-        fname = f"gen{generation}_{variant}_{var_col}.png".replace("/", "_")
+        fname = f"{label}_{variant}_{var_col}.png".replace("/", "_")
         out_path = plots_dir / fname
         try:
             if vtype == "categorical":
-                plot_categorical(df_gen, variant, var_col, generation, out_path)
+                plot_categorical(df_gen, variant, var_col, label, out_path)
             else:
-                plot_continuous(df_gen, variant, var_col, generation, out_path)
+                plot_continuous(df_gen, variant, var_col, label, out_path)
             sig.at[idx, "plot_path"] = str(out_path)
         except Exception as e:
             log.warning("Plot failed for %s/%s: %s", variant, var_col, e)
 
-    log.info("Generation %d: %d plots generated (Bonferroni p < %.2f)", generation, sig["plot_path"].notna().sum(), ALPHA)
+    log.info("%s: %d plots generated (Bonferroni p < %.2f)", label, sig["plot_path"].notna().sum(), ALPHA)
     return sig
 
 
@@ -218,10 +242,6 @@ def _set_cell_text(cell, text: str, bold: bool = False):
 
 
 def _add_significant_results_table(doc, sig: pd.DataFrame):
-    """Table WITHOUT a Bonferroni column; the raw p-value is bolded when
-    the result is significant after Bonferroni correction (it always is,
-    for rows already filtered into `sig`, but we keep the bold logic
-    generic in case an unfiltered frame is passed in)."""
     table = doc.add_table(rows=1, cols=6)
     table.style = "Light Grid Accent 1"
     headers = ["Variant", "Variable", "Test", "p-value", "N group 0", "N group 1"]
@@ -279,6 +299,7 @@ def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int,
 def build_combined_report(results1: pd.DataFrame, results2: pd.DataFrame,
                            sig1: pd.DataFrame, sig2: pd.DataFrame, out_path: Path):
     from docx import Document
+    from docx.shared import Inches
 
     doc = Document()
     doc.add_heading("Variant analysis - Generation 1 vs Generation 2", level=1)
@@ -292,7 +313,6 @@ def build_combined_report(results1: pd.DataFrame, results2: pd.DataFrame,
     _add_generation_section(doc, results1, sig1, 1, heading_level=2)
     _add_generation_section(doc, results2, sig2, 2, heading_level=2)
 
-    # Combined = union of significant results from both generations
     doc.add_heading("Combined (Generation 1 + Generation 2)", level=2)
     sig1_tagged = sig1.copy()
     sig1_tagged["generation"] = 1
@@ -304,39 +324,38 @@ def build_combined_report(results1: pd.DataFrame, results2: pd.DataFrame,
         f"({len(sig1)} from Generation 1, {len(sig2)} from Generation 2)."
     )
 
-    from docx.shared import Inches
-    table = doc.add_table(rows=1, cols=7)
-    table.style = "Light Grid Accent 1"
-    headers = ["Generation", "Variant", "Variable", "Test", "p-value", "N group 0", "N group 1"]
-    for i, h in enumerate(headers):
-        _set_cell_text(table.rows[0].cells[i], h, bold=True)
-    for _, row in union.sort_values(["generation", "pvalue_bonf"]).iterrows():
-        cells = table.add_row().cells
-        _set_cell_text(cells[0], str(row["generation"]))
-        _set_cell_text(cells[1], str(row["variant"]))
-        _set_cell_text(cells[2], str(row["variable"]))
-        _set_cell_text(cells[3], str(row["test"]))
-        _set_cell_text(cells[4], f"{row['pvalue']:.4g}", bold=True)
-        _set_cell_text(cells[5], str(row.get("n0", "")))
-        _set_cell_text(cells[6], str(row.get("n1", "")))
+    if not union.empty:
+        table = doc.add_table(rows=1, cols=7)
+        table.style = "Light Grid Accent 1"
+        headers = ["Generation", "Variant", "Variable", "Test", "p-value", "N group 0", "N group 1"]
+        for i, h in enumerate(headers):
+            _set_cell_text(table.rows[0].cells[i], h, bold=True)
+        for _, row in union.sort_values(["generation", "pvalue_bonf"]).iterrows():
+            cells = table.add_row().cells
+            _set_cell_text(cells[0], str(row["generation"]))
+            _set_cell_text(cells[1], str(row["variant"]))
+            _set_cell_text(cells[2], str(row["variable"]))
+            _set_cell_text(cells[3], str(row["test"]))
+            _set_cell_text(cells[4], f"{row['pvalue']:.4g}", bold=True)
+            _set_cell_text(cells[5], str(row.get("n0", "")))
+            _set_cell_text(cells[6], str(row.get("n1", "")))
 
-    doc.add_heading("Plots", level=2)
-    for _, row in union.sort_values(["generation", "pvalue_bonf"]).iterrows():
-        if not row["plot_path"]:
-            continue
-        doc.add_paragraph(f"Gen{row['generation']} | {row['variant']} vs {row['variable']} (p = {row['pvalue']:.4g})")
-        doc.add_picture(row["plot_path"], width=Inches(5))
+        doc.add_heading("Plots", level=2)
+        for _, row in union.sort_values(["generation", "pvalue_bonf"]).iterrows():
+            if not row["plot_path"]:
+                continue
+            doc.add_paragraph(f"Gen{row['generation']} | {row['variant']} vs {row['variable']} (p = {row['pvalue']:.4g})")
+            doc.add_picture(row["plot_path"], width=Inches(5))
 
     doc.save(out_path)
     log.info("Combined report saved: %s", out_path)
 
 
 # ----------------------------------------------------------------------
-# C9 (mutaz_bin) dedicated report - ALL variants, regardless of significance
+# C9 (mutaz_bin) advanced report - ALL variants (of this exposure), regardless
+# of significance
 # ----------------------------------------------------------------------
 def _add_c9_contingency_counts(df_gen: pd.DataFrame, c9: pd.DataFrame) -> pd.DataFrame:
-    """For each variant row, compute the actual 2x2 contingency counts
-    against mutaz_bin: how many C9+ / C9- within variant=0 and variant=1."""
     counts = []
     for _, row in c9.iterrows():
         variant = row["variant"]
@@ -356,22 +375,19 @@ def _add_c9_contingency_counts(df_gen: pd.DataFrame, c9: pd.DataFrame) -> pd.Dat
     return pd.concat([c9, counts_df], axis=1)
 
 
-def _c9_results_for_generation(df: pd.DataFrame, results_by_gen: dict, generation: int) -> pd.DataFrame:
-    results = results_by_gen[generation]
+def _c9_results_for_generation(df_gen: pd.DataFrame, results: pd.DataFrame, generation: int, plots_dir: Path) -> pd.DataFrame:
     c9 = results[results["variable"] == "mutaz_bin"].copy()
     c9 = c9.sort_values("pvalue")
-
-    df_gen = df[df[GENERATION_COL] == generation]
     c9 = _add_c9_contingency_counts(df_gen, c9)
 
-    C9_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
     c9["plot_path"] = None
     for idx, row in c9.iterrows():
         variant = row["variant"]
         fname = f"gen{generation}_{variant}_mutaz_bin.png".replace("/", "_")
-        out_img = C9_PLOTS_DIR / fname
+        out_img = plots_dir / fname
         try:
-            plot_categorical(df_gen, variant, "mutaz_bin", generation, out_img)
+            plot_categorical(df_gen, variant, "mutaz_bin", f"gen{generation}", out_img)
             c9.at[idx, "plot_path"] = str(out_img)
         except Exception as e:
             log.warning("C9 plot failed for %s: %s", variant, e)
@@ -385,12 +401,16 @@ def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, gen
     threshold = bonferroni_threshold(results)
     doc.add_heading(f"Generation {generation}", level=heading_level)
     doc.add_paragraph(
-        f"All variants tested against mutaz_bin (C9ORF72), regardless of significance. "
+        f"All variants (for this exposure) tested against mutaz_bin (C9ORF72), regardless of significance. "
         f"Total variants: {len(c9)}. "
         f"Bonferroni-corrected significance threshold: raw p-value < {threshold:.4g} "
         f"(alpha={ALPHA} / {results.attrs.get('n_tests', len(results))} tests). "
         f"Significant p-values are shown in bold."
     )
+
+    if c9.empty:
+        doc.add_paragraph("No variants available for this generation/exposure.")
+        return
 
     table = doc.add_table(rows=1, cols=7)
     table.style = "Light Grid Accent 1"
@@ -417,33 +437,35 @@ def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, gen
         doc.add_picture(row["plot_path"], width=Inches(4.5))
 
 
-def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
+def build_c9_report(df: pd.DataFrame, results_by_gen: dict, exposure: str, c9_dir: Path, out_path: Path):
     from docx import Document
-    from docx.shared import Inches
 
-    C9_DIR.mkdir(parents=True, exist_ok=True)
+    c9_dir.mkdir(parents=True, exist_ok=True)
+    c9_plots_dir = c9_dir / "plots"
 
     doc = Document()
-    doc.add_heading("C9ORF72 (mutaz_bin) report - all variants", level=1)
+    doc.add_heading(f"C9ORF72 (mutaz_bin) advanced report - exposure: {exposure}", level=1)
     doc.add_paragraph(
-        "This report includes ALL tested variants against mutaz_bin, regardless "
-        "of statistical significance. Generation 1 and Generation 2 are shown "
-        "separately, followed by a Combined section that is the union of both "
-        "generations' rows (no statistics re-run on pooled data)."
+        "This report includes ALL variants (for this exposure, 'close' cohort only) "
+        "tested against mutaz_bin, regardless of statistical significance. "
+        "Generation 1 and Generation 2 are shown separately, followed by a "
+        "Combined section that is the union of both generations' rows "
+        "(no statistics re-run on pooled data)."
     )
 
     c9_by_gen = {}
     for generation in (1, 2):
         if generation not in results_by_gen:
             continue
-        c9 = _c9_results_for_generation(df, results_by_gen, generation)
+        results, df_gen = results_by_gen[generation]
+        c9 = _c9_results_for_generation(df_gen, results, generation, c9_plots_dir)
         c9_by_gen[generation] = c9
 
-        csv_path = C9_DIR / f"c9_mutaz_bin_gen{generation}.csv"
+        csv_path = c9_dir / f"c9_mutaz_bin_gen{generation}.csv"
         c9.to_csv(csv_path, index=False)
-        log.info("C9 CSV saved for generation %d: %s (%d variants)", generation, csv_path, len(c9))
+        log.info("C9 CSV saved for generation %d (%s): %s (%d variants)", generation, exposure, csv_path, len(c9))
 
-        _add_c9_generation_section(doc, results_by_gen[generation], c9, generation, heading_level=2)
+        _add_c9_generation_section(doc, results, c9, generation, heading_level=2)
 
     if 1 in c9_by_gen and 2 in c9_by_gen:
         doc.add_heading("Combined (Generation 1 + Generation 2)", level=2)
@@ -456,7 +478,7 @@ def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
         c9_2["generation"] = 2
         union = pd.concat([c9_1, c9_2], ignore_index=True).sort_values(["generation", "pvalue"])
 
-        combined_csv = C9_DIR / "c9_mutaz_bin_combined.csv"
+        combined_csv = c9_dir / "c9_mutaz_bin_combined.csv"
         union.to_csv(combined_csv, index=False)
         log.info("C9 combined CSV saved: %s", combined_csv)
 
@@ -466,8 +488,7 @@ def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
         for i, h in enumerate(headers):
             _set_cell_text(table.rows[0].cells[i], h, bold=True)
         for _, row in union.iterrows():
-            gen_results = results_by_gen[row["generation"]]
-            threshold = bonferroni_threshold(gen_results)
+            threshold = bonferroni_threshold(results_by_gen[row["generation"]][0])
             is_sig = pd.notna(row["pvalue"]) and row["pvalue"] < threshold
             cells = table.add_row().cells
             _set_cell_text(cells[0], str(row["generation"]))
@@ -485,42 +506,147 @@ def build_c9_report(df: pd.DataFrame, results_by_gen: dict, out_path: Path):
 
 
 # ----------------------------------------------------------------------
-# Main
+# Per-exposure pipeline
 # ----------------------------------------------------------------------
-def main():
-    STATS_DIR.mkdir(parents=True, exist_ok=True)
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+def run_cohort_pipeline(df_cohort: pd.DataFrame, exposure: str, cohort_label: str, variant_cols: list, cohort_dir: Path):
+    log.info("=== Exposure: %s | cohort: %s (%d variants) ===", exposure, cohort_label, len(variant_cols))
+    log.info("%s cohort for %s: %d rows", cohort_label, exposure, len(df_cohort))
 
-    df, variant_cols = load_data()
+    plots_dir = cohort_dir / "plots"
+    reports_dir = cohort_dir / "reports"
+    c9_dir = reports_dir / "c9_report"
+    reports_dir.mkdir(parents=True, exist_ok=True)
 
     sig_by_gen = {}
+    results_for_c9 = {}  # generation -> (results, df_gen)
     results_by_gen = {}
     for generation in (1, 2):
-        df_gen = df[df[GENERATION_COL] == generation].copy()
-        log.info("Generation %d: %d samples", generation, len(df_gen))
+        df_gen = df_cohort[df_cohort[GENERATION_COL] == generation].copy()
+        log.info("[%s/%s] Generation %d: %d samples", exposure, cohort_label, generation, len(df_gen))
         if df_gen.empty:
-            log.warning("Generation %d is empty, skipping.", generation)
+            log.warning("[%s/%s] Generation %d is empty, skipping.", exposure, cohort_label, generation)
             continue
 
         results = run_tests_for_generation(df_gen, variant_cols)
-        results_by_gen[generation] = results
-        results_csv = STATS_DIR / f"gen{generation}_variant_stats.csv"
-        results.to_csv(results_csv, index=False)
-        log.info("Results CSV saved for generation %d: %s", generation, results_csv)
+        if results.empty:
+            log.warning("[%s/%s] Generation %d produced no test results, skipping.", exposure, cohort_label, generation)
+            continue
 
-        sig = generate_plots(df_gen, results, generation, PLOTS_DIR)
+        results_by_gen[generation] = results
+        results_for_c9[generation] = (results, df_gen)
+
+        results_csv = cohort_dir / f"gen{generation}_variant_stats.csv"
+        results.to_csv(results_csv, index=False)
+        log.info("[%s/%s] Results CSV saved for generation %d: %s", exposure, cohort_label, generation, results_csv)
+
+        sig = generate_plots(df_gen, results, f"{exposure}_{cohort_label}_gen{generation}", plots_dir)
         sig_by_gen[generation] = sig
 
-        build_word_report(results, sig, generation, REPORTS_DIR / f"gen{generation}_report.docx")
+        build_word_report(results, sig, generation, reports_dir / f"gen{generation}_report.docx")
 
     if 1 in sig_by_gen and 2 in sig_by_gen:
         build_combined_report(
             results_by_gen[1], results_by_gen[2],
             sig_by_gen[1], sig_by_gen[2],
-            REPORTS_DIR / "combined_report.docx",
+            reports_dir / "combined_report.docx",
         )
 
-    build_c9_report(df, results_by_gen, REPORTS_DIR / "c9_report.docx")
+    if results_for_c9:
+        build_c9_report(df_cohort, results_for_c9, f"{exposure} ({cohort_label})", c9_dir, reports_dir / "c9_report.docx")
+
+    return results_by_gen, sig_by_gen
+
+
+def build_close_vs_far_summary(exposure: str, close_res: dict, far_res: dict, out_path: Path):
+    """Side-by-side summary: for every (variant, variable) tested in either
+    cohort, show p-value and Bonferroni significance in close vs far, so it's
+    easy to spot subgroup-specific (environment-dependent) effects."""
+    from docx import Document
+
+    doc = Document()
+    doc.add_heading(f"Close vs Far summary - exposure: {exposure}", level=1)
+    doc.add_paragraph(
+        "For each generation, compares the 'close' cohort (exposure > 0) against "
+        "the 'far' cohort (exposure = 0) on the same variant/variable pairs. "
+        "A pattern significant in 'close' but not in 'far' suggests a subgroup "
+        "effect specific to that environmental exposure. Bold = significant "
+        "after Bonferroni correction within that cohort/generation."
+    )
+
+    for generation in (1, 2):
+        if generation not in close_res and generation not in far_res:
+            continue
+        doc.add_heading(f"Generation {generation}", level=2)
+
+        r_close = close_res.get(generation)
+        r_far = far_res.get(generation)
+        thr_close = bonferroni_threshold(r_close) if r_close is not None else None
+        thr_far = bonferroni_threshold(r_far) if r_far is not None else None
+
+        keys = set()
+        if r_close is not None:
+            keys |= set(zip(r_close["variant"], r_close["variable"]))
+        if r_far is not None:
+            keys |= set(zip(r_far["variant"], r_far["variable"]))
+
+        table = doc.add_table(rows=1, cols=5)
+        table.style = "Light Grid Accent 1"
+        headers = ["Variant", "Variable", "p-value (close)", "p-value (far)", "N close / N far"]
+        for i, h in enumerate(headers):
+            _set_cell_text(table.rows[0].cells[i], h, bold=True)
+
+        for variant, variable in sorted(keys):
+            row_close = r_close[(r_close["variant"] == variant) & (r_close["variable"] == variable)] if r_close is not None else pd.DataFrame()
+            row_far = r_far[(r_far["variant"] == variant) & (r_far["variable"] == variable)] if r_far is not None else pd.DataFrame()
+
+            p_close = row_close["pvalue"].iloc[0] if not row_close.empty else None
+            p_far = row_far["pvalue"].iloc[0] if not row_far.empty else None
+            sig_close = p_close is not None and pd.notna(p_close) and thr_close and p_close < thr_close
+            sig_far = p_far is not None and pd.notna(p_far) and thr_far and p_far < thr_far
+
+            n_close = f"{row_close['n0'].iloc[0]}/{row_close['n1'].iloc[0]}" if not row_close.empty and pd.notna(row_close['n0'].iloc[0]) else "n/a"
+            n_far = f"{row_far['n0'].iloc[0]}/{row_far['n1'].iloc[0]}" if not row_far.empty and pd.notna(row_far['n0'].iloc[0]) else "n/a"
+
+            cells = table.add_row().cells
+            _set_cell_text(cells[0], str(variant))
+            _set_cell_text(cells[1], str(variable))
+            _set_cell_text(cells[2], f"{p_close:.4g}" if p_close is not None and pd.notna(p_close) else "n/a", bold=sig_close)
+            _set_cell_text(cells[3], f"{p_far:.4g}" if p_far is not None and pd.notna(p_far) else "n/a", bold=sig_far)
+            _set_cell_text(cells[4], f"{n_close} / {n_far}")
+
+    doc.save(out_path)
+    log.info("Close vs Far summary saved: %s", out_path)
+
+
+def run_exposure_pipeline(df: pd.DataFrame, exposure: str, variant_cols: list, exposure_dir: Path):
+    df_close = df[df[exposure] > 0]
+    df_far = df[df[exposure] == 0]
+
+    close_results_by_gen, _ = run_cohort_pipeline(df_close, exposure, "close", variant_cols, exposure_dir / "close")
+    far_results_by_gen, _ = run_cohort_pipeline(df_far, exposure, "far", variant_cols, exposure_dir / "far")
+
+    build_close_vs_far_summary(exposure, close_results_by_gen, far_results_by_gen, exposure_dir / "close_vs_far_summary.docx")
+
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+def main():
+    STATS_DIR.mkdir(parents=True, exist_ok=True)
+    BY_EXPOSURE_DIR.mkdir(parents=True, exist_ok=True)
+
+    df, variant_exposure_map = load_data()
+    components = get_components(variant_exposure_map, set(df.columns))
+
+    if not components:
+        raise RuntimeError(
+            "No environmental component matched a column in the merged CSV. "
+            "Check variant_exposure_map.json exposure names against c9_check_merged.csv columns."
+        )
+
+    for exposure, variant_cols in components.items():
+        exposure_dir = BY_EXPOSURE_DIR / exposure
+        run_exposure_pipeline(df, exposure, variant_cols, exposure_dir)
 
 
 if __name__ == "__main__":

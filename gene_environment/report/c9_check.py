@@ -47,6 +47,7 @@ CODICE_GEN_FILE = OUT_DIR / "codice_gen.csv"
 VCF_FILE_GEN1 = "/mnt/cresla_prod/genome_datasets/gen1/gen1_onlycases_vcf_chr22.vcf.gz"
 VCF_FILE_GEN2 = "/mnt/cresla_prod/genome_datasets/gen2/gen2_vcf_chr22.vcf.gz"
 VARIANT_COLS_FILE = OUT_DIR / "variant_columns.json"  # lista colonne-varianti, riusata da generation_stats.py
+VARIANT_EXPOSURE_MAP_FILE = OUT_DIR / "variant_exposure_map.json"  # colonna -> lista esposizioni
 
 # Nel parquet l'id campione NON è una colonna: è l'indice del DataFrame
 # (come in _load_genetic_data). Nel CSV ambientale invece si usa la prima
@@ -117,7 +118,23 @@ def get_vcf_sample_ids(vcf_path: str) -> set:
     return cleaned
 
 
-def json_dump_list(path: Path, items: list) -> None:
+def build_variant_exposure_map(annotated_df: pd.DataFrame, matched_cols: list) -> dict:
+    """Per ogni colonna-variante effettivamente presente nel parquet, trova
+    a quale/i esposizione/i è associata secondo get_annotated_results()
+    (matchando sia il nome variante puro sia il nome con prefisso char_)."""
+    mapping = {}
+    for col in matched_cols:
+        is_char = col.startswith("char_")
+        bare = col[len("char_"):] if is_char else col
+        matches = annotated_df[annotated_df["variant"] == bare]
+        exposures = sorted(matches["exposure"].dropna().unique().tolist())
+        mapping[col] = exposures
+        if not exposures:
+            log.warning("Nessuna esposizione trovata per la colonna %s", col)
+    return mapping
+
+
+def json_dump_list(path: Path, items) -> None:
     import json
     with open(path, "w") as f:
         json.dump(items, f, indent=2)
@@ -198,7 +215,7 @@ def main():
     merged[ID_COL_RAW] = merged[ID_COL_RAW].astype(str)
 
     merged = merged.merge(
-        codice_gen_df[["corretto", "parals_codals", "mutaz"]],
+        codice_gen_df[["corretto", "parals_codals"]],
         left_on=ID_COL_RAW,
         right_on="corretto",
         how="left",  # tiene tutte le righe di merged anche senza match
@@ -246,9 +263,14 @@ def main():
         (merged["generation"] == 2).sum(),
     )
 
-    # Salvo la lista delle colonne-varianti per riuso in generation_stats.py
+    # Salvo la lista delle colonne-varianti e la mappa colonna->esposizioni,
+    # riusate da generation_stats.py per fare i report per componente ambientale.
     json_dump_list(VARIANT_COLS_FILE, selected_cols)
     log.info("Lista colonne-varianti salvata in %s (%d colonne)", VARIANT_COLS_FILE, len(selected_cols))
+
+    variant_exposure_map = build_variant_exposure_map(annotated_df, selected_cols)
+    json_dump_list(VARIANT_EXPOSURE_MAP_FILE, variant_exposure_map)
+    log.info("Mappa variante->esposizione salvata in %s", VARIANT_EXPOSURE_MAP_FILE)
 
     # 7. Salvataggio finale
     merged.to_csv(MERGED_CSV, index=False)
