@@ -408,7 +408,7 @@ def _c9_results_for_generation(df_gen: pd.DataFrame, results: pd.DataFrame, gene
     return c9
 
 
-def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, generation: int, heading_level: int = 2):
+def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, generation: int, heading_level: int = 2, include_plots: bool = True):
     from docx.shared import Inches
 
     threshold = bonferroni_threshold(results)
@@ -441,6 +441,9 @@ def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, gen
         _set_cell_text(cells[4], str(row.get("variant0_c9neg", "")))
         _set_cell_text(cells[5], str(row.get("variant1_c9pos", "")))
         _set_cell_text(cells[6], str(row.get("variant1_c9neg", "")))
+
+    if not include_plots:
+        return
 
     doc.add_heading("Plots", level=heading_level + 1)
     for _, row in c9.iterrows():
@@ -666,9 +669,64 @@ def run_exposure_pipeline(df: pd.DataFrame, exposure: str, variant_cols: list, e
     return [c for c in (close_c9, far_c9) if c is not None]
 
 
+def _build_master_summary_table(doc, all_c9_data: list):
+    """Initial table: every (exposure, cohort, generation, variant) row with
+    pvalue < 0.05, across ALL exposures, with an extra 'Exposure' column."""
+    summary_rows = []
+    for entry in all_c9_data:
+        label = f"{exposure_label(entry['exposure'])} ({entry['cohort']})"
+        c9_by_gen = entry["c9_by_gen"]
+        for generation, c9 in c9_by_gen.items():
+            sig = c9[c9["pvalue"].notna() & (c9["pvalue"] < 0.05)]
+            for _, row in sig.iterrows():
+                summary_rows.append({
+                    "exposure": label,
+                    "generation": generation,
+                    "variant": row["variant"],
+                    "test": row["test"],
+                    "pvalue": row["pvalue"],
+                    "pvalue_bonf": row.get("pvalue_bonf"),
+                    "variant0_c9pos": row.get("variant0_c9pos", ""),
+                    "variant0_c9neg": row.get("variant0_c9neg", ""),
+                    "variant1_c9pos": row.get("variant1_c9pos", ""),
+                    "variant1_c9neg": row.get("variant1_c9neg", ""),
+                })
+
+    doc.add_heading("Summary: all exposures, p-value < 0.05", level=2)
+    if not summary_rows:
+        doc.add_paragraph("No (exposure, cohort, generation, variant) row reached p-value < 0.05.")
+        return
+
+    summary = pd.DataFrame(summary_rows).sort_values("pvalue")
+    doc.add_paragraph(
+        f"{len(summary)} rows across all exposures/cohorts/generations with raw p-value < 0.05. "
+        f"Bold = also significant after Bonferroni correction (within its own exposure/cohort/generation)."
+    )
+
+    table = doc.add_table(rows=1, cols=8)
+    table.style = "Light Grid Accent 1"
+    headers = ["Exposure", "Generation", "Variant", "Test", "p-value", "Variant=0 C9+", "Variant=0 C9-", "Variant=1 C9+/C9- (1)"]
+    # NB: last header shortened for space; actual data still has separate C9+/C9- for variant=1 below
+    headers = ["Exposure", "Generation", "Variant", "Test", "p-value", "Var=0 C9+", "Var=0 C9-", "Var=1 C9+"]
+    for i, h in enumerate(headers):
+        _set_cell_text(table.rows[0].cells[i], h, bold=True)
+    for _, row in summary.iterrows():
+        is_sig = pd.notna(row["pvalue_bonf"]) and row["pvalue_bonf"] < ALPHA
+        cells = table.add_row().cells
+        _set_cell_text(cells[0], str(row["exposure"]))
+        _set_cell_text(cells[1], str(row["generation"]))
+        _set_cell_text(cells[2], str(row["variant"]))
+        _set_cell_text(cells[3], str(row["test"]))
+        _set_cell_text(cells[4], f"{row['pvalue']:.4g}", bold=is_sig)
+        _set_cell_text(cells[5], str(row["variant0_c9pos"]))
+        _set_cell_text(cells[6], str(row["variant0_c9neg"]))
+        _set_cell_text(cells[7], str(row["variant1_c9pos"]))
+
+
 def build_master_c9_report(all_c9_data: list, out_path: Path):
     """Single docx with ALL exposures' C9 tables (per generation + combined),
-    one after another, so everything can be reviewed in one file."""
+    one after another, so everything can be reviewed in one file. No images
+    (those are already in each exposure's own c9_report.docx)."""
     from docx import Document
 
     doc = Document()
@@ -676,8 +734,11 @@ def build_master_c9_report(all_c9_data: list, out_path: Path):
     doc.add_paragraph(
         "This document collects, for every environmental exposure and cohort "
         "(close/far), the same C9 tables already available in each exposure's "
-        "individual c9_report.docx, gathered here in a single file for convenience."
+        "individual c9_report.docx, gathered here in a single file for convenience. "
+        "Plots are omitted here; see the per-exposure c9_report.docx for images."
     )
+
+    _build_master_summary_table(doc, all_c9_data)
 
     for entry in all_c9_data:
         label = f"{exposure_label(entry['exposure'])} ({entry['cohort']})"
@@ -691,7 +752,7 @@ def build_master_c9_report(all_c9_data: list, out_path: Path):
             if generation not in c9_by_gen:
                 continue
             results, _ = results_for_c9[generation]
-            _add_c9_generation_section(doc, results, c9_by_gen[generation], generation, heading_level=3)
+            _add_c9_generation_section(doc, results, c9_by_gen[generation], generation, heading_level=3, include_plots=False)
 
         if union is not None:
             doc.add_heading("Combined (Generation 1 + Generation 2)", level=3)
