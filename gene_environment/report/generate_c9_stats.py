@@ -62,6 +62,19 @@ MUTAZ_RAW_COL = "mutaz"
 
 ALPHA = 0.05  # significance threshold applied to the Bonferroni-corrected p-value
 
+EXPOSURE_LABELS = {
+    "seminativi_1500": "Arable land 1500mt",
+    "vigneti_1500": "Vineyards 1500mt",
+    "risaie_1500": "Rice fields 1500mt",
+    "seminativi_1000": "Arable land 1000mt",
+    "vigneti_1000": "Vineyards 1000mt",
+    "risaie_1000": "Rice fields 1000mt",
+}
+
+
+def exposure_label(exposure: str) -> str:
+    return EXPOSURE_LABELS.get(exposure, exposure)
+
 CATEGORICAL_VARS = [SEX_COL, ONSET_SITE_COL, "mutaz_bin", "survival_null"]
 CONTINUOUS_VARS = [DIAGNOSTIC_DELAY_COL, EDUCATION_YEARS_COL, SURVIVAL_COL]
 
@@ -289,7 +302,7 @@ def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int,
     from docx import Document
 
     doc = Document()
-    doc.add_heading(f"Variant analysis - Exposure: {exposure} ({cohort_label}) - Generation {generation}", level=1)
+    doc.add_heading(f"Variant analysis - Exposure: {exposure_label(exposure)} ({cohort_label}) - Generation {generation}", level=1)
     _add_generation_section(doc, results, sig, generation, heading_level=2)
 
     doc.save(out_path)
@@ -302,7 +315,7 @@ def build_combined_report(results1: pd.DataFrame, results2: pd.DataFrame,
     from docx.shared import Inches
 
     doc = Document()
-    doc.add_heading(f"Variant analysis - Exposure: {exposure} ({cohort_label}) - Generation 1 vs Generation 2", level=1)
+    doc.add_heading(f"Variant analysis - Exposure: {exposure_label(exposure)} ({cohort_label}) - Generation 1 vs Generation 2", level=1)
     doc.add_paragraph(
         "This report lists Generation 1 and Generation 2 significant results "
         "separately, followed by a Combined section that is the union of "
@@ -437,6 +450,27 @@ def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, gen
         doc.add_picture(row["plot_path"], width=Inches(4.5))
 
 
+def _add_c9_combined_table(doc, union: pd.DataFrame, results_by_gen: dict):
+    table = doc.add_table(rows=1, cols=8)
+    table.style = "Light Grid Accent 1"
+    headers = ["Generation", "Variant", "Test", "p-value", "Variant=0 C9+", "Variant=0 C9-", "Variant=1 C9+", "Variant=1 C9-"]
+    for i, h in enumerate(headers):
+        _set_cell_text(table.rows[0].cells[i], h, bold=True)
+    for _, row in union.iterrows():
+        threshold = bonferroni_threshold(results_by_gen[row["generation"]][0])
+        is_sig = pd.notna(row["pvalue"]) and row["pvalue"] < threshold
+        cells = table.add_row().cells
+        _set_cell_text(cells[0], str(row["generation"]))
+        _set_cell_text(cells[1], str(row["variant"]))
+        _set_cell_text(cells[2], str(row["test"]))
+        pv_txt = f"{row['pvalue']:.4g}" if pd.notna(row["pvalue"]) else "n/a"
+        _set_cell_text(cells[3], pv_txt, bold=is_sig)
+        _set_cell_text(cells[4], str(row.get("variant0_c9pos", "")))
+        _set_cell_text(cells[5], str(row.get("variant0_c9neg", "")))
+        _set_cell_text(cells[6], str(row.get("variant1_c9pos", "")))
+        _set_cell_text(cells[7], str(row.get("variant1_c9neg", "")))
+
+
 def build_c9_report(df: pd.DataFrame, results_by_gen: dict, exposure: str, c9_dir: Path, out_path: Path):
     from docx import Document
 
@@ -462,11 +496,14 @@ def build_c9_report(df: pd.DataFrame, results_by_gen: dict, exposure: str, c9_di
         c9_by_gen[generation] = c9
 
         csv_path = c9_dir / f"c9_mutaz_bin_gen{generation}.csv"
-        c9.to_csv(csv_path, index=False)
+        c9_out = c9.copy()
+        c9_out.insert(0, "exposure", exposure)
+        c9_out.to_csv(csv_path, index=False)
         log.info("C9 CSV saved for generation %d (%s): %s (%d variants)", generation, exposure, csv_path, len(c9))
 
         _add_c9_generation_section(doc, results, c9, generation, heading_level=2)
 
+    union = None
     if 1 in c9_by_gen and 2 in c9_by_gen:
         doc.add_heading("Combined (Generation 1 + Generation 2)", level=2)
         doc.add_paragraph(
@@ -479,30 +516,17 @@ def build_c9_report(df: pd.DataFrame, results_by_gen: dict, exposure: str, c9_di
         union = pd.concat([c9_1, c9_2], ignore_index=True).sort_values(["generation", "pvalue"])
 
         combined_csv = c9_dir / "c9_mutaz_bin_combined.csv"
-        union.to_csv(combined_csv, index=False)
+        union_out = union.copy()
+        union_out.insert(0, "exposure", exposure)
+        union_out.to_csv(combined_csv, index=False)
         log.info("C9 combined CSV saved: %s", combined_csv)
 
-        table = doc.add_table(rows=1, cols=8)
-        table.style = "Light Grid Accent 1"
-        headers = ["Generation", "Variant", "Test", "p-value", "Variant=0 C9+", "Variant=0 C9-", "Variant=1 C9+", "Variant=1 C9-"]
-        for i, h in enumerate(headers):
-            _set_cell_text(table.rows[0].cells[i], h, bold=True)
-        for _, row in union.iterrows():
-            threshold = bonferroni_threshold(results_by_gen[row["generation"]][0])
-            is_sig = pd.notna(row["pvalue"]) and row["pvalue"] < threshold
-            cells = table.add_row().cells
-            _set_cell_text(cells[0], str(row["generation"]))
-            _set_cell_text(cells[1], str(row["variant"]))
-            _set_cell_text(cells[2], str(row["test"]))
-            pv_txt = f"{row['pvalue']:.4g}" if pd.notna(row["pvalue"]) else "n/a"
-            _set_cell_text(cells[3], pv_txt, bold=is_sig)
-            _set_cell_text(cells[4], str(row.get("variant0_c9pos", "")))
-            _set_cell_text(cells[5], str(row.get("variant0_c9neg", "")))
-            _set_cell_text(cells[6], str(row.get("variant1_c9pos", "")))
-            _set_cell_text(cells[7], str(row.get("variant1_c9neg", "")))
+        _add_c9_combined_table(doc, union, results_by_gen)
 
     doc.save(out_path)
     log.info("C9 report saved: %s", out_path)
+
+    return c9_by_gen, union
 
 
 # ----------------------------------------------------------------------
@@ -538,7 +562,7 @@ def run_cohort_pipeline(df_cohort: pd.DataFrame, exposure: str, cohort_label: st
         results_csv = cohort_dir / f"gen{generation}_variant_stats.csv"
         results_out = results.copy()
         results_out.insert(0, "cohort", cohort_label)
-        results_out.insert(0, "exposure", exposure)
+        results_out.insert(0, "exposure", exposure_label(exposure))
         results_out.to_csv(results_csv, index=False)
         log.info("[%s/%s] Results CSV saved for generation %d: %s", exposure, cohort_label, generation, results_csv)
 
@@ -555,10 +579,18 @@ def run_cohort_pipeline(df_cohort: pd.DataFrame, exposure: str, cohort_label: st
             reports_dir / "combined_report.docx",
         )
 
+    c9_data = None
     if results_for_c9:
-        build_c9_report(df_cohort, results_for_c9, f"{exposure} ({cohort_label})", c9_dir, reports_dir / "c9_report.docx")
+        c9_by_gen, union = build_c9_report(df_cohort, results_for_c9, f"{exposure_label(exposure)} ({cohort_label})", c9_dir, reports_dir / "c9_report.docx")
+        c9_data = {
+            "exposure": exposure,
+            "cohort": cohort_label,
+            "results_for_c9": results_for_c9,
+            "c9_by_gen": c9_by_gen,
+            "union": union,
+        }
 
-    return results_by_gen, sig_by_gen
+    return results_by_gen, sig_by_gen, c9_data
 
 
 def build_close_vs_far_summary(exposure: str, close_res: dict, far_res: dict, out_path: Path):
@@ -568,7 +600,7 @@ def build_close_vs_far_summary(exposure: str, close_res: dict, far_res: dict, ou
     from docx import Document
 
     doc = Document()
-    doc.add_heading(f"Close vs Far summary - exposure: {exposure}", level=1)
+    doc.add_heading(f"Close vs Far summary - exposure: {exposure_label(exposure)}", level=1)
     doc.add_paragraph(
         "For each generation, compares the 'close' cohort (exposure > 0) against "
         "the 'far' cohort (exposure = 0) on the same variant/variable pairs. "
@@ -626,10 +658,51 @@ def run_exposure_pipeline(df: pd.DataFrame, exposure: str, variant_cols: list, e
     df_close = df[df[exposure] > 0]
     df_far = df[df[exposure] == 0]
 
-    close_results_by_gen, _ = run_cohort_pipeline(df_close, exposure, "close", variant_cols, exposure_dir / "close")
-    far_results_by_gen, _ = run_cohort_pipeline(df_far, exposure, "far", variant_cols, exposure_dir / "far")
+    close_results_by_gen, _, close_c9 = run_cohort_pipeline(df_close, exposure, "close", variant_cols, exposure_dir / "close")
+    far_results_by_gen, _, far_c9 = run_cohort_pipeline(df_far, exposure, "far", variant_cols, exposure_dir / "far")
 
     build_close_vs_far_summary(exposure, close_results_by_gen, far_results_by_gen, exposure_dir / "close_vs_far_summary.docx")
+
+    return [c for c in (close_c9, far_c9) if c is not None]
+
+
+def build_master_c9_report(all_c9_data: list, out_path: Path):
+    """Single docx with ALL exposures' C9 tables (per generation + combined),
+    one after another, so everything can be reviewed in one file."""
+    from docx import Document
+
+    doc = Document()
+    doc.add_heading("C9ORF72 (mutaz_bin) - all exposures", level=1)
+    doc.add_paragraph(
+        "This document collects, for every environmental exposure and cohort "
+        "(close/far), the same C9 tables already available in each exposure's "
+        "individual c9_report.docx, gathered here in a single file for convenience."
+    )
+
+    for entry in all_c9_data:
+        label = f"{exposure_label(entry['exposure'])} ({entry['cohort']})"
+        doc.add_heading(f"Exposure: {label}", level=2)
+
+        results_for_c9 = entry["results_for_c9"]
+        c9_by_gen = entry["c9_by_gen"]
+        union = entry["union"]
+
+        for generation in (1, 2):
+            if generation not in c9_by_gen:
+                continue
+            results, _ = results_for_c9[generation]
+            _add_c9_generation_section(doc, results, c9_by_gen[generation], generation, heading_level=3)
+
+        if union is not None:
+            doc.add_heading("Combined (Generation 1 + Generation 2)", level=3)
+            doc.add_paragraph(
+                "Union of all variant rows from both generations (concatenation, not a joint re-analysis)."
+            )
+            results_by_gen = {g: r for g, (r, _) in results_for_c9.items()}
+            _add_c9_combined_table(doc, union, results_by_gen)
+
+    doc.save(out_path)
+    log.info("Master C9 report saved: %s", out_path)
 
 
 # ----------------------------------------------------------------------
@@ -648,9 +721,14 @@ def main():
             "Check variant_exposure_map.json exposure names against c9_check_merged.csv columns."
         )
 
+    all_c9_data = []
     for exposure, variant_cols in components.items():
         exposure_dir = BY_EXPOSURE_DIR / exposure
-        run_exposure_pipeline(df, exposure, variant_cols, exposure_dir)
+        c9_data = run_exposure_pipeline(df, exposure, variant_cols, exposure_dir)
+        all_c9_data.extend(c9_data)
+
+    if all_c9_data:
+        build_master_c9_report(all_c9_data, BY_EXPOSURE_DIR / "all_c9_report.docx")
 
 
 if __name__ == "__main__":
