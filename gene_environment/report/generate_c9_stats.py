@@ -285,11 +285,11 @@ def _add_generation_section(doc, results: pd.DataFrame, sig: pd.DataFrame, gener
         doc.add_picture(row["plot_path"], width=Inches(5))
 
 
-def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int, out_path: Path):
+def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int, exposure: str, cohort_label: str, out_path: Path):
     from docx import Document
 
     doc = Document()
-    doc.add_heading(f"Variant analysis - Generation {generation}", level=1)
+    doc.add_heading(f"Variant analysis - Exposure: {exposure} ({cohort_label}) - Generation {generation}", level=1)
     _add_generation_section(doc, results, sig, generation, heading_level=2)
 
     doc.save(out_path)
@@ -297,12 +297,12 @@ def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int,
 
 
 def build_combined_report(results1: pd.DataFrame, results2: pd.DataFrame,
-                           sig1: pd.DataFrame, sig2: pd.DataFrame, out_path: Path):
+                           sig1: pd.DataFrame, sig2: pd.DataFrame, exposure: str, cohort_label: str, out_path: Path):
     from docx import Document
     from docx.shared import Inches
 
     doc = Document()
-    doc.add_heading("Variant analysis - Generation 1 vs Generation 2", level=1)
+    doc.add_heading(f"Variant analysis - Exposure: {exposure} ({cohort_label}) - Generation 1 vs Generation 2", level=1)
     doc.add_paragraph(
         "This report lists Generation 1 and Generation 2 significant results "
         "separately, followed by a Combined section that is the union of "
@@ -536,18 +536,22 @@ def run_cohort_pipeline(df_cohort: pd.DataFrame, exposure: str, cohort_label: st
         results_for_c9[generation] = (results, df_gen)
 
         results_csv = cohort_dir / f"gen{generation}_variant_stats.csv"
-        results.to_csv(results_csv, index=False)
+        results_out = results.copy()
+        results_out.insert(0, "cohort", cohort_label)
+        results_out.insert(0, "exposure", exposure)
+        results_out.to_csv(results_csv, index=False)
         log.info("[%s/%s] Results CSV saved for generation %d: %s", exposure, cohort_label, generation, results_csv)
 
         sig = generate_plots(df_gen, results, f"{exposure}_{cohort_label}_gen{generation}", plots_dir)
         sig_by_gen[generation] = sig
 
-        build_word_report(results, sig, generation, reports_dir / f"gen{generation}_report.docx")
+        build_word_report(results, sig, generation, exposure, cohort_label, reports_dir / f"gen{generation}_report.docx")
 
     if 1 in sig_by_gen and 2 in sig_by_gen:
         build_combined_report(
             results_by_gen[1], results_by_gen[2],
             sig_by_gen[1], sig_by_gen[2],
+            exposure, cohort_label,
             reports_dir / "combined_report.docx",
         )
 
