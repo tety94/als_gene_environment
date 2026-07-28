@@ -698,8 +698,7 @@ def build_master_c9_report(all_c9_data: list, out_path: Path):
             doc.add_paragraph(
                 "Union of all variant rows from both generations (concatenation, not a joint re-analysis)."
             )
-            results_by_gen = {g: r for g, (r, _) in results_for_c9.items()}
-            _add_c9_combined_table(doc, union, results_by_gen)
+            _add_c9_combined_table(doc, union, results_for_c9)
 
     doc.save(out_path)
     log.info("Master C9 report saved: %s", out_path)
