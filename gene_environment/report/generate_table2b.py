@@ -15,15 +15,14 @@ Behavior:
       variant, exposure, gene_id, gene_symbol, gene_type,
       expressed_brain, expressed_neurons, expressed_glia,
       ctd_chemicals, als_opentargets_score, neuro_plausibility_score
-- This dataset has NO p-value / coefficient columns (unlike Table 2's
-  get_significant_results_table_2), so this script is purely descriptive:
-  no significance highlighting, no chromosome enrichment test. It reports
-  gene annotation content instead.
+- This dataset has NO p-value / coefficient columns (unlike Table 2), so
+  this script is purely descriptive: no significance highlighting, no
+  statistical enrichment test. It reports gene annotation content instead.
 - Translates the `exposure` column from the source dataset's Italian
   land-use terms to English (see `gene_environment.report.exposure_labels`)
   right after fetching, since (unlike Table 2) nothing downstream needs the
   raw value to query the DB again.
-- Produces:
+- Produces POOLED (all-exposures) outputs exactly as before:
     output/table2b/Table2b_top10.docx
     output/table2b/Table2b_full_supplementary.docx
     output/table2b/table2b_raw_results.csv
@@ -36,6 +35,26 @@ Behavior:
     output/table2b/figures/ctd_chemicals_top20.png
     output/table2b/table2b_gene_type_counts.csv
     output/table2b/table2b_chemicals_frequency.csv
+- NEW: Produces PER-EXPOSURE outputs, mirroring the by_exposure pattern used
+  in generate_table2.py:
+    output/table2b/figures/by_exposure/<slug>/variants_per_chromosome.png
+    output/table2b/figures/by_exposure/<slug>/gene_type_distribution.png
+    output/table2b/figures/by_exposure/<slug>/expressed_brain_neurons_glia.png
+    output/table2b/figures/by_exposure/<slug>/als_opentargets_score_histogram.png
+    output/table2b/figures/by_exposure/<slug>/neuro_plausibility_score_histogram.png
+    output/table2b/figures/by_exposure/<slug>/ctd_chemicals_top20.png
+    output/table2b/figures/by_exposure/<slug>/gene_type_counts.csv
+    output/table2b/figures/by_exposure/<slug>/chemicals_frequency.csv
+  plus one combined grid figure per metric (one panel per exposure), same
+  idea as `observed_vs_expected_by_chromosome_per_exposure.png` in Table 2:
+    output/table2b/figures/gene_type_distribution_by_exposure.png
+    output/table2b/figures/expressed_brain_neurons_glia_by_exposure.png
+  <slug> uses the same `slugify(translate_exposure_value(...))` convention
+  as Table 2, and is computed from the already-translated (English)
+  exposure label, since (unlike Table 2) this script has no further DB
+  queries downstream that need the raw Italian value.
+  The full supplementary Word doc gets a new "Per-exposure figures" section
+  with one subsection (heading + all 6 figures) per exposure.
 
 Notes on ambiguous column types (documented here since the astore only
 gives column names, not types):
@@ -44,7 +63,10 @@ gives column names, not types):
   runtime -- if every non-null value across the three columns is in {0, 1},
   it treats them as binary flags and plots proportion-of-genes-expressed;
   otherwise it treats them as continuous scores and plots histograms. A
-  message is printed to stderr saying which path was taken.
+  message is printed to stderr saying which path was taken. This detection
+  is done ONCE on the pooled dataset, and the same mode is reused for every
+  per-exposure panel so that all panels are visually comparable (a mode
+  that flips exposure-to-exposure would make the by-exposure grid useless).
 - ctd_chemicals: assumed to be a delimited list of chemical names per row
   (comma / semicolon / pipe separated). Frequency is counted after
   splitting on any of those delimiters and stripping whitespace.
@@ -56,7 +78,7 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -66,7 +88,7 @@ from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.shared import Pt, RGBColor
 
-from gene_environment.report.db_utils import call_stored_routine_to_df, chrom_sort_key, extract_chromosome
+from gene_environment.report.db_utils import chrom_sort_key, call_stored_routine_to_df, extract_chromosome, slugify
 from gene_environment.report.exposure_labels import translate_exposure
 from gene_environment.report.word_utils import (
     add_figure_to_doc,
@@ -83,6 +105,7 @@ from gene_environment.report.word_utils import (
 
 OUT_DIR = Path("output/table2b")
 FIG_DIR = OUT_DIR / "figures"
+BY_EXPOSURE_DIR = FIG_DIR / "by_exposure"
 
 ASTORE_NAME = "get_significant_results_table_2b"
 
@@ -253,10 +276,14 @@ def add_table_to_doc(
 
 
 # ---------------------------------------------------------------------------
-# Figures
+# Figures -- all of these now take an explicit `fig_dir` / `out_dir` so they
+# can be reused unchanged for both the pooled (all-exposures) run and each
+# per-exposure run: pooled calls pass FIG_DIR/OUT_DIR, per-exposure calls
+# pass BY_EXPOSURE_DIR/<slug>/ for both (figures and their companion CSVs
+# live together in that per-exposure folder).
 # ---------------------------------------------------------------------------
 
-def make_chromosome_figures(df: pd.DataFrame, fig_dir: Path) -> None:
+def make_chromosome_figures(df: pd.DataFrame, fig_dir: Path, title_suffix: str = "") -> None:
     """Purely descriptive chromosome-level figures (no significance concept
     here -- every row in this dataset is already the astore's output)."""
     df = df.copy()
@@ -273,7 +300,7 @@ def make_chromosome_figures(df: pd.DataFrame, fig_dir: Path) -> None:
     ax = sns.barplot(data=merged, x="chromosome", y="n_variants", color="#4472C4")
     ax.set_xlabel("Chromosome")
     ax.set_ylabel("Number of unique variants")
-    ax.set_title("Variants per chromosome (Table 2b)")
+    ax.set_title(f"Variants per chromosome (Table 2b){title_suffix}")
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.savefig(fig_dir / "variants_per_chromosome.png", dpi=300)
@@ -286,25 +313,26 @@ def make_chromosome_figures(df: pd.DataFrame, fig_dir: Path) -> None:
                  horizontalalignment="left", verticalalignment="bottom")
     ax.set_xlabel("Number of unique genes per chromosome")
     ax.set_ylabel("Number of unique variants per chromosome")
-    ax.set_title("Genes vs variants per chromosome (Table 2b)")
+    ax.set_title(f"Genes vs variants per chromosome (Table 2b){title_suffix}")
     plt.tight_layout()
     plt.savefig(fig_dir / "genes_vs_variants_scatter.png", dpi=300)
     plt.close()
 
 
-def make_gene_type_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path) -> pd.DataFrame:
+def make_gene_type_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path, title_suffix: str = "") -> pd.DataFrame:
     """Bar chart of unique genes per gene_type. Returns the counts table,
     also saved to CSV."""
     genes = df.drop_duplicates(subset=["gene_symbol"])
     counts = genes["gene_type"].fillna("Unknown").value_counts().rename_axis("gene_type").reset_index(name="n_genes")
     counts = counts.sort_values("n_genes", ascending=False)
-    counts.to_csv(out_dir / "table2b_gene_type_counts.csv", index=False)
+    counts.to_csv(out_dir / "gene_type_counts.csv" if out_dir != OUT_DIR else out_dir / "table2b_gene_type_counts.csv",
+                  index=False)
 
     plt.figure(figsize=(max(6, 0.5 * len(counts)), 5))
     ax = sns.barplot(data=counts, x="gene_type", y="n_genes", color="#4472C4")
     ax.set_xlabel("Gene type")
     ax.set_ylabel("Number of unique genes")
-    ax.set_title("Gene type distribution")
+    ax.set_title(f"Gene type distribution{title_suffix}")
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     plt.savefig(fig_dir / "gene_type_distribution.png", dpi=300)
@@ -312,11 +340,15 @@ def make_gene_type_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path) -> pd.
     return counts
 
 
-def make_expression_figure(df: pd.DataFrame, fig_dir: Path) -> str:
-    """expressed_brain / expressed_neurons / expressed_glia: auto-detects
-    whether these look like binary flags (all observed values in {0,1}) or
-    continuous scores, and plots accordingly. Returns which mode was used
-    ('binary' or 'continuous') for logging."""
+def make_expression_figure(df: pd.DataFrame, fig_dir: Path, mode: Optional[str] = None,
+                            title_suffix: str = "") -> str:
+    """expressed_brain / expressed_neurons / expressed_glia: if `mode` is
+    given ('binary' or 'continuous') it is used as-is -- this lets
+    per-exposure calls reuse the mode detected once on the pooled dataset,
+    so every panel in the by-exposure grid is visually comparable. If
+    `mode` is None (pooled call), auto-detects whether the observed values
+    look like binary flags (all in {0,1}) or continuous scores. Returns
+    the mode used ('binary' or 'continuous') for logging / reuse."""
     cols = ["expressed_brain", "expressed_neurons", "expressed_glia"]
     genes = df.drop_duplicates(subset=["gene_symbol"])[["gene_symbol"] + cols].copy()
 
@@ -325,14 +357,16 @@ def make_expression_figure(df: pd.DataFrame, fig_dir: Path) -> str:
         numeric[c] = pd.to_numeric(genes[c], errors="coerce")
     numeric_df = pd.DataFrame(numeric)
 
-    observed_values = set(numeric_df.stack().dropna().unique().tolist())
-    is_binary = observed_values.issubset({0.0, 1.0}) and len(observed_values) > 0
+    if mode is None:
+        observed_values = set(numeric_df.stack().dropna().unique().tolist())
+        is_binary = observed_values.issubset({0.0, 1.0}) and len(observed_values) > 0
+        mode = "binary" if is_binary else "continuous"
+        print(f"[info] expressed_brain/neurons/glia detected as {mode} "
+              "(this mode will be reused for all per-exposure panels).", file=sys.stderr)
 
     fig_path = fig_dir / "expressed_brain_neurons_glia.png"
 
-    if is_binary:
-        print("[info] expressed_brain/neurons/glia detected as binary (0/1) flags -- "
-              "plotting proportion of genes expressed.", file=sys.stderr)
+    if mode == "binary":
         props = numeric_df.mean(numeric_only=True).reset_index()
         props.columns = ["compartment", "proportion_expressed"]
         props["compartment"] = props["compartment"].str.replace("expressed_", "", regex=False)
@@ -342,14 +376,11 @@ def make_expression_figure(df: pd.DataFrame, fig_dir: Path) -> str:
         ax.set_ylim(0, 1)
         ax.set_xlabel("Compartment")
         ax.set_ylabel("Proportion of unique genes expressed")
-        ax.set_title("Gene expression by compartment (binary flags)")
+        ax.set_title(f"Gene expression by compartment (binary flags){title_suffix}")
         plt.tight_layout()
         plt.savefig(fig_path, dpi=300)
         plt.close()
-        return "binary"
     else:
-        print("[info] expressed_brain/neurons/glia detected as continuous scores (not all "
-              "values in {0,1}) -- plotting histograms instead of proportions.", file=sys.stderr)
         fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
         for ax, c in zip(axes, cols):
             vals = numeric_df[c].dropna()
@@ -360,10 +391,12 @@ def make_expression_figure(df: pd.DataFrame, fig_dir: Path) -> str:
             sns.histplot(vals, bins=30, ax=ax, color="#548235")
             ax.set_title(c.replace("expressed_", "").capitalize())
             ax.set_xlabel("Score")
+        fig.suptitle(title_suffix.strip(" ()") or None)
         plt.tight_layout()
         plt.savefig(fig_path, dpi=300)
         plt.close(fig)
-        return "continuous"
+
+    return mode
 
 
 def make_score_histogram(df: pd.DataFrame, col: str, fig_dir: Path, fig_name: str, title: str) -> None:
@@ -387,7 +420,7 @@ def make_score_histogram(df: pd.DataFrame, col: str, fig_dir: Path, fig_name: st
     plt.close()
 
 
-def make_chemicals_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path) -> pd.DataFrame:
+def make_chemicals_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path, title_suffix: str = "") -> pd.DataFrame:
     """Top-N most frequent CTD chemicals across all rows. Frequency counts
     rows (variant x exposure x gene), not unique genes, since the same
     chemical linked to different genes/variants is still relevant signal.
@@ -397,7 +430,8 @@ def make_chemicals_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path) -> pd.
         counter.update(_split_chemicals(raw))
 
     fig_path = fig_dir / "ctd_chemicals_top20.png"
-    freq_path = out_dir / "table2b_chemicals_frequency.csv"
+    freq_path = (out_dir / "chemicals_frequency.csv" if out_dir != OUT_DIR
+                 else out_dir / "table2b_chemicals_frequency.csv")
 
     if not counter:
         freq = pd.DataFrame(columns=["chemical", "n_occurrences"])
@@ -417,11 +451,110 @@ def make_chemicals_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path) -> pd.
     ax = sns.barplot(data=top, y="chemical", x="n_occurrences", color="#4472C4", orient="h")
     ax.set_xlabel("Occurrences")
     ax.set_ylabel("Chemical")
-    ax.set_title(f"Top {min(CTD_CHEMICALS_TOP_N, len(freq))} CTD chemicals")
+    ax.set_title(f"Top {min(CTD_CHEMICALS_TOP_N, len(freq))} CTD chemicals{title_suffix}")
     plt.tight_layout()
     plt.savefig(fig_path, dpi=300)
     plt.close()
     return freq
+
+
+# ---------------------------------------------------------------------------
+# Per-exposure orchestration (new)
+# ---------------------------------------------------------------------------
+
+def run_per_exposure_figures(
+    df: pd.DataFrame,
+    exposures: List[str],
+    expression_mode: str,
+    by_exposure_dir: Path,
+    fig_dir: Path,
+) -> Dict[str, Path]:
+    """For each (already-translated/English) exposure label, filter df and
+    regenerate the full set of descriptive figures + companion CSVs into
+    their own subfolder `by_exposure/<slug>/`, then build one combined grid
+    figure per metric (gene-type distribution, expression) with one panel
+    per exposure -- mirroring `observed_vs_expected_by_chromosome_per_exposure`
+    in generate_table2.py. Returns {exposure: slug_dir} for use when
+    building the Word doc.
+
+    Exposures with zero rows (shouldn't normally happen since `exposures`
+    is derived from df itself) are skipped defensively.
+    """
+    slug_dirs: Dict[str, Path] = {}
+    gene_type_panels: List[Tuple[str, pd.DataFrame]] = []
+    expression_panels: List[str] = []  # just track exposures with data, for the grid
+
+    for exposure in exposures:
+        df_sub = df.loc[df["exposure"] == exposure]
+        if df_sub.empty:
+            continue
+
+        slug = slugify(exposure)
+        slug_dir = by_exposure_dir / slug
+        slug_dir.mkdir(parents=True, exist_ok=True)
+        slug_dirs[exposure] = slug_dir
+
+        title_suffix = f" -- {exposure}"
+
+        make_chromosome_figures(df_sub, slug_dir, title_suffix=title_suffix)
+        counts = make_gene_type_figure(df_sub, slug_dir, slug_dir, title_suffix=title_suffix)
+        make_expression_figure(df_sub, slug_dir, mode=expression_mode, title_suffix=title_suffix)
+        make_score_histogram(df_sub, "als_opentargets_score", slug_dir,
+                              "als_opentargets_score_histogram.png",
+                              f"Distribution of ALS OpenTargets score{title_suffix}")
+        make_score_histogram(df_sub, "neuro_plausibility_score", slug_dir,
+                              "neuro_plausibility_score_histogram.png",
+                              f"Distribution of neuro plausibility score{title_suffix}")
+        make_chemicals_figure(df_sub, slug_dir, slug_dir, title_suffix=title_suffix)
+
+        counts["exposure"] = exposure
+        gene_type_panels.append((exposure, counts))
+        expression_panels.append(exposure)
+
+    # --- combined grid: gene type distribution by exposure ---
+    if gene_type_panels:
+        n = len(gene_type_panels)
+        ncols = min(3, n)
+        nrows = -(-n // ncols)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.6 * nrows), squeeze=False)
+        for idx, (exposure, counts) in enumerate(gene_type_panels):
+            r, c = divmod(idx, ncols)
+            ax = axes[r][c]
+            sns.barplot(data=counts, x="gene_type", y="n_genes", color="#4472C4", ax=ax)
+            ax.set_title(exposure, fontsize=10)
+            ax.set_xlabel("")
+            ax.set_ylabel("N genes", fontsize=9)
+            ax.tick_params(axis="x", rotation=45, labelsize=8)
+        for idx in range(n, nrows * ncols):
+            r, c = divmod(idx, ncols)
+            axes[r][c].axis("off")
+        fig.suptitle("Gene type distribution by exposure", fontsize=12)
+        plt.tight_layout(rect=(0, 0, 1, 0.97))
+        plt.savefig(fig_dir / "gene_type_distribution_by_exposure.png", dpi=200)
+        plt.close(fig)
+
+    # --- combined grid: expression by exposure (reuses the per-exposure PNGs) ---
+    if expression_panels:
+        n = len(expression_panels)
+        ncols = min(3, n)
+        nrows = -(-n // ncols)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6.0 * ncols, 4.2 * nrows), squeeze=False)
+        for idx, exposure in enumerate(expression_panels):
+            r, c = divmod(idx, ncols)
+            ax = axes[r][c]
+            img = plt.imread(slug_dirs[exposure] / "expressed_brain_neurons_glia.png")
+            ax.imshow(img)
+            ax.set_title(exposure, fontsize=10)
+            ax.axis("off")
+        for idx in range(n, nrows * ncols):
+            r, c = divmod(idx, ncols)
+            axes[r][c].axis("off")
+        fig.suptitle(f"Expression by compartment, by exposure (mode: {expression_mode})", fontsize=12)
+        plt.tight_layout(rect=(0, 0, 1, 0.96))
+        plt.savefig(fig_dir / "expressed_brain_neurons_glia_by_exposure.png", dpi=150)
+        plt.close(fig)
+
+    return slug_dirs
 
 
 # ---------------------------------------------------------------------------
@@ -433,8 +566,10 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
 
     out_dir = Path(out_dir)
     fig_dir = out_dir / "figures"
+    by_exposure_dir = fig_dir / "by_exposure"
     out_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
+    by_exposure_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Calling stored routine: {ASTORE_NAME}() ...")
     df = call_stored_routine_to_df(ASTORE_NAME, get_connection, cursor_scope, columns=TABLE_COLUMNS)
@@ -442,8 +577,10 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
         if c not in df.columns:
             df[c] = pd.NA
 
-    # No further DB round-trip depends on the raw exposure value here, so
-    # translate immediately -- the CSV export below is English too.
+    # No further DB round-trip depends on the raw exposure value here (this
+    # script, unlike Table 2, has no per-exposure DB queries), so translate
+    # immediately -- everything downstream, including the by-exposure slugs,
+    # uses the English label.
     df = translate_exposure(df)
 
     df.to_csv(out_dir / "table2b_raw_results.csv", index=False)
@@ -452,6 +589,7 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
         print("[warn] no rows returned by the stored routine -- nothing further to do.", file=sys.stderr)
         return
 
+    # --- pooled (all-exposures) figures, unchanged from before ---
     make_chromosome_figures(df, fig_dir)
     gene_type_counts = make_gene_type_figure(df, out_dir, fig_dir)
     expression_mode = make_expression_figure(df, fig_dir)
@@ -460,6 +598,11 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
     make_score_histogram(df, "neuro_plausibility_score", fig_dir, "neuro_plausibility_score_histogram.png",
                           "Distribution of neuro plausibility score (unique genes)")
     chemicals_freq = make_chemicals_figure(df, out_dir, fig_dir)
+
+    # --- NEW: per-exposure figures ---
+    exposures = sorted(df["exposure"].dropna().unique().tolist())
+    slug_dirs = run_per_exposure_figures(df, exposures, expression_mode, by_exposure_dir, fig_dir)
+    print(f"Per-exposure figures generated for {len(slug_dirs)} exposures in: {by_exposure_dir}")
 
     n_unique_genes = df["gene_symbol"].nunique()
     n_unique_variants = df["variant"].nunique()
@@ -493,7 +636,7 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
     )
     add_table_to_doc(doc_full, df)
 
-    doc_full.add_heading("Figures", level=1)
+    doc_full.add_heading("Figures (all exposures pooled)", level=1)
     add_figure_to_doc(doc_full, fig_dir / "variants_per_chromosome.png",
                        "Figure 1. Number of unique variants per chromosome.")
     add_figure_to_doc(doc_full, fig_dir / "genes_vs_variants_scatter.png",
@@ -515,6 +658,38 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
                        f"Figure 7. Top {min(CTD_CHEMICALS_TOP_N, len(chemicals_freq))} most frequent "
                        "CTD chemicals across all rows (row-level occurrence count).", width_in=6.5)
 
+    # --- NEW: combined by-exposure grids, then one subsection per exposure ---
+    if slug_dirs:
+        doc_full.add_heading("Figures by exposure", level=1)
+        add_figure_to_doc(doc_full, fig_dir / "gene_type_distribution_by_exposure.png",
+                           "Figure 8. Gene type distribution, one panel per exposure.", width_in=6.5)
+        add_figure_to_doc(doc_full, fig_dir / "expressed_brain_neurons_glia_by_exposure.png",
+                           f"Figure 9. Expression by compartment, one panel per exposure (mode: {expression_mode}).",
+                           width_in=6.5)
+
+        doc_full.add_heading("Per-exposure figures", level=1)
+        doc_full.add_paragraph(
+            "The following subsections repeat the full descriptive figure set (Figures 1-7 above) "
+            "separately for each exposure, using the same gene-expression detection mode "
+            f"('{expression_mode}') as the pooled analysis for comparability."
+        )
+        for exposure, slug_dir in slug_dirs.items():
+            doc_full.add_heading(f"Exposure: {exposure}", level=2)
+            add_figure_to_doc(doc_full, slug_dir / "variants_per_chromosome.png",
+                               f"Variants per chromosome -- {exposure}.")
+            add_figure_to_doc(doc_full, slug_dir / "genes_vs_variants_scatter.png",
+                               f"Genes vs variants per chromosome -- {exposure}.")
+            add_figure_to_doc(doc_full, slug_dir / "gene_type_distribution.png",
+                               f"Gene type distribution -- {exposure}.")
+            add_figure_to_doc(doc_full, slug_dir / "expressed_brain_neurons_glia.png",
+                               f"Expression by compartment -- {exposure}.", width_in=6.5)
+            add_figure_to_doc(doc_full, slug_dir / "als_opentargets_score_histogram.png",
+                               f"ALS OpenTargets score distribution -- {exposure}.")
+            add_figure_to_doc(doc_full, slug_dir / "neuro_plausibility_score_histogram.png",
+                               f"Neuro plausibility score distribution -- {exposure}.")
+            add_figure_to_doc(doc_full, slug_dir / "ctd_chemicals_top20.png",
+                               f"Top CTD chemicals -- {exposure}.", width_in=6.5)
+
     full_path = out_dir / "Table2b_full_supplementary.docx"
     doc_full.save(full_path)
 
@@ -525,6 +700,7 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
     print(f"Gene type counts CSV: {out_dir / 'table2b_gene_type_counts.csv'}")
     print(f"CTD chemicals frequency CSV: {out_dir / 'table2b_chemicals_frequency.csv'}")
     print(f"Figures saved in: {fig_dir}")
+    print(f"Per-exposure figures + CSVs saved in: {by_exposure_dir}")
     print(f"Expression columns detected as: {expression_mode}")
 
 
