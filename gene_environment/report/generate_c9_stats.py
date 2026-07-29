@@ -16,6 +16,10 @@ vigneti_1500):
      section that is the union of the two generations' significant
      results (no re-running of stats on pooled data).
 
+Each variant is additionally annotated with its gene name / gene symbol
+(from variant_gene_map.json, built by c9_check.py) -- these are shown
+alongside the variant in every table (CSV and Word) throughout.
+
 Output layout per component E:
   stats/by_exposure/E/gen{1,2}_variant_stats.csv
   stats/by_exposure/E/plots/...
@@ -58,6 +62,7 @@ log = logging.getLogger(__name__)
 OUT_DIR = Path("/mnt/cresla_prod/stefano_ge/c9_check")
 MERGED_CSV = OUT_DIR / "c9_check_merged.csv"
 VARIANT_EXPOSURE_MAP_FILE = OUT_DIR / "variant_exposure_map.json"
+VARIANT_GENE_MAP_FILE = OUT_DIR / "variant_gene_map.json"
 
 STATS_DIR = OUT_DIR / "stats"
 BY_EXPOSURE_DIR = STATS_DIR / "by_exposure"
@@ -77,20 +82,36 @@ ALPHA = 0.05  # significance threshold applied to the Bonferroni-corrected p-val
 CATEGORICAL_VARS = [SEX_COL, ONSET_SITE_COL, "mutaz_bin", "survival_null"]
 CONTINUOUS_VARS = [DIAGNOSTIC_DELAY_COL, EDUCATION_YEARS_COL, SURVIVAL_COL]
 
+# Populated once in load_data(); column -> {"gene_name": ..., "gene_symbol": ...}
+GENE_MAP: dict = {}
+
+
+def gene_info(variant: str) -> tuple[str, str]:
+    """Returns (gene_name, gene_symbol) for a variant column, falling back
+    to 'n/a' for whichever piece is missing (e.g. if get_annotated_results()
+    never exposed a gene_symbol column)."""
+    info = GENE_MAP.get(variant, {})
+    return (info.get("gene_name") or "n/a", info.get("gene_symbol") or "n/a")
+
 
 # ----------------------------------------------------------------------
 # Data loading
 # ----------------------------------------------------------------------
 def load_data():
+    global GENE_MAP
+
     df = pd.read_csv(MERGED_CSV)
     with open(VARIANT_EXPOSURE_MAP_FILE) as f:
         variant_exposure_map = json.load(f)  # {column_name: [exposure, ...]}
+    with open(VARIANT_GENE_MAP_FILE) as f:
+        GENE_MAP = json.load(f)  # {column_name: {"gene_name": ..., "gene_symbol": ...}}
 
     df["mutaz_bin"] = df[MUTAZ_RAW_COL].astype(str).str.contains("C9ORF72", na=False).astype(int)
     df["survival_null"] = df[SURVIVAL_COL].isna()
     df[EDUCATION_YEARS_COL] = pd.to_numeric(df[EDUCATION_YEARS_COL], errors="coerce").astype("Int64")
 
-    log.info("Data loaded: %d rows, %d variant columns in exposure map", len(df), len(variant_exposure_map))
+    log.info("Data loaded: %d rows, %d variant columns in exposure map, %d in gene map",
+              len(df), len(variant_exposure_map), len(GENE_MAP))
     return df, variant_exposure_map
 
 
@@ -166,13 +187,21 @@ def run_tests_for_generation(df_gen: pd.DataFrame, variant_cols: list) -> pd.Dat
         if group.dropna().nunique() < 2:
             continue  # monomorphic variant in this subset, skip
 
+        gname, gsymbol = gene_info(variant)
+
         for var_col in CATEGORICAL_VARS:
             res = test_categorical(df_gen.assign(_grp=group), "_grp", var_col)
-            rows.append({"variant": variant, "variable": var_col, "type": "categorical", **res})
+            rows.append({
+                "variant": variant, "gene_name": gname, "gene_symbol": gsymbol,
+                "variable": var_col, "type": "categorical", **res,
+            })
 
         for var_col in CONTINUOUS_VARS:
             res = test_continuous(df_gen.assign(_grp=group), "_grp", var_col)
-            rows.append({"variant": variant, "variable": var_col, "type": "continuous", **res})
+            rows.append({
+                "variant": variant, "gene_name": gname, "gene_symbol": gsymbol,
+                "variable": var_col, "type": "continuous", **res,
+            })
 
     results = pd.DataFrame(rows)
 
@@ -248,9 +277,9 @@ def generate_plots(df_gen: pd.DataFrame, results: pd.DataFrame, label: str, plot
 # Word report helpers
 # ----------------------------------------------------------------------
 def _add_significant_results_table(doc, sig: pd.DataFrame):
-    table = doc.add_table(rows=1, cols=6)
+    table = doc.add_table(rows=1, cols=8)
     table.style = "Light Grid Accent 1"
-    headers = ["Variant", "Variable", "Test", "p-value", "N group 0", "N group 1"]
+    headers = ["Variant", "Gene name", "Gene symbol", "Variable", "Test", "p-value", "N group 0", "N group 1"]
     for i, h in enumerate(headers):
         _set_cell_text(table.rows[0].cells[i], h, bold=True)
 
@@ -258,11 +287,13 @@ def _add_significant_results_table(doc, sig: pd.DataFrame):
         cells = table.add_row().cells
         is_sig = pd.notna(row["pvalue_bonf"]) and row["pvalue_bonf"] < ALPHA
         _set_cell_text(cells[0], str(row["variant"]))
-        _set_cell_text(cells[1], str(row["variable"]))
-        _set_cell_text(cells[2], str(row["test"]))
-        _set_cell_text(cells[3], f"{row['pvalue']:.4g}", bold=is_sig)
-        _set_cell_text(cells[4], str(row.get("n0", "")))
-        _set_cell_text(cells[5], str(row.get("n1", "")))
+        _set_cell_text(cells[1], str(row.get("gene_name", "n/a")))
+        _set_cell_text(cells[2], str(row.get("gene_symbol", "n/a")))
+        _set_cell_text(cells[3], str(row["variable"]))
+        _set_cell_text(cells[4], str(row["test"]))
+        _set_cell_text(cells[5], f"{row['pvalue']:.4g}", bold=is_sig)
+        _set_cell_text(cells[6], str(row.get("n0", "")))
+        _set_cell_text(cells[7], str(row.get("n1", "")))
 
 
 def _add_generation_section(doc, results: pd.DataFrame, sig: pd.DataFrame, generation: int, heading_level: int = 2):
@@ -324,20 +355,22 @@ def build_combined_report(results1: pd.DataFrame, results2: pd.DataFrame,
     )
 
     if not union.empty:
-        table = doc.add_table(rows=1, cols=7)
+        table = doc.add_table(rows=1, cols=9)
         table.style = "Light Grid Accent 1"
-        headers = ["Generation", "Variant", "Variable", "Test", "p-value", "N group 0", "N group 1"]
+        headers = ["Generation", "Variant", "Gene name", "Gene symbol", "Variable", "Test", "p-value", "N group 0", "N group 1"]
         for i, h in enumerate(headers):
             _set_cell_text(table.rows[0].cells[i], h, bold=True)
         for _, row in union.sort_values(["generation", "pvalue_bonf"]).iterrows():
             cells = table.add_row().cells
             _set_cell_text(cells[0], str(row["generation"]))
             _set_cell_text(cells[1], str(row["variant"]))
-            _set_cell_text(cells[2], str(row["variable"]))
-            _set_cell_text(cells[3], str(row["test"]))
-            _set_cell_text(cells[4], f"{row['pvalue']:.4g}", bold=True)
-            _set_cell_text(cells[5], str(row.get("n0", "")))
-            _set_cell_text(cells[6], str(row.get("n1", "")))
+            _set_cell_text(cells[2], str(row.get("gene_name", "n/a")))
+            _set_cell_text(cells[3], str(row.get("gene_symbol", "n/a")))
+            _set_cell_text(cells[4], str(row["variable"]))
+            _set_cell_text(cells[5], str(row["test"]))
+            _set_cell_text(cells[6], f"{row['pvalue']:.4g}", bold=True)
+            _set_cell_text(cells[7], str(row.get("n0", "")))
+            _set_cell_text(cells[8], str(row.get("n1", "")))
 
         doc.add_heading("Plots", level=2)
         for _, row in union.sort_values(["generation", "pvalue_bonf"]).iterrows():
@@ -409,22 +442,25 @@ def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, gen
         doc.add_paragraph("No variants available for this generation/exposure.")
         return
 
-    table = doc.add_table(rows=1, cols=7)
+    table = doc.add_table(rows=1, cols=9)
     table.style = "Light Grid Accent 1"
-    headers = ["Variant", "Test", "p-value", "Variant=0 C9+", "Variant=0 C9-", "Variant=1 C9+", "Variant=1 C9-"]
+    headers = ["Variant", "Gene name", "Gene symbol", "Test", "p-value",
+               "Variant=0 C9+", "Variant=0 C9-", "Variant=1 C9+", "Variant=1 C9-"]
     for i, h in enumerate(headers):
         _set_cell_text(table.rows[0].cells[i], h, bold=True)
     for _, row in c9.iterrows():
         cells = table.add_row().cells
         is_sig = pd.notna(row["pvalue_bonf"]) and row["pvalue_bonf"] < ALPHA
         _set_cell_text(cells[0], str(row["variant"]))
-        _set_cell_text(cells[1], str(row["test"]))
+        _set_cell_text(cells[1], str(row.get("gene_name", "n/a")))
+        _set_cell_text(cells[2], str(row.get("gene_symbol", "n/a")))
+        _set_cell_text(cells[3], str(row["test"]))
         pv_txt = f"{row['pvalue']:.4g}" if pd.notna(row["pvalue"]) else "n/a"
-        _set_cell_text(cells[2], pv_txt, bold=is_sig)
-        _set_cell_text(cells[3], str(row.get("variant0_c9pos", "")))
-        _set_cell_text(cells[4], str(row.get("variant0_c9neg", "")))
-        _set_cell_text(cells[5], str(row.get("variant1_c9pos", "")))
-        _set_cell_text(cells[6], str(row.get("variant1_c9neg", "")))
+        _set_cell_text(cells[4], pv_txt, bold=is_sig)
+        _set_cell_text(cells[5], str(row.get("variant0_c9pos", "")))
+        _set_cell_text(cells[6], str(row.get("variant0_c9neg", "")))
+        _set_cell_text(cells[7], str(row.get("variant1_c9pos", "")))
+        _set_cell_text(cells[8], str(row.get("variant1_c9neg", "")))
 
     if not include_plots:
         return
@@ -438,9 +474,10 @@ def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, gen
 
 
 def _add_c9_combined_table(doc, union: pd.DataFrame, results_by_gen: dict):
-    table = doc.add_table(rows=1, cols=8)
+    table = doc.add_table(rows=1, cols=10)
     table.style = "Light Grid Accent 1"
-    headers = ["Generation", "Variant", "Test", "p-value", "Variant=0 C9+", "Variant=0 C9-", "Variant=1 C9+", "Variant=1 C9-"]
+    headers = ["Generation", "Variant", "Gene name", "Gene symbol", "Test", "p-value",
+               "Variant=0 C9+", "Variant=0 C9-", "Variant=1 C9+", "Variant=1 C9-"]
     for i, h in enumerate(headers):
         _set_cell_text(table.rows[0].cells[i], h, bold=True)
     for _, row in union.iterrows():
@@ -449,13 +486,15 @@ def _add_c9_combined_table(doc, union: pd.DataFrame, results_by_gen: dict):
         cells = table.add_row().cells
         _set_cell_text(cells[0], str(row["generation"]))
         _set_cell_text(cells[1], str(row["variant"]))
-        _set_cell_text(cells[2], str(row["test"]))
+        _set_cell_text(cells[2], str(row.get("gene_name", "n/a")))
+        _set_cell_text(cells[3], str(row.get("gene_symbol", "n/a")))
+        _set_cell_text(cells[4], str(row["test"]))
         pv_txt = f"{row['pvalue']:.4g}" if pd.notna(row["pvalue"]) else "n/a"
-        _set_cell_text(cells[3], pv_txt, bold=is_sig)
-        _set_cell_text(cells[4], str(row.get("variant0_c9pos", "")))
-        _set_cell_text(cells[5], str(row.get("variant0_c9neg", "")))
-        _set_cell_text(cells[6], str(row.get("variant1_c9pos", "")))
-        _set_cell_text(cells[7], str(row.get("variant1_c9neg", "")))
+        _set_cell_text(cells[5], pv_txt, bold=is_sig)
+        _set_cell_text(cells[6], str(row.get("variant0_c9pos", "")))
+        _set_cell_text(cells[7], str(row.get("variant0_c9neg", "")))
+        _set_cell_text(cells[8], str(row.get("variant1_c9pos", "")))
+        _set_cell_text(cells[9], str(row.get("variant1_c9neg", "")))
 
 
 def build_c9_report(df: pd.DataFrame, results_by_gen: dict, exposure: str, c9_dir: Path, out_path: Path):
@@ -608,9 +647,9 @@ def build_close_vs_far_summary(exposure: str, close_res: dict, far_res: dict, ou
         if r_far is not None:
             keys |= set(zip(r_far["variant"], r_far["variable"]))
 
-        table = doc.add_table(rows=1, cols=5)
+        table = doc.add_table(rows=1, cols=7)
         table.style = "Light Grid Accent 1"
-        headers = ["Variant", "Variable", "p-value (close)", "p-value (far)", "N close / N far"]
+        headers = ["Variant", "Gene name", "Gene symbol", "Variable", "p-value (close)", "p-value (far)", "N close / N far"]
         for i, h in enumerate(headers):
             _set_cell_text(table.rows[0].cells[i], h, bold=True)
 
@@ -626,12 +665,16 @@ def build_close_vs_far_summary(exposure: str, close_res: dict, far_res: dict, ou
             n_close = f"{row_close['n0'].iloc[0]}/{row_close['n1'].iloc[0]}" if not row_close.empty and pd.notna(row_close['n0'].iloc[0]) else "n/a"
             n_far = f"{row_far['n0'].iloc[0]}/{row_far['n1'].iloc[0]}" if not row_far.empty and pd.notna(row_far['n0'].iloc[0]) else "n/a"
 
+            gname, gsymbol = gene_info(variant)
+
             cells = table.add_row().cells
             _set_cell_text(cells[0], str(variant))
-            _set_cell_text(cells[1], str(variable))
-            _set_cell_text(cells[2], f"{p_close:.4g}" if p_close is not None and pd.notna(p_close) else "n/a", bold=sig_close)
-            _set_cell_text(cells[3], f"{p_far:.4g}" if p_far is not None and pd.notna(p_far) else "n/a", bold=sig_far)
-            _set_cell_text(cells[4], f"{n_close} / {n_far}")
+            _set_cell_text(cells[1], str(gname))
+            _set_cell_text(cells[2], str(gsymbol))
+            _set_cell_text(cells[3], str(variable))
+            _set_cell_text(cells[4], f"{p_close:.4g}" if p_close is not None and pd.notna(p_close) else "n/a", bold=sig_close)
+            _set_cell_text(cells[5], f"{p_far:.4g}" if p_far is not None and pd.notna(p_far) else "n/a", bold=sig_far)
+            _set_cell_text(cells[6], f"{n_close} / {n_far}")
 
     doc.save(out_path)
     log.info("Close vs Far summary saved: %s", out_path)
@@ -663,6 +706,8 @@ def _build_master_summary_table(doc, all_c9_data: list):
                     "exposure": label,
                     "generation": generation,
                     "variant": row["variant"],
+                    "gene_name": row.get("gene_name", "n/a"),
+                    "gene_symbol": row.get("gene_symbol", "n/a"),
                     "test": row["test"],
                     "pvalue": row["pvalue"],
                     "pvalue_bonf": row.get("pvalue_bonf"),
@@ -683,9 +728,10 @@ def _build_master_summary_table(doc, all_c9_data: list):
         f"Bold = also significant after Bonferroni correction (within its own exposure/cohort/generation)."
     )
 
-    table = doc.add_table(rows=1, cols=8)
+    table = doc.add_table(rows=1, cols=10)
     table.style = "Light Grid Accent 1"
-    headers = ["Exposure", "Generation", "Variant", "Test", "p-value", "Var=0 C9+", "Var=0 C9-", "Var=1 C9+"]
+    headers = ["Exposure", "Generation", "Variant", "Gene name", "Gene symbol", "Test", "p-value",
+               "Var=0 C9+", "Var=0 C9-", "Var=1 C9+"]
     for i, h in enumerate(headers):
         _set_cell_text(table.rows[0].cells[i], h, bold=True)
     for _, row in summary.iterrows():
@@ -694,11 +740,13 @@ def _build_master_summary_table(doc, all_c9_data: list):
         _set_cell_text(cells[0], str(row["exposure"]))
         _set_cell_text(cells[1], str(row["generation"]))
         _set_cell_text(cells[2], str(row["variant"]))
-        _set_cell_text(cells[3], str(row["test"]))
-        _set_cell_text(cells[4], f"{row['pvalue']:.4g}", bold=is_sig)
-        _set_cell_text(cells[5], str(row["variant0_c9pos"]))
-        _set_cell_text(cells[6], str(row["variant0_c9neg"]))
-        _set_cell_text(cells[7], str(row["variant1_c9pos"]))
+        _set_cell_text(cells[3], str(row["gene_name"]))
+        _set_cell_text(cells[4], str(row["gene_symbol"]))
+        _set_cell_text(cells[5], str(row["test"]))
+        _set_cell_text(cells[6], f"{row['pvalue']:.4g}", bold=is_sig)
+        _set_cell_text(cells[7], str(row["variant0_c9pos"]))
+        _set_cell_text(cells[8], str(row["variant0_c9neg"]))
+        _set_cell_text(cells[9], str(row["variant1_c9pos"]))
 
 
 def build_master_c9_report(all_c9_data: list, out_path: Path):

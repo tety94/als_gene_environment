@@ -13,9 +13,10 @@ Pipeline:
 6. Assigns a `generation` column: 1 if the id is in the gen1 VCF, 2 if
    it's in the gen2 VCF. Rows whose id appears in NEITHER VCF are
    dropped.
-7. Saves the list of variant columns and the variant -> exposure(s) map
-   (both reused by generate_c9_stats.py to build the per-exposure
-   reports), and the final merged CSV, to OUT_DIR.
+7. Saves the list of variant columns, the variant -> exposure(s) map, and
+   the variant -> gene (gene_name / gene_symbol) map (all three reused by
+   generate_c9_stats.py to build the per-exposure reports), and the final
+   merged CSV, to OUT_DIR.
 
 """
 
@@ -54,6 +55,7 @@ VCF_FILE_GEN1 = "/mnt/cresla_prod/genome_datasets/gen1/gen1_onlycases_vcf_chr22.
 VCF_FILE_GEN2 = "/mnt/cresla_prod/genome_datasets/gen2/gen2_vcf_chr22.vcf.gz"
 VARIANT_COLS_FILE = OUT_DIR / "variant_columns.json"  # list of variant columns, reused by generate_c9_stats.py
 VARIANT_EXPOSURE_MAP_FILE = OUT_DIR / "variant_exposure_map.json"  # column -> list of exposures (raw, untranslated)
+VARIANT_GENE_MAP_FILE = OUT_DIR / "variant_gene_map.json"  # column -> {"gene_name": ..., "gene_symbol": ...}
 
 # In the parquet the sample id is NOT a column: it's the DataFrame index
 # (as in _load_genetic_data). In the environmental CSV, the id is instead
@@ -129,6 +131,36 @@ def build_variant_exposure_map(annotated_df: pd.DataFrame, matched_cols: List[st
         mapping[col] = exposures
         if not exposures:
             log.warning("No exposure found for column %s", col)
+    return mapping
+
+
+def build_variant_gene_map(annotated_df: pd.DataFrame, matched_cols: List[str]) -> Dict[str, Dict[str, str]]:
+    """For each variant column actually present in the parquet, looks up
+    gene_name (and gene_symbol, if that column exists in the annotation
+    result) from get_annotated_results(). If a variant matches multiple
+    rows with different gene values, the first one is kept and a warning
+    is logged."""
+    gene_cols = [c for c in ("gene_name", "gene_symbol") if c in annotated_df.columns]
+    if not gene_cols:
+        log.warning(
+            "Neither 'gene_name' nor 'gene_symbol' found in get_annotated_results() output; "
+            "gene columns in reports will be empty."
+        )
+
+    mapping = {}
+    for col in matched_cols:
+        is_char = col.startswith("char_")
+        bare = col[len("char_"):] if is_char else col
+        matches = annotated_df[annotated_df["variant"] == bare]
+
+        info = {}
+        for gc in gene_cols:
+            vals = matches[gc].dropna().unique().tolist()
+            info[gc] = vals[0] if vals else None
+            if len(vals) > 1:
+                log.warning("Variant %s has multiple distinct %s values %s, using the first one.", col, gc, vals)
+        mapping[col] = info
+
     return mapping
 
 
@@ -257,14 +289,19 @@ def run_c9_check() -> Path:
         (merged["generation"] == 2).sum(),
     )
 
-    # Save the list of variant columns and the column -> exposure(s) map,
-    # reused by generate_c9_stats.py to build the per-environmental-component reports.
+    # Save the list of variant columns, the column -> exposure(s) map, and
+    # the column -> gene map, reused by generate_c9_stats.py to build the
+    # per-environmental-component reports.
     json_dump(VARIANT_COLS_FILE, selected_cols)
     log.info("Variant-column list saved to %s (%d columns)", VARIANT_COLS_FILE, len(selected_cols))
 
     variant_exposure_map = build_variant_exposure_map(annotated_df, selected_cols)
     json_dump(VARIANT_EXPOSURE_MAP_FILE, variant_exposure_map)
     log.info("Variant -> exposure map saved to %s", VARIANT_EXPOSURE_MAP_FILE)
+
+    variant_gene_map = build_variant_gene_map(annotated_df, selected_cols)
+    json_dump(VARIANT_GENE_MAP_FILE, variant_gene_map)
+    log.info("Variant -> gene map saved to %s", VARIANT_GENE_MAP_FILE)
 
     # 7. Final save
     merged.to_csv(MERGED_CSV, index=False)
