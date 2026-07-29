@@ -18,6 +18,8 @@ Examples:
     python -m gene_environment.cli run-gxe-genetlib
     python -m gene_environment.cli generate-reports          # Table 1, Table 2, Table 2b, annotated tables
     python -m gene_environment.cli generate-reports --only table2 table2b
+    python -m gene_environment.cli run-c9-check               # restricted genotype/env/C9orf72 merge (see report/c9_check.py)
+    python -m gene_environment.cli generate-c9-stats          # per-exposure close-vs-far + C9ORF72 stats (needs run-c9-check first)
     python -m gene_environment.cli pipeline-order    # print the recommended order
 """
 from __future__ import annotations
@@ -58,6 +60,13 @@ Recommended execution order:
 Steps 4 and 5 can be repeated as many times as needed during the
 "run-model" run (e.g. from cron), to always have an up-to-date snapshot
 of the significant variants without waiting for the full run to finish.
+
+Optional side branch (not required for Table 1/2/2b): a restricted
+genotype/environment/C9orf72-code exploratory analysis --
+  a. run-c9-check         builds the restricted genotype+environment+C9orf72
+                           merge (requires annotate-genes to have run first)
+  b. generate-c9-stats     per-exposure close-vs-far stratified statistics
+                           and C9ORF72 reporting, from run-c9-check's output
 """
 
 
@@ -108,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("build-cohort-mapping", help="Rebuilds the id -> generation mapping CSV by reading VCF headers (prerequisite for table1)")
     sub.add_parser("run-c9-check", help="Restricted genotype/environment/C9orf72-code merge diagnostic (see report/c9_check.py)")
+    sub.add_parser("generate-c9-stats", help="Per-exposure close-vs-far stratified statistics and C9ORF72 reporting (needs run-c9-check first)")
 
     args = parser.parse_args(argv)
 
@@ -184,6 +194,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "run-c9-check":
         from gene_environment.report.c9_check import run_c9_check
         run_c9_check()
+
+    elif args.command == "generate-c9-stats":
+        from gene_environment.report.generate_c9_stats import run_generate_c9_stats
+        run_generate_c9_stats()
 
     else:
         parser.print_help()

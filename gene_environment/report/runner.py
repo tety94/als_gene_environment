@@ -11,17 +11,20 @@ for the pattern), add one `_run_<name>()` wrapper below with the defaults
 you want for a routine "generate everything" run, and append it to
 REPORTS. cli.py's `generate-reports` command does not need to change.
 
-`build_cohort_mapping` and `c9_check` are intentionally NOT part of
-REPORTS: the former is a one-off prerequisite for Table 1 (only needs
-re-running when the VCF sample sets change, not every time reports are
-regenerated) and the latter is a standalone diagnostic/merge script, not
-a paper table. Both are still reachable as their own CLI subcommands.
+`c9_check` and `generate_c9_stats` are intentionally NOT part of REPORTS
+either: they're a separate exploratory analysis chain (restricted
+genotype/environment/C9orf72 merge, then per-exposure stratified stats),
+not a paper table, and `generate_c9_stats` depends on files that
+`c9_check` writes to disk rather than on the DB astores the four reports
+above pull from. Both are reachable as their own CLI subcommands
+(`run-c9-check`, `generate-c9-stats`).
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
 log = logging.getLogger(__name__)
@@ -35,7 +38,19 @@ class ReportSpec:
 
 
 def _run_table1() -> None:
-    from gene_environment.report.generate_table1 import run_table1
+    from gene_environment.report.generate_table1 import COHORT_MAPPING_CSV, run_table1
+
+    # Table 1 needs the id -> generation mapping CSV that
+    # build_cohort_mapping.py produces by reading VCF headers. Generate it
+    # automatically if it's missing, rather than failing -- that mapping
+    # only needs to be rebuilt when the VCF sample sets change, so if it's
+    # already there we leave it alone and reuse it as-is.
+    if not Path(COHORT_MAPPING_CSV).exists():
+        log.info("Cohort mapping CSV not found (%s) -- generating it first.", COHORT_MAPPING_CSV)
+        print(f"Cohort mapping CSV not found ({COHORT_MAPPING_CSV}) -- generating it first...")
+        from gene_environment.report.build_cohort_mapping import run_build_cohort_mapping
+        run_build_cohort_mapping(output_csv=COHORT_MAPPING_CSV)
+
     run_table1()
 
 

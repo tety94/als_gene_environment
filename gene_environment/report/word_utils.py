@@ -59,6 +59,16 @@ def set_table_borders(table, color_hex: str = "BFBFBF", size: int = 4) -> None:
     tblPr.append(borders)
 
 
+def set_cell_text(cell, text: str, bold: bool = False) -> None:
+    """Set a table cell's text with optional bold, replacing any existing
+    content. Lighter-weight than the shaded/bordered tables built by
+    add_table_to_doc-style helpers -- for reports that just need a plain
+    "Light Grid Accent 1"-style table with bold highlighting."""
+    cell.text = ""
+    run = cell.paragraphs[0].add_run(text)
+    run.bold = bold
+
+
 def repeat_header_row(table) -> None:
     """Mark a table's first row so it repeats on every page it spans."""
     tr = table.rows[0]._tr

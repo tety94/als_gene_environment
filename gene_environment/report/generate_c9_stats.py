@@ -1,12 +1,12 @@
 """
-generation_stats.py
+generate_c9_stats.py
 
 For each environmental component E (e.g. seminativi_1500, risaie_1500,
 vigneti_1500):
   1. Restrict the cohort to "close" samples only (E > 0).
   2. Use ONLY the variants that get_annotated_results() associated with
      that specific exposure (variant_exposure_map.json, built by
-     build_c9_check.py).
+     c9_check.py).
   3. Within that restricted cohort, for each variant column (0/1), split
      mutated vs non-mutated and test against: sex, onset_site,
      diagnostic_delay, education_years, survival, survival_null, mutaz_bin
@@ -23,8 +23,15 @@ Output layout per component E:
   stats/by_exposure/E/reports/combined_report.docx
   stats/by_exposure/E/reports/c9_report.docx (+ c9 CSVs/plots)
 
-All output (logs, docx content, column headers) is in English.
+All output (logs, docx content, column headers) is in English. Exposure
+values are translated from the source dataset's Italian land-use terms
+to English (see gene_environment.report.exposure_labels, the single
+shared mapping also used by generate_table1/2/2b.py) for display only --
+`exposure` itself is used raw throughout as the key into
+variant_exposure_map / the merged CSV's own column names.
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -35,7 +42,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+from docx import Document
+from docx.shared import Inches
 from scipy import stats
+
+from gene_environment.report.exposure_labels import translate_exposure_value as exposure_label
+from gene_environment.report.word_utils import set_cell_text as _set_cell_text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -61,19 +73,6 @@ SURVIVAL_COL = "survival"
 MUTAZ_RAW_COL = "mutaz"
 
 ALPHA = 0.05  # significance threshold applied to the Bonferroni-corrected p-value
-
-EXPOSURE_LABELS = {
-    "seminativi_1500": "Arable land 1500mt",
-    "vigneti_1500": "Vineyards 1500mt",
-    "risaie_1500": "Rice fields 1500mt",
-    "seminativi_1000": "Arable land 1000mt",
-    "vigneti_1000": "Vineyards 1000mt",
-    "risaie_1000": "Rice fields 1000mt",
-}
-
-
-def exposure_label(exposure: str) -> str:
-    return EXPOSURE_LABELS.get(exposure, exposure)
 
 CATEGORICAL_VARS = [SEX_COL, ONSET_SITE_COL, "mutaz_bin", "survival_null"]
 CONTINUOUS_VARS = [DIAGNOSTIC_DELAY_COL, EDUCATION_YEARS_COL, SURVIVAL_COL]
@@ -248,12 +247,6 @@ def generate_plots(df_gen: pd.DataFrame, results: pd.DataFrame, label: str, plot
 # ----------------------------------------------------------------------
 # Word report helpers
 # ----------------------------------------------------------------------
-def _set_cell_text(cell, text: str, bold: bool = False):
-    cell.text = ""
-    run = cell.paragraphs[0].add_run(text)
-    run.bold = bold
-
-
 def _add_significant_results_table(doc, sig: pd.DataFrame):
     table = doc.add_table(rows=1, cols=6)
     table.style = "Light Grid Accent 1"
@@ -273,8 +266,6 @@ def _add_significant_results_table(doc, sig: pd.DataFrame):
 
 
 def _add_generation_section(doc, results: pd.DataFrame, sig: pd.DataFrame, generation: int, heading_level: int = 2):
-    from docx.shared import Inches
-
     threshold = bonferroni_threshold(results)
     doc.add_heading(f"Generation {generation}", level=heading_level)
     doc.add_paragraph(
@@ -299,8 +290,6 @@ def _add_generation_section(doc, results: pd.DataFrame, sig: pd.DataFrame, gener
 
 
 def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int, exposure: str, cohort_label: str, out_path: Path):
-    from docx import Document
-
     doc = Document()
     doc.add_heading(f"Variant analysis - Exposure: {exposure_label(exposure)} ({cohort_label}) - Generation {generation}", level=1)
     _add_generation_section(doc, results, sig, generation, heading_level=2)
@@ -311,9 +300,6 @@ def build_word_report(results: pd.DataFrame, sig: pd.DataFrame, generation: int,
 
 def build_combined_report(results1: pd.DataFrame, results2: pd.DataFrame,
                            sig1: pd.DataFrame, sig2: pd.DataFrame, exposure: str, cohort_label: str, out_path: Path):
-    from docx import Document
-    from docx.shared import Inches
-
     doc = Document()
     doc.add_heading(f"Variant analysis - Exposure: {exposure_label(exposure)} ({cohort_label}) - Generation 1 vs Generation 2", level=1)
     doc.add_paragraph(
@@ -409,8 +395,6 @@ def _c9_results_for_generation(df_gen: pd.DataFrame, results: pd.DataFrame, gene
 
 
 def _add_c9_generation_section(doc, results: pd.DataFrame, c9: pd.DataFrame, generation: int, heading_level: int = 2, include_plots: bool = True):
-    from docx.shared import Inches
-
     threshold = bonferroni_threshold(results)
     doc.add_heading(f"Generation {generation}", level=heading_level)
     doc.add_paragraph(
@@ -475,8 +459,6 @@ def _add_c9_combined_table(doc, union: pd.DataFrame, results_by_gen: dict):
 
 
 def build_c9_report(df: pd.DataFrame, results_by_gen: dict, exposure: str, c9_dir: Path, out_path: Path):
-    from docx import Document
-
     c9_dir.mkdir(parents=True, exist_ok=True)
     c9_plots_dir = c9_dir / "plots"
 
@@ -600,8 +582,6 @@ def build_close_vs_far_summary(exposure: str, close_res: dict, far_res: dict, ou
     """Side-by-side summary: for every (variant, variable) tested in either
     cohort, show p-value and Bonferroni significance in close vs far, so it's
     easy to spot subgroup-specific (environment-dependent) effects."""
-    from docx import Document
-
     doc = Document()
     doc.add_heading(f"Close vs Far summary - exposure: {exposure_label(exposure)}", level=1)
     doc.add_paragraph(
@@ -705,8 +685,6 @@ def _build_master_summary_table(doc, all_c9_data: list):
 
     table = doc.add_table(rows=1, cols=8)
     table.style = "Light Grid Accent 1"
-    headers = ["Exposure", "Generation", "Variant", "Test", "p-value", "Variant=0 C9+", "Variant=0 C9-", "Variant=1 C9+/C9- (1)"]
-    # NB: last header shortened for space; actual data still has separate C9+/C9- for variant=1 below
     headers = ["Exposure", "Generation", "Variant", "Test", "p-value", "Var=0 C9+", "Var=0 C9-", "Var=1 C9+"]
     for i, h in enumerate(headers):
         _set_cell_text(table.rows[0].cells[i], h, bold=True)
@@ -727,8 +705,6 @@ def build_master_c9_report(all_c9_data: list, out_path: Path):
     """Single docx with ALL exposures' C9 tables (per generation + combined),
     one after another, so everything can be reviewed in one file. No images
     (those are already in each exposure's own c9_report.docx)."""
-    from docx import Document
-
     doc = Document()
     doc.add_heading("C9ORF72 (mutaz_bin) - all exposures", level=1)
     doc.add_paragraph(
@@ -766,9 +742,9 @@ def build_master_c9_report(all_c9_data: list, out_path: Path):
 
 
 # ----------------------------------------------------------------------
-# Main
+# Main (callable, reusable from the report runner and the CLI)
 # ----------------------------------------------------------------------
-def main():
+def run_generate_c9_stats() -> None:
     STATS_DIR.mkdir(parents=True, exist_ok=True)
     BY_EXPOSURE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -789,6 +765,10 @@ def main():
 
     if all_c9_data:
         build_master_c9_report(all_c9_data, BY_EXPOSURE_DIR / "all_c9_report.docx")
+
+
+def main() -> None:
+    run_generate_c9_stats()
 
 
 if __name__ == "__main__":

@@ -21,13 +21,12 @@ Then in generate_table1.py set:
 
 from __future__ import annotations
 
-import gzip
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 import pandas as pd
+
+from gene_environment.report.vcf_utils import get_sample_ids
 
 # ============================================================
 # CONFIG — edit here
@@ -72,36 +71,11 @@ def find_representative_file(vcf_dir) -> Path:
     return candidates[0]
 
 
-def extract_sample_ids_bcftools(vcf_path: Path) -> list[str]:
-    result = subprocess.run(
-        ["bcftools", "query", "-l", str(vcf_path)],
-        capture_output=True, text=True, check=True,
-    )
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
-
-
-def extract_sample_ids_manual(vcf_path: Path) -> list[str]:
-    """Fallback without bcftools: reads line by line until it finds #CHROM."""
-    with gzip.open(vcf_path, "rt") as f:
-        for line in f:
-            if line.startswith("#CHROM"):
-                cols = line.rstrip("\n").split("\t")
-                # fixed VCF columns: CHROM POS ID REF ALT QUAL FILTER INFO FORMAT, then samples
-                fixed = ["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"]
-                return cols[len(fixed):]
-            if not line.startswith("##") and not line.startswith("#CHROM"):
-                # header ended without finding #CHROM: malformed file
-                break
-    sys.exit(f"ERROR: #CHROM line not found in the header of {vcf_path}")
-
-
 def extract_sample_ids(vcf_path: Path) -> list[str]:
-    if shutil.which("bcftools"):
-        try:
-            return extract_sample_ids_bcftools(vcf_path)
-        except subprocess.CalledProcessError as e:
-            print(f"  bcftools failed ({e}), trying manual parsing...")
-    return extract_sample_ids_manual(vcf_path)
+    try:
+        return get_sample_ids(vcf_path)
+    except RuntimeError as e:
+        sys.exit(f"ERROR: {e}")
 
 
 def run_build_cohort_mapping(output_csv: Path = OUTPUT_CSV) -> Path:
