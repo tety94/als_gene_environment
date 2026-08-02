@@ -106,6 +106,22 @@ def run_parallel_processing(
 
 def run_main_pipeline() -> None:
     cfg = get_config()
+    print("=== DEBUG CONFIG ===")
+    print("id(cfg) =", id(cfg))
+    print("GENERATION =", cfg.generation)
+    print("RAW_FILE =", cfg.raw_file)
+    print("ENV_FILE =", cfg.env_file)
+    print("SAMPLE_GENERATION_MAP =", repr(cfg.sample_generation_map))
+    print("ENV_GENERATION_COL =", repr(cfg.env_generation_col))
+    print("OUTPUT_FOLDER =", repr(cfg.output_folder))
+    print("cwd =", os.getcwd())
+    import gene_environment.config as configmod
+    print("map_path risolto =",
+          cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv"))
+    print("map_path esiste? =",
+          os.path.exists(cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv")))
+    print("=====================")
+
     configure_logging(cfg.log_dir)
 
     start_time = datetime.now()

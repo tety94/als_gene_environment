@@ -98,6 +98,10 @@ def _build_narrow_covariates(cfg: Config, gen_ids: pd.Series) -> tuple[pd.DataFr
     map_path = cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv")
     if os.path.exists(map_path):
         gen_map = pd.read_csv(map_path, dtype={"id": str})
+        print("DEBUG generation richiesta:", cfg.generation)
+        print("DEBUG generazioni presenti in gen_map:", gen_map["generation"].unique())
+        print("DEBUG righe dopo filtro generazione:", len(df))
+        print("DEBUG esempio id filtrati:", df["id"].head(5).tolist())
         n_before = len(df)
         df = df.merge(gen_map, on="id", how="left")
         n_missing_map = df["generation"].isna().sum()
@@ -187,6 +191,9 @@ def load_and_prepare_data(cfg: Config | None = None):
     covariates, Ecols, covariate_cols = _build_narrow_covariates(cfg, df_gen["id"])
 
     log.info("Merge finale (unico touch del dataframe genetico largo) su 'id'")
+    print("DEBUG id covariates (dopo filtro gen):", covariates["id"].head(10).tolist())
+    print("DEBUG id df_gen (genetica):", df_gen["id"].head(10).tolist())
+    print("DEBUG overlap:", len(set(covariates["id"]) & set(df_gen["id"])))
     df = pd.merge(covariates, df_gen, on="id", how="inner")
 
     n_cov, n_gen, n_merged = len(covariates), len(df_gen), len(df)
