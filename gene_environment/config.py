@@ -30,7 +30,7 @@ try:
     _here = Path(__file__).resolve().parent.parent
     for candidate in (Path.cwd() / ".env", _here / ".env"):
         if candidate.exists():
-            load_dotenv(candidate)
+            load_dotenv(candidate, override=True)
             break
 except ImportError:
     # python-dotenv è opzionale: se non installato, ci si affida alle env vars
