@@ -1,28 +1,26 @@
 """
-Synthetic dataset generator (genetics + environment + population PCs),
-PARAMETRIZED REFACTOR of the original version.
+Synthetic dataset generator (genetics + environment + population PCs) for
+testing the gene_environment/vqtl pipeline.
 
-Everything that used to be a module-level constant (N_PATIENTS,
-CAUSAL_VARIANTS, PURE_VARIANCE_VARIANTS, prop_unexposed, missing rate,
-RNG_SEED, etc.) is now an argument of `generate_dataset(...)`, so the same
-generator can be called in a loop from a multi-scenario orchestration script
-(see run_scenarios.py) without duplicating code or hand-editing constants
-for every run.
+All simulation parameters (N_PATIENTS, CAUSAL_VARIANTS,
+PURE_VARIANCE_VARIANTS, prop_unexposed, missing rate, RNG_SEED, etc.) are
+arguments of `generate_dataset(...)`, so the same generator can be called
+in a loop from a multi-scenario orchestration script (see run_scenarios.py)
+without duplicating code or hand-editing constants for every run.
 
-When launched from the command line it behaves like the original script
-(same defaults), but accepts two optional arguments:
+When launched from the command line it uses sensible defaults, but accepts
+two optional arguments:
   --out-dir       output folder (default: <script_dir>/fake_data)
   --config-json   path to a JSON file with a subset of generate_dataset()
                    kwargs to override relative to the defaults (used by the
                    multi-scenario orchestrator)
 
-NEW STRESS-TEST PARAMETERS (absent from the original version, all disabled
-by default -> identical behaviour to the original if not specified):
+STRESS-TEST PARAMETERS (all disabled by default):
 
   - subpop_frac / subpop_onset_shift / subpop_maf_shift: simulate a real
     population structure (two subpopulations with different MAF and
     baseline onset_age) that the PCs written to output do NOT capture (the
-    PCs remain independent Gaussian noise, as in the original) -- used to
+    PCs remain independent Gaussian noise) -- used to
     stress-test the correction for stratification: if lambda_GC rises
     noticeably relative to the "no stratification" scenario, correction via
     (here, uninformative) PCs is not enough, exactly as can happen in
@@ -47,7 +45,7 @@ import pandas as pd
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_CAUSAL_VARIANTS = {
-    # original, unchanged (backward compatibility with scenarios already run)
+    # base set (kept fixed for backward compatibility with scenarios already run)
     "1_1000001_A_G": (-4.5, -1.0),
     "2_2000002_C_T": (4.0, 0.5),
     "3_3000003_G_A": (-3.5, 0.0),
@@ -140,7 +138,7 @@ DEFAULT_CAUSAL_VARIANTS = {
 }
 
 DEFAULT_PURE_VARIANCE_VARIANTS = {
-    # original
+    # base pair
     "7_7000001_A_G": {0: 3.0, 1: 12.0},
     "7_7000002_C_T": {0: 12.0, 1: 3.0},
 
@@ -164,8 +162,8 @@ DEFAULT_PURE_VARIANCE_VARIANTS = {
 
 def _stream(rng_seed: int, label: str) -> np.random.Generator:
     """Deterministic, independent random generator per label, seeded on
-    (rng_seed, label) -- see the original docstring for why md5 instead of
-    the built-in hash()."""
+    (rng_seed, label). Uses md5 rather than the built-in hash(), since
+    Python's hash() randomization makes it non-reproducible across runs."""
     digest = hashlib.md5(f"{rng_seed}:{label}".encode("utf-8")).hexdigest()
     seed = int(digest[:8], 16)
     return np.random.default_rng(seed)
