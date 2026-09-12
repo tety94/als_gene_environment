@@ -1,3 +1,4 @@
+"""Ensembl REST API client: gene lookup by id/region/symbol and ENSG -> UniProt cross-reference."""
 import requests
 
 class EnsemblAPI:
@@ -61,7 +62,7 @@ class EnsemblAPI:
         r.raise_for_status()
         xrefs = r.json()
 
-        #  può averne più di uno perchè può codificare più proteine
+        # A gene can have more than one UniProt entry if it encodes multiple proteins
         uniprots = [x["primary_id"] for x in xrefs if x["dbname"].lower().startswith("uniprot")]
 
         return uniprots

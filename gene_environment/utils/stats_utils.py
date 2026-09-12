@@ -1,15 +1,4 @@
-"""
-Utility statistiche generiche (ex utils.py).
-
-Fix rispetto all'originale:
-  - volcano_plot: `-np.log10(df[p_col])` esplodeva a +inf quando un p-value
-    empirico era esattamente 0 (capita spesso con permutation test quando
-    l'effetto osservato supera tutte le permutazioni, es. p=0/10000). Un
-    +inf nel plot rompe la scala dell'asse y silenziosamente. Ora i p-value
-    vengono clippati a un minimo > 0 prima del log.
-  - save_path ora obbligatorio (evita che in un job non interattivo lo
-    script si blocchi su plt.show()).
-"""
+"""Generic statistics helpers: FDR correction and the gene x environment volcano plot."""
 from __future__ import annotations
 
 import numpy as np
@@ -46,14 +35,16 @@ def volcano_plot(
     min_p_for_log: float = 1e-300,
 ):
     if not save_path:
-        raise ValueError("save_path è obbligatorio: niente plt.show() in job non interattivi.")
+        raise ValueError("save_path is required: no plt.show() in non-interactive jobs.")
 
     df = df.copy()
+    # Clip p-values before the log so an exact p=0 (observed effect beating
+    # every permutation) doesn't blow up to +inf and break the y-axis scale.
     safe_p = df[p_col].astype(float).clip(lower=min_p_for_log)
     df["neglog10p"] = -np.log10(safe_p)
 
     fig, ax = plt.subplots(figsize=(9, 7))
-    ax.scatter(df[beta_col], df["neglog10p"], alpha=0.6, label="tutte le varianti")
+    ax.scatter(df[beta_col], df["neglog10p"], alpha=0.6, label="all variants")
     ax.axhline(-np.log10(p_thresh), linestyle="--", color="red", label=f"p = {p_thresh}")
 
     if fdr_col in df.columns:
@@ -63,11 +54,11 @@ def volcano_plot(
             s=50, edgecolor="black", label=f"FDR < {fdr_thresh}", color="orange",
         )
 
-    ax.set_xlabel("Beta dell'interazione")
+    ax.set_xlabel("Interaction beta")
     ax.set_ylabel("-log10(p)")
-    ax.set_title("Volcano Plot: Interazioni Gene x Ambiente")
+    ax.set_title("Volcano Plot: Gene x Environment Interactions")
     ax.legend()
     fig.tight_layout()
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    log.info("Volcano plot salvato in %s", save_path)
+    log.info("Volcano plot saved to %s", save_path)

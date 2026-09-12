@@ -1,85 +1,61 @@
-"""
-Filtraggio VCF -> PLINK binario -> MAF filter -> LD pruning -> VCF filtrato.
-(ex gene_reduction.py)
+"""VCF filtering -> binary PLINK -> MAF filter -> LD pruning -> filtered VCF.
 
-Fix rispetto all'originale:
-  - Il loop sui file VCF era completamente SEQUENZIALE (un file dopo l'altro),
-    nonostante MAX_WORKERS fosse già configurato e usato altrove nella
-    pipeline. Con decine/centinaia di file VCF per cromosoma questo è lo
-    step più lento di tutta la pipeline "a monte". Ora è parallelizzato con
-    ProcessPoolExecutor, un processo per file VCF (ogni chiamata plink2 è
-    già mono-processo pesante in I/O+CPU, quindi parallelizzare a livello di
-    file ha senso ed è sicuro).
-  - Idempotenza: se l'output finale (_filtered.vcf.gz) esiste già ED È
-    VALIDO (vedi sotto), il file viene saltato invece di essere ricalcolato
-    da capo ad ogni rilancio.
-  - Il prefisso "ACH" usato per escludere campioni dal .fam era hardcoded
-    senza alcun commento sul perché. Ora è un parametro di configurazione
-    esplicito (EXCLUDE_ID_PREFIXES), documentato, con default vuoto: se non
-    configurato non viene rimosso silenziosamente nessun campione.
-  - Ogni subprocess.run(..., check=True) ora logga comando ed esito; un
-    fallimento di plink2 su UN file non blocca più necessariamente l'intero
-    batch (l'errore viene loggato e si passa al file successivo, il
-    riepilogo finale elenca i falliti).
+Design notes:
+  - Files are processed in PARALLEL with ProcessPoolExecutor, one process
+    per VCF file (each plink2 call is already a heavy single-process I/O+CPU
+    job, so parallelizing at the file level is safe and effective).
+  - Idempotency: if the final output (_filtered.vcf.gz) already exists AND
+    IS VALID (see _is_valid_bgzip), the file is skipped instead of being
+    recomputed on every rerun.
+  - The id prefixes used to exclude samples from the .fam file are an
+    explicit, documented configuration parameter (EXCLUDE_ID_PREFIXES),
+    defaulting to empty: if not configured, no sample is silently removed.
+  - Every subprocess.run(..., check=True) logs the command and outcome; a
+    plink2 failure on ONE file doesn't necessarily block the whole batch
+    (the error is logged and the next file is processed; the final summary
+    lists the failures).
 
-FIX (10 luglio 2026 - VCF filtrati enormi e corruzione a valle):
-  - CAUSA #1 dei file enormi: l'ultimo step chiamava
-    `plink2 --recode vcf`, che scrive VCF TESTUALE non compresso (da qui i
-    GB, a fronte di VCF di input compressi). Ora si usa
-    `plink2 --export vcf bgz`, che scrive direttamente in bgzip (blocked
-    gzip): file molto più piccoli, e bgzip è letto nativamente da cyvcf2
-    nello step successivo (vcf_to_parquet.py) senza bisogno di
-    decompressione manuale. L'output finale è quindi *_filtered.vcf.gz
-    invece di *_filtered.vcf.
-  - CAUSA #2 della corruzione a valle: il VCF finale veniva scritto da
-    plink2 DIRETTAMENTE sul path definitivo (*_filtered.vcf). Se il
-    processo veniva ucciso a metà (OOM, kill manuale, disco pieno - reso
-    più probabile proprio dai VCF non compressi), restava un file
-    TRONCATO con il nome "finale": al run successivo l'idempotenza lo
-    considerava completo (os.path.exists) e lo saltava, e vcf_to_parquet.py
-    andava in crash provando a leggerlo (i controlli di corruzione lì
-    presenti coprono solo i file .parquet, non i VCF di input). Ora ogni
-    file viene scritto su un prefisso temporaneo e poi spostato sul path
-    finale con os.replace() SOLO se la scrittura è andata a buon fine
-    (stesso pattern "scrivi su tmp poi rinomina" già usato per i parquet in
-    vcf_to_parquet.py): un processo ucciso a metà non lascia mai un
-    .vcf.gz troncato sul path definitivo.
-  - Il controllo di idempotenza ora valida anche che il .vcf.gz esistente
-    sia un bgzip leggibile per intero (non solo che il file esista): un
-    .vcf.gz troncato da un run precedente a QUESTA fix viene rilevato e
-    rigenerato invece di essere scambiato per completo.
-  - Log numerici: per ogni file vengono ora loggati (e salvati in un CSV
-    riepilogativo in <log_dir>/filter_vcf_stats.csv) campioni totali,
-    campioni esclusi per prefisso id, varianti prima del filtro MAF,
-    varianti dopo il filtro MAF, varianti dopo l'LD pruning. Il log va
-    anche su file (<log_dir>/filter_vcf.log), non solo su console, sia nel
-    processo principale sia in ogni worker (processi separati non
-    ereditano gli handler di logging del padre).
+Output format and atomic writes: the final export uses
+`plink2 --export vcf bgz`, which writes directly in bgzip (blocked gzip)
+format -- much smaller than uncompressed VCF, and natively readable by
+cyvcf2 in the next step (vcf_to_parquet.py) with no manual decompression
+needed. The output is therefore *_filtered.vcf.gz. Each file is written to
+a temporary prefix and only moved to the final path with os.replace() once
+the write succeeds (same "write to tmp then rename" pattern used for the
+parquet files in vcf_to_parquet.py): a process killed midway never leaves
+a truncated .vcf.gz at the final path. The idempotency check also
+validates that an existing .vcf.gz is a fully readable bgzip (not just
+that the file exists), so a truncated file from an interrupted run is
+detected and regenerated rather than mistaken for complete.
 
-FIX (10 luglio 2026 - pulizia automatica degli intermedi):
-  - Ogni file VCF di input produce, oltre al risultato finale
-    *_filtered.vcf.gz (poche decine di MB), una catena di file intermedi
-    plink2 (*_plink.bed/.bim/.fam, *_maf.bed/.bim/.fam, *_pruned.*,
-    *_plink_remove.txt) che NON servono a nessuno step successivo della
-    pipeline: vcf_to_parquet.py legge esclusivamente *_filtered.vcf.gz
-    (vedi glob "*_filtered.vcf.gz" in convert_filtered_vcfs_to_parquet).
-    Questi intermedi sono anche di gran lunga i file più pesanti prodotti
-    da questo script (il *_plink.bed di un cromosoma può superare i 2GB),
-    quindi lasciarli su disco moltiplica inutilmente lo spazio occupato
-    per ogni cromosoma processato.
-    Ora, subito dopo che il *_filtered.vcf.gz finale è stato scritto E
-    VALIDATO (quindi mai prima, e mai se la validazione fallisce), tutti
-    gli intermedi relativi a quel singolo file vengono rimossi con
-    _cleanup_intermediates(). Questo è sicuro perché l'idempotenza dello
-    script si basa SOLO sull'esistenza/validità del .vcf.gz finale (vedi
-    _is_valid_bgzip più sotto): se il file finale manca o è invalido, lo
-    script riparte comunque da zero da plink2 --vcf <input originale>,
-    MAI dagli intermedi. La pulizia viene fatta anche nel path di "skip"
-    (output già presente e valido), per ripulire retroattivamente run
-    precedenti a questa fix in cui gli intermedi erano rimasti sul disco.
-    Comportamento disattivabile impostando cfg.keep_intermediate_files
-    (se il campo non esiste nella config del progetto, il default è
-    "pulisci", tramite getattr per non rompere config esistenti).
+Numeric logging: for each file, total samples, samples excluded by id
+prefix, variants before/after the MAF filter, and variants after LD
+pruning are logged and saved to a summary CSV at
+<log_dir>/filter_vcf_stats.csv. Logging also goes to file
+(<log_dir>/filter_vcf.log), not just console, in both the main process and
+every worker (separate processes don't inherit the parent's logging
+handlers).
+
+Intermediate file cleanup: each input VCF file produces, besides the final
+*_filtered.vcf.gz result, a chain of intermediate plink2 files
+(*_plink.bed/.bim/.fam, *_maf.bed/.bim/.fam, *_pruned.*,
+*_plink_remove.txt) that no later pipeline step needs: vcf_to_parquet.py
+reads exclusively *_filtered.vcf.gz (see the "*_filtered.vcf.gz" glob in
+convert_filtered_vcfs_to_parquet). These intermediates are also by far the
+heaviest files produced by this script (a chromosome's *_plink.bed can
+exceed 2GB), so leaving them on disk needlessly multiplies the space used
+per processed chromosome.
+Right after the final *_filtered.vcf.gz has been written AND VALIDATED
+(never before, and never if validation fails), all intermediates for that
+single file are removed with _cleanup_intermediates(). This is safe
+because the script's idempotency relies ONLY on the existence/validity of
+the final .vcf.gz (see _is_valid_bgzip below): if the final file is
+missing or invalid, the script restarts from scratch from
+plink2 --vcf <original input>, NEVER from the intermediates. Cleanup also
+runs on the "skip" path (output already present and valid), to
+retroactively clean up runs where intermediates were left on disk.
+Configurable via cfg.keep_intermediate_files (defaults to "clean up" via
+getattr, so it doesn't break configs that don't define this field).
 """
 from __future__ import annotations
 
@@ -101,11 +77,11 @@ OUTPUT_SUBFOLDER = "vcf_filtered"
 LOG_FILENAME = "filter_vcf.log"
 STATS_FILENAME = "filter_vcf_stats.csv"
 
-# Pattern (relativi a <output_vcf_folder>/<base_name>) dei file intermedi da
-# rimuovere una volta che *_filtered.vcf.gz è confermato valido. Elencati
-# esplicitamente (invece di un catch-all tipo "tutto tranne *_filtered.*")
-# per non rischiare di cancellare per errore qualcosa che non ci si aspetta,
-# se in futuro lo script produce altri file con naming diverso.
+# Patterns (relative to <output_vcf_folder>/<base_name>) of the
+# intermediate files to remove once *_filtered.vcf.gz is confirmed valid.
+# Listed explicitly (instead of a catch-all like "everything except
+# *_filtered.*") to avoid accidentally deleting something unexpected if
+# the script produces other files with different naming in the future.
 _INTERMEDIATE_SUFFIXES = [
     "_plink.bed", "_plink.bim", "_plink.fam", "_plink.log",
     "_maf.bed", "_maf.bim", "_maf.fam", "_maf.log",
@@ -116,17 +92,17 @@ _INTERMEDIATE_SUFFIXES = [
 
 
 def _add_file_logging(log_dir: str) -> None:
-    """Aggiunge (una sola volta per processo) un FileHandler al root logger,
-    così i log finiscono sia su console sia su <log_dir>/filter_vcf.log.
-    Va richiamata sia nel processo principale sia in ogni worker (sono
-    processi separati e non ereditano gli handler di logging del padre)."""
+    """Adds (once per process) a FileHandler to the root logger, so logs go
+    both to console and to <log_dir>/filter_vcf.log. Must be called in both
+    the main process and every worker (separate processes don't inherit
+    the parent's logging handlers)."""
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.abspath(os.path.join(log_dir, LOG_FILENAME))
 
     root = logging.getLogger()
     for h in root.handlers:
         if isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == log_path:
-            return  # già aggiunto in questo processo
+            return  # already added in this process
 
     fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [pid=%(process)d] %(name)s: %(message)s"))
@@ -134,16 +110,16 @@ def _add_file_logging(log_dir: str) -> None:
     root.addHandler(fh)
     if root.level > logging.INFO or root.level == logging.NOTSET:
         root.setLevel(logging.INFO)
-    log.info("Logging su file abilitato: %s", log_path)
+    log.info("File logging enabled: %s", log_path)
 
 
 def _is_valid_bgzip(path: str) -> bool:
-    """True se il file esiste, non è vuoto, ed è un bgzip/gzip leggibile per
-    intero (nessun blocco troncato). Decomprimere per intero ha un costo,
-    ma questi sono i VCF già filtrati/pruned quindi relativamente piccoli;
-    è lo stesso principio del controllo footer usato per i parquet
-    nell'altro script, adattato al formato gzip che non ha un footer
-    comodo da leggere in isolamento."""
+    """True if the file exists, is non-empty, and is a fully readable
+    bgzip/gzip (no truncated block). Decompressing fully has a cost, but
+    these are already filtered/pruned VCFs so relatively small; same
+    principle as the footer check used for the parquet files elsewhere,
+    adapted to the gzip format which has no convenient footer to read in
+    isolation."""
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return False
     try:
@@ -152,17 +128,17 @@ def _is_valid_bgzip(path: str) -> bool:
                 pass
         return True
     except Exception as e:
-        log.warning("VCF filtrato non valido/troncato, verrà rigenerato: %s (%s)", path, e)
+        log.warning("Filtered VCF invalid/truncated, will be regenerated: %s (%s)", path, e)
         return False
 
 
 def _cleanup_intermediates(output_vcf_folder: str, base_name: str, vcf_file: str) -> int:
-    """Rimuove i file intermedi plink2 (plink/maf/pruned/remove-list/log tmp)
-    relativi a <base_name>, DOPO che *_filtered.vcf.gz è stato validato.
-    Non tocca mai *_filtered.vcf.gz né altri file non elencati in
-    _INTERMEDIATE_SUFFIXES. Ritorna il numero di file effettivamente
-    rimossi (0 se non c'era nulla da pulire, es. già pulito in run
-    precedente)."""
+    """Removes the plink2 intermediate files (plink/maf/pruned/remove-list/
+    tmp log) for <base_name>, AFTER *_filtered.vcf.gz has been validated.
+    Never touches *_filtered.vcf.gz or any file not listed in
+    _INTERMEDIATE_SUFFIXES. Returns the number of files actually removed
+    (0 if there was nothing to clean, e.g. already cleaned by an earlier
+    run)."""
     n_removed = 0
     for suffix in _INTERMEDIATE_SUFFIXES:
         path = os.path.join(output_vcf_folder, base_name + suffix)
@@ -171,14 +147,14 @@ def _cleanup_intermediates(output_vcf_folder: str, base_name: str, vcf_file: str
                 os.remove(path)
                 n_removed += 1
             except OSError as e:
-                log.warning("[%s] impossibile rimuovere intermedio %s: %s", vcf_file, path, e)
+                log.warning("[%s] could not remove intermediate %s: %s", vcf_file, path, e)
     if n_removed:
-        log.info("[%s] puliti %d file intermedi (plink/maf/pruned)", vcf_file, n_removed)
+        log.info("[%s] cleaned up %d intermediate files (plink/maf/pruned)", vcf_file, n_removed)
     return n_removed
 
 
 def _run(cmd: list[str], log_prefix: str) -> None:
-    log.debug("%s: eseguo: %s", log_prefix, " ".join(cmd))
+    log.debug("%s: running: %s", log_prefix, " ".join(cmd))
     subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
@@ -203,26 +179,26 @@ class FilterStats:
 def filter_single_vcf(
     input_path: str, output_vcf_folder: str, cfg_dict: dict
 ) -> tuple[str, bool, str | None, FilterStats]:
-    """Esegue l'intera catena plink2 per un singolo VCF. Ritorna
-    (nome_file, successo, messaggio_errore, statistiche_numeriche)."""
+    """Runs the full plink2 chain for a single VCF. Returns
+    (file_name, success, error_message, numeric_stats)."""
     from gene_environment.logging_utils import configure_logging as _cfg_log
 
-    _cfg_log(cfg_dict["log_dir"])  # necessario nei worker separati
+    _cfg_log(cfg_dict["log_dir"])  # needed in separate worker processes
     _add_file_logging(cfg_dict["log_dir"])
 
     t0 = time.monotonic()
     vcf_file = os.path.basename(input_path)
-    base_name = os.path.splitext(os.path.splitext(vcf_file)[0])[0]  # rimuove .vcf.gz
+    base_name = os.path.splitext(os.path.splitext(vcf_file)[0])[0]  # strip .vcf.gz
     stats = FilterStats(vcf_file=vcf_file)
     keep_intermediates = cfg_dict["keep_intermediate_files"]
 
     final_vcf_path = os.path.join(output_vcf_folder, base_name + "_filtered.vcf.gz")
     if _is_valid_bgzip(final_vcf_path):
-        log.info("[%s] output già presente e valido, salto: %s", vcf_file, final_vcf_path)
+        log.info("[%s] output already present and valid, skipping: %s", vcf_file, final_vcf_path)
         stats.skipped = True
-        # Anche in caso di skip, ripulisco eventuali intermedi rimasti da
-        # run precedenti a questa fix (idempotente: se non c'è nulla da
-        # rimuovere, _cleanup_intermediates ritorna semplicemente 0).
+        # Even on skip, clean up any leftover intermediates from earlier
+        # runs (idempotent: if there's nothing to remove,
+        # _cleanup_intermediates simply returns 0).
         if not keep_intermediates:
             stats.intermediates_cleaned = _cleanup_intermediates(output_vcf_folder, base_name, vcf_file)
         stats.elapsed_seconds = time.monotonic() - t0
@@ -249,7 +225,7 @@ def filter_single_vcf(
                     n_removed += 1
         stats.n_samples_removed = n_removed
         if n_removed:
-            log.info("[%s] %d campioni esclusi per prefisso id (%s)", vcf_file, n_removed, exclude_prefixes)
+            log.info("[%s] %d samples excluded by id prefix (%s)", vcf_file, n_removed, exclude_prefixes)
 
         plink_maf_prefix = os.path.join(output_vcf_folder, base_name + "_maf")
         remove_args = ["--remove", remove_file] if n_removed else []
@@ -260,7 +236,7 @@ def filter_single_vcf(
         )
         stats.n_variants_after_maf = _count_lines(plink_maf_prefix + ".bim")
         log.info(
-            "[%s] varianti: %d (raw) -> %d (dopo MAF >= %s)",
+            "[%s] variants: %d (raw) -> %d (after MAF >= %s)",
             vcf_file, stats.n_variants_raw, stats.n_variants_after_maf, cfg_dict["maf_threshold"],
         )
 
@@ -273,19 +249,19 @@ def filter_single_vcf(
         )
         stats.n_variants_after_pruning = _count_lines(plink_prune_prefix + ".prune.in")
         log.info(
-            "[%s] varianti: %d (dopo MAF) -> %d (dopo LD pruning, window=%s step=%s r2=%s)",
+            "[%s] variants: %d (after MAF) -> %d (after LD pruning, window=%s step=%s r2=%s)",
             vcf_file, stats.n_variants_after_maf, stats.n_variants_after_pruning,
             cfg_dict["ld_window_size"], cfg_dict["ld_step"], cfg_dict["ld_r2_threshold"],
         )
 
-        # Scrittura ATOMICA: si esporta su un prefisso temporaneo e solo se
-        # plink2 termina con successo si sposta il .vcf.gz risultante sul
-        # path finale. Se il processo viene ucciso a metà, il path finale
-        # non esiste ancora (niente file troncato con nome "definitivo").
+        # ATOMIC write: export to a temporary prefix and only move the
+        # resulting .vcf.gz to the final path once plink2 succeeds. If the
+        # process is killed midway, the final path doesn't exist yet (no
+        # truncated file with the "final" name).
         tmp_prefix = os.path.join(output_vcf_folder, base_name + "_filtered_tmp")
         tmp_vcf_gz = tmp_prefix + ".vcf.gz"
         if os.path.exists(tmp_vcf_gz):
-            os.remove(tmp_vcf_gz)  # residuo di un run interrotto precedente
+            os.remove(tmp_vcf_gz)  # leftover from a previous interrupted run
 
         _run(
             ["plink2", "--bfile", plink_maf_prefix, "--extract", plink_prune_prefix + ".prune.in",
@@ -294,21 +270,21 @@ def filter_single_vcf(
         )
 
         if not _is_valid_bgzip(tmp_vcf_gz):
-            raise RuntimeError(f"plink2 ha prodotto un .vcf.gz non valido: {tmp_vcf_gz}")
+            raise RuntimeError(f"plink2 produced an invalid .vcf.gz: {tmp_vcf_gz}")
 
         os.replace(tmp_vcf_gz, final_vcf_path)
 
         log.info(
-            "[%s] filtrato con successo -> %s (%d campioni [-%d], %d varianti finali)",
+            "[%s] filtered successfully -> %s (%d samples [-%d], %d final variants)",
             vcf_file, final_vcf_path, stats.n_samples_total - stats.n_samples_removed,
             stats.n_samples_removed, stats.n_variants_after_pruning,
         )
 
-        # Pulizia intermedi: SOLO ora, dopo che il .vcf.gz finale è stato
-        # scritto atomicamente e validato dal controllo bgzip sopra. Se
-        # qualsiasi step precedente fallisce, si finisce nel blocco except
-        # e gli intermedi restano sul disco (utili per debug del run
-        # fallito).
+        # Intermediate cleanup: ONLY now, after the final .vcf.gz has been
+        # written atomically and validated by the bgzip check above. If
+        # any earlier step fails, execution ends up in the except block
+        # and the intermediates stay on disk (useful for debugging the
+        # failed run).
         if not keep_intermediates:
             stats.intermediates_cleaned = _cleanup_intermediates(output_vcf_folder, base_name, vcf_file)
 
@@ -317,20 +293,19 @@ def filter_single_vcf(
 
     except subprocess.CalledProcessError as e:
         err = f"{e}\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}"
-        log.error("[%s] fallito: %s", vcf_file, err)
+        log.error("[%s] failed: %s", vcf_file, err)
         stats.elapsed_seconds = time.monotonic() - t0
         return vcf_file, False, err, stats
-    except Exception as e:  # es. RuntimeError sopra per bgzip non valido
-        log.error("[%s] fallito: %s", vcf_file, e)
+    except Exception as e:  # e.g. the RuntimeError above for an invalid bgzip
+        log.error("[%s] failed: %s", vcf_file, e)
         stats.elapsed_seconds = time.monotonic() - t0
         return vcf_file, False, str(e), stats
 
 
 def _write_stats_csv(all_stats: list[FilterStats], log_dir: str) -> str:
-    """Scrive un CSV riepilogativo con le statistiche numeriche di ogni
-    file processato in questo run, in <log_dir>/filter_vcf_stats.csv.
-    Scrittura atomica (tmp + rename) come per gli altri output della
-    pipeline."""
+    """Writes a summary CSV with the numeric statistics for every file
+    processed in this run, to <log_dir>/filter_vcf_stats.csv. Atomic write
+    (tmp + rename), same as other pipeline outputs."""
     os.makedirs(log_dir, exist_ok=True)
     out_path = os.path.join(log_dir, STATS_FILENAME)
     tmp_path = out_path + ".tmp"
@@ -354,27 +329,27 @@ def run_filter_vcf(exclude_id_prefixes: list[str] | None = None) -> None:
     configure_logging(cfg.log_dir)
     _add_file_logging(cfg.log_dir)
 
-    # default: legge da config (EXCLUDE_ID_PREFIXES), non più una lista vuota fissa
+    # default: read from config (EXCLUDE_ID_PREFIXES)
     exclude_id_prefixes = exclude_id_prefixes if exclude_id_prefixes is not None else cfg.exclude_id_prefixes
     if exclude_id_prefixes:
-        log.info("Prefissi id da escludere dal filtraggio: %s", exclude_id_prefixes)
+        log.info("Id prefixes to exclude from filtering: %s", exclude_id_prefixes)
     else:
         log.warning(
-            "EXCLUDE_ID_PREFIXES non configurato: nessun campione verrà escluso per prefisso id. "
-            "Lo script originale escludeva sempre i campioni con id che iniziano per 'ACH' — "
-            "se è ancora il comportamento voluto, imposta EXCLUDE_ID_PREFIXES=ACH nel .env."
+            "EXCLUDE_ID_PREFIXES not configured: no sample will be excluded by id prefix. "
+            "If you need to exclude samples with a specific id prefix, "
+            "set EXCLUDE_ID_PREFIXES in the .env."
         )
 
-    # keep_intermediate_files: campo opzionale della config del progetto.
-    # Se non esiste (config non ancora aggiornata), il default è False,
-    # cioè "pulisci gli intermedi" — è il comportamento desiderato dato
-    # che pesano ordini di grandezza più del risultato finale e non sono
-    # letti da nessun altro step della pipeline.
+    # keep_intermediate_files: optional project config field. If it
+    # doesn't exist, the default is False, i.e. "clean up the
+    # intermediates" -- the desired behavior since they're orders of
+    # magnitude heavier than the final result and aren't read by any other
+    # pipeline step.
     keep_intermediates = getattr(cfg, "keep_intermediate_files", False)
     if keep_intermediates:
-        log.info("keep_intermediate_files=True: i file intermedi plink/maf/pruned NON verranno rimossi.")
+        log.info("keep_intermediate_files=True: the plink/maf/pruned intermediate files will NOT be removed.")
     else:
-        log.info("I file intermedi plink/maf/pruned verranno rimossi automaticamente dopo ogni file completato con successo.")
+        log.info("The plink/maf/pruned intermediate files will be removed automatically after each file completes successfully.")
 
     cfg_dict = {
         "maf_threshold": cfg.maf_threshold,
@@ -394,11 +369,11 @@ def run_filter_vcf(exclude_id_prefixes: list[str] | None = None) -> None:
             f for f in os.listdir(input_folder)
             if f.endswith(".vcf.gz") and not f.startswith("._")
         ]
-        log.info("Generazione %d: %d VCF trovati in %s", generation, len(vcf_files), input_folder)
+        log.info("Generation %d: %d VCFs found in %s", generation, len(vcf_files), input_folder)
         for vcf_file in vcf_files:
             jobs.append((os.path.join(input_folder, vcf_file), output_vcf_folder))
 
-    log.info("Filtraggio VCF: %d file da processare con %d worker", len(jobs), cfg.max_workers)
+    log.info("VCF filtering: %d files to process with %d workers", len(jobs), cfg.max_workers)
 
     t_start = time.monotonic()
     failed = []
@@ -423,20 +398,20 @@ def run_filter_vcf(exclude_id_prefixes: list[str] | None = None) -> None:
     tot_intermediates_cleaned = sum(s.intermediates_cleaned for s in all_stats)
 
     log.info(
-        "Riepilogo filtraggio VCF: %d file totali, %d ok (%d saltati perché già presenti), "
-        "%d falliti, tempo totale %.1fs. Varianti (somma su tutti i file processati in questo "
-        "run, esclusi gli skip): %d raw -> %d dopo MAF -> %d finali dopo LD pruning. "
-        "Campioni esclusi per prefisso id (somma): %d. File intermedi rimossi (somma): %d. "
-        "Statistiche per-file salvate in %s",
+        "VCF filtering summary: %d total files, %d ok (%d skipped as already present), "
+        "%d failed, total time %.1fs. Variants (summed across all files processed in this "
+        "run, skips excluded): %d raw -> %d after MAF -> %d final after LD pruning. "
+        "Samples excluded by id prefix (sum): %d. Intermediate files removed (sum): %d. "
+        "Per-file statistics saved to %s",
         len(jobs), n_ok, n_skipped, len(failed), elapsed_total,
         tot_variants_raw, tot_variants_after_maf, tot_variants_final,
         tot_samples_removed, tot_intermediates_cleaned, stats_path,
     )
 
     if failed:
-        log.error("Filtraggio completato con %d errori su %d file: %s", len(failed), len(jobs), [f for f, _ in failed])
+        log.error("Filtering complete with %d errors out of %d files: %s", len(failed), len(jobs), [f for f, _ in failed])
     else:
-        log.info("Filtraggio VCF completato senza errori (%d file).", len(jobs))
+        log.info("VCF filtering complete with no errors (%d files).", len(jobs))
 
 
 if __name__ == "__main__":

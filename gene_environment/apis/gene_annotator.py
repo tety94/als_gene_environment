@@ -1,3 +1,4 @@
+"""Aggregates gene annotations from Ensembl, GTEx, HPA, PanelApp, Open Targets and CTD into a single neuro-plausibility record."""
 from gene_environment.apis.ctd_api import CTDAPI
 from gene_environment.apis.ensembl_api import EnsemblAPI
 from gene_environment.apis.gtex_api import GTExAPI
@@ -13,21 +14,21 @@ class GeneAnnotator:
     @staticmethod
     def annotate(ensg: str):
         info = EnsemblAPI.get_gene_info(ensg)
-        gene_symbol = info.get("gene_symbol")  # puo' essere None: gestito a valle da PanelApp/CTD
+        gene_symbol = info.get("gene_symbol")  # may be None: handled downstream by PanelApp/CTD
         gene_type = info.get("gene_type")
 
         gtex = GTExAPI.get_brain_expression(ensg)
         hpa = HPAAPI.get_single_cell_info(ensg)
 
-        # GO disattivato: niente chiamata esterna, campo a NULL per velocizzare
+        # GO disabled: no external call, field left NULL for speed
         go_neuro_processes = None
         go_toxic_response = None
 
         panelapp = PanelAppAPI.get_als_status(gene_symbol)
         opentargets = OpenTargetsAPI.get_als_association(ensg)
 
-        # CTD: indici caricati una volta per processo worker (lazy cache),
-        # query per simbolo (non ENSG, l'indice CTD e' keyed su GeneSymbol)
+        # CTD: indices loaded once per worker process (lazy cache),
+        # queried by symbol (not ENSG -- the CTD index is keyed on GeneSymbol)
         ctd_data = CTDAPI.query_gene(
             gene_symbol,
             CTDAPI.get_chem_index(),

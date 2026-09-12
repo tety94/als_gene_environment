@@ -1,39 +1,4 @@
-"""
-Gestione delle connessioni MySQL.
-
-PROBLEMA nell'originale (db.py):
-  - `get_conn()` apriva una NUOVA connessione TCP al DB ogni volta che veniva
-    chiamata, e questo veniva fatto in moltissimi punti (spesso dentro
-    funzioni chiamate in loop, es. mark_variant_in_progress/reset per ogni
-    variante). Aprire/chiudere una connessione per ogni singola query è
-    lento e, sotto carico, può esaurire le connessioni disponibili sul
-    server MySQL.
-  - Nessun retry/backoff su errori transitori di connessione.
-  - Cursori aperti senza sempre garantire la chiusura in caso di eccezione
-    (niente context manager -> uso di try/finally sparso e incoerente).
-
-SOLUZIONE:
-  - Un connection pool (mysql.connector.pooling) condiviso, dimensionato da
-    config (DB_POOL_SIZE). Le connessioni vengono riutilizzate invece di
-    essere aperte/chiuse in continuazione.
-  - Un context manager `get_connection()` che restituisce la connessione al
-    pool automaticamente (commit se tutto ok, rollback se eccezione).
-  - Un context manager `cursor_scope()` per i cursori, che chiude sempre il
-    cursore anche in caso di errore.
-
-NOTA su multiprocessing (ProcessPoolExecutor / fork):
-  - `_pool` e' un singleton di modulo. Se venisse creato nel processo padre
-    (es. perche' get_connection() viene chiamato li' prima di spawnare i
-    worker) e poi il padre facesse fork() per creare i worker, questi
-    ultimi erediterebbero una COPIA del pool con le connessioni TCP gia'
-    aperte nel padre. Piu' processi che leggono/scrivono sullo stesso
-    socket ereditato via fork corrompono il protocollo MySQL lato client,
-    causando errori tipo "MySQL Connection not available".
-  - Per evitarlo, _get_pool() tiene traccia del PID che ha creato il pool
-    e lo ricrea da zero se il PID corrente e' diverso: cosi' ogni processo
-    (padre o worker figlio) finisce per avere un proprio pool con
-    connessioni TCP nuove, mai condivise.
-"""
+"""MySQL connection pooling: a shared, per-process connection pool plus context managers for connections and cursors."""
 from __future__ import annotations
 
 import contextlib
@@ -53,14 +18,23 @@ _pool_pid: int | None = None
 
 
 def _get_pool() -> pooling.MySQLConnectionPool:
+    # The pool is keyed by PID and recreated whenever the current PID differs
+    # from the one that created it. This matters with multiprocessing
+    # (ProcessPoolExecutor / fork): if the pool were created in the parent
+    # process and then the parent forked worker processes, those workers
+    # would inherit a copy of the pool with TCP connections already open in
+    # the parent. Multiple processes sharing a forked socket corrupt the
+    # MySQL client-side protocol, causing errors like "MySQL Connection not
+    # available". Recreating the pool per-PID ensures every process (parent
+    # or worker) ends up with its own pool and fresh TCP connections.
     global _pool, _pool_pid
     current_pid = os.getpid()
     if _pool is None or _pool_pid != current_pid:
         cfg: DBConfig = get_config().db
         _pool = pooling.MySQLConnectionPool(
-            # pool_name univoco per processo: evita collisioni nel registro
-            # interno di mysql-connector se il pool viene ricreato dopo un
-            # fork con lo stesso nome logico
+            # Pool name unique per process, to avoid collisions in
+            # mysql-connector's internal registry if the pool is recreated
+            # after a fork under the same logical name.
             pool_name=f"gene_env_pool_{current_pid}",
             pool_size=cfg.pool_size,
             host=cfg.host,
@@ -71,16 +45,14 @@ def _get_pool() -> pooling.MySQLConnectionPool:
             autocommit=False,
         )
         _pool_pid = current_pid
-        log.info("Connection pool MySQL creato (pid=%d, pool_size=%d, host=%s:%s, db=%s)",
+        log.info("MySQL connection pool created (pid=%d, pool_size=%d, host=%s:%s, db=%s)",
                   current_pid, cfg.pool_size, cfg.host, cfg.port, cfg.name)
     return _pool
 
 
 @contextlib.contextmanager
 def get_connection(retries: int = 3, retry_delay: float = 1.0):
-    """Context manager: prende una connessione dal pool, fa commit a fine
-    blocco se non ci sono state eccezioni, rollback altrimenti, e restituisce
-    sempre la connessione al pool (mai lasciarla aperta indefinitamente)."""
+    """Get a connection from the pool, commit on success, rollback on exception, and always return it to the pool."""
     last_err = None
     for attempt in range(1, retries + 1):
         try:
@@ -88,10 +60,10 @@ def get_connection(retries: int = 3, retry_delay: float = 1.0):
             break
         except mysql.connector.Error as e:
             last_err = e
-            log.warning("Connessione DB fallita (tentativo %d/%d): %s", attempt, retries, e)
+            log.warning("DB connection failed (attempt %d/%d): %s", attempt, retries, e)
             time.sleep(retry_delay * attempt)
     else:
-        raise last_err  # tutti i tentativi falliti
+        raise last_err  # all retries exhausted
 
     try:
         yield conn
@@ -100,7 +72,7 @@ def get_connection(retries: int = 3, retry_delay: float = 1.0):
         conn.rollback()
         raise
     finally:
-        conn.close()  # per una connessione dal pool, close() la restituisce al pool
+        conn.close()  # for a pooled connection, close() returns it to the pool
 
 
 @contextlib.contextmanager

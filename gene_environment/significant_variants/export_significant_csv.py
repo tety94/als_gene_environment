@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-"""
-Script INDIPENDENTE (richiesto: "un CSV con le colonne per le varianti
-significative... salvato in maniera separata / con altro script").
+"""Independent, repeatable export script for the currently significant variants.
 
-Può essere rilanciato in qualsiasi momento (anche mentre il run principale è
-ancora in corso su altre varianti): legge lo stato ATTUALE della tabella
-variant_results, ricalcola l'FDR sui risultati con permutazioni "alte"
-(iterations = N_PERM_HIGH) già completati, seleziona quelli sotto soglia e
-scrive un CSV in una cartella SEPARATA (config: SIGNIFICANT_EXPORT_DIR),
-diversa da quella usata dalla pipeline di estrazione genotipi
-(SIGNIFICANT_MATRIX_DIR), con:
-  - il coefficiente osservato e il p-value empirico/FDR del modello
-  - le statistiche di differenza onset_age (mediane, delta, IC bootstrap,
-    p-value) già salvate nella stessa riga da modeling.py
-  - il nome del gene, se già annotato
+Can be rerun at any time (even while the main run is still in progress on
+other variants): it reads the CURRENT state of the variant_results table,
+recomputes the FDR on the results with "high" permutations
+(iterations = N_PERM_HIGH) already completed, selects those below threshold
+and writes a CSV to a SEPARATE folder (config: SIGNIFICANT_EXPORT_DIR),
+different from the one used by the genotype-extraction pipeline
+(SIGNIFICANT_MATRIX_DIR), with:
+  - the observed coefficient and the model's empirical p-value/FDR
+  - the onset_age difference statistics (medians, delta, bootstrap CI,
+    p-value) already saved on the same row by modeling.py
+  - the gene name, if already annotated
 
-Ogni esecuzione scrive sia uno snapshot timestampato sia un file
-"significant_variants_latest.csv" sempre aggiornato, così un downstream
-consumer (dashboard, notebook, altro script) può sempre puntare allo stesso
-path senza doversi preoccupare del timestamp.
+Each run writes both a timestamped snapshot and an always-up-to-date
+"significant_variants_latest.csv" file, so a downstream consumer
+(dashboard, notebook, other script) can always point at the same path
+without worrying about the timestamp.
 
 Usage: python -m gene_environment.significant_variants.export_significant_csv
 """
@@ -66,11 +64,11 @@ def fetch_current_results(exposure: str, generation: int, iterations: int) -> pd
     df["gene_name"] = None
 
     log.info(
-        "fetch_current_results: exposure=%s generation=%s iterations=%s -> %d righe",
+        "fetch_current_results: exposure=%s generation=%s iterations=%s -> %d rows",
         exposure, generation, iterations, len(df),
     )
     if df.empty:
-        log.warning("fetch_current_results: 0 righe con questi filtri, controlla completed/iterations/onset_low_power in DB")
+        log.warning("fetch_current_results: 0 rows with these filters, check completed/iterations/onset_low_power in DB")
     else:
         log.info("fetch_current_results: variant distinct=%d", df["variant"].nunique())
 
@@ -85,23 +83,22 @@ def run_export(alpha: float | None = None, from_export:bool | None = None) -> st
         df = load_raw_significant_results()
         print(df)
         if not df.empty:
-            # Schema "wide" (coorte 1 e 2 affiancate): usiamo g1 come p-value di riferimento
+            # "Wide" schema (cohort 1 and 2 side by side): use g1 as the reference p-value
             df["empirical_p"] = df["empirical_p_g1"]
             df["obs_coef"] = df["obs_coef_g1"]
     else:
         df = fetch_current_results(cfg.exposure, cfg.generation, cfg.n_perm_high)
 
     if df.empty:
-        log.info("Nessun risultato completato con iterations=%d al momento. Nessun export prodotto.", cfg.n_perm_high)
+        log.info("No completed results with iterations=%d at the moment. No export produced.", cfg.n_perm_high)
         return None
 
     df = add_fdr(df, p_col="empirical_p", fdr_col="fdr")
-    # significant = df[df["fdr"] < alpha].copy()
     significant = df.copy()
-    log.info("Risultati totali: %d, significativi (FDR < %.3f): %d", len(df), alpha, len(significant))
+    log.info("Total results: %d, significant (FDR < %.3f): %d", len(df), alpha, len(significant))
 
     if significant.empty:
-        log.info("Nessuna variante significativa al momento. Nessun export prodotto.")
+        log.info("No significant variants at the moment. No export produced.")
         return None
 
     significant = significant.reindex(columns=[c for c in RESULT_COLUMNS if c in significant.columns])
@@ -114,7 +111,7 @@ def run_export(alpha: float | None = None, from_export:bool | None = None) -> st
 
     significant.to_csv(snapshot_path, index=False)
     significant.to_csv(latest_path, index=False)
-    log.info("Export scritto in %s e %s (%d varianti)", snapshot_path, latest_path, len(significant))
+    log.info("Export written to %s and %s (%d variants)", snapshot_path, latest_path, len(significant))
     return latest_path
 
 

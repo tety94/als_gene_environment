@@ -1,5 +1,5 @@
+"""GTEx API client: resolves the GTEx-compatible GENCODE gene id and checks brain-tissue expression."""
 import requests
-from numpy import generic
 
 
 class GTExAPI:
@@ -21,9 +21,9 @@ class GTExAPI:
         "Brain_Substantia_nigra",
     ]
 
-    # Versioni GENCODE effettive e dataset GTEx compatibile
+    # GENCODE versions mapped to their compatible GTEx dataset
     GENCODE_TO_DATASET = {
-        # GTEx v8 → GENCODE v19 e versioni precedenti usate in v8
+        # GTEx v8 -> GENCODE v19 and earlier versions used in v8
         "v8": "gtex_v8",
         "v9": "gtex_v8",
         "v10": "gtex_v8",
@@ -37,7 +37,7 @@ class GTExAPI:
         "v18": "gtex_v8",
         "v19": "gtex_v8",
 
-        # GTEx v10 → GENCODE v26 e versioni precedenti compatibili
+        # GTEx v10 -> GENCODE v26 and earlier compatible versions
         "v20": "gtex_v10",
         "v21": "gtex_v10",
         "v22": "gtex_v10",
@@ -46,7 +46,7 @@ class GTExAPI:
         "v25": "gtex_v10",
         "v26": "gtex_v10",
 
-        # snRNA-seq pilot → GENCODE v39
+        # snRNA-seq pilot -> GENCODE v39
         "v39": "gtex_snrnaseq_pilot",
     }
 
@@ -58,21 +58,18 @@ class GTExAPI:
         return None
 
     def extract_version(gencode_id: str) -> str:
-        """
-        Prende un GENCODE ID versionato e restituisce solo la versione come stringa.
-        Esempio:
+        """Take a versioned GENCODE ID and return just the version as a string.
+        Example:
             ENSG00000141027.20 -> '20'
         """
         if "." in gencode_id:
             return 'v' + str(gencode_id.split(".")[-1])
-        return None  # se non c'è versione
+        return None  # no version present
 
 
     @staticmethod
     def get_versioned_gencode(gene_symbol: str):
-        """
-        Restituisce (gencodeId compatibile, versione GENCODE, dataset GTEx)
-        """
+        """Return (compatible gencodeId, GENCODE version, GTEx dataset)."""
         url = f"{GTExAPI.GTEX_REST}/reference/gene"
         params = {"geneId": gene_symbol}
         r = requests.get(url, params=params)
@@ -83,16 +80,15 @@ class GTExAPI:
         if not data:
             return None, None, None
 
-        # Ordina dalla versione più alta alla più bassa
+        # Sort from the highest version to the lowest
         sorted_genes = sorted(
             data,
             key=lambda x: int(x["gencodeId"].split('.')[-1]) if x.get("gencodeId") else 0,
             reverse=True
         )
 
-        # Trova prima versione compatibile con dataset GTEx
+        # Find the first version compatible with a GTEx dataset
         for g in sorted_genes:
-            # version = g.get("gencodeVersion")
             genocode_id = g.get("gencodeId")
             version = GTExAPI.parse_versioned_ensg(genocode_id)
             dataset = GTExAPI.GENCODE_TO_DATASET.get(version)

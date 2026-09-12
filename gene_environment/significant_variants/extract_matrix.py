@@ -1,44 +1,36 @@
 #!/usr/bin/env python3
-"""
-Estrae, per le varianti significative, il genotipo binario (0/1) per ciascun
-paziente in gen1/gen2/gen3, direttamente dai VCF indicizzati (bcftools).
-(ex extract_significant_variant_matrices.py — supera anche
-get_variants_after_gen1.py, che faceva la stessa cosa scansionando i VCF
-riga per riga senza usare l'indice .tbi: molto più lento, mantenuto solo
-come riferimento storico e non incluso in questo refactor).
+"""Extracts, for the significant variants, the binary genotype (0/1) for
+every patient in gen1/gen2/gen3, directly from the indexed VCFs (bcftools).
 
-NOVITÀ rispetto all'originale (come richiesto):
-  1) SCRITTURA INCREMENTALE: il CSV combinato viene scritto/appesto SUBITO
-     dopo ogni generazione completata (non solo tutto insieme alla fine).
-     Se lo script si interrompe a metà (es. gen3 fallisce), gen1 e gen2 sono
-     già su disco.
-  2) CHECKPOINT DI RIPRESA: un file di stato JSON accanto al CSV tiene
-     traccia delle generazioni già completate; un rilancio salta quelle già
-     fatte invece di ripartire da zero.
-  3) Parallelizzazione per cromosoma dentro ogni generazione
-     (ProcessPoolExecutor): le query bcftools per cromosomi diversi sono
-     indipendenti.
-  4) Config (path VCF, cartella output) spostata in gene_environment.config
-     invece di hardcoded in testa allo script.
+Key design points:
+  1) INCREMENTAL WRITES: the combined CSV is written/appended immediately
+     after each generation completes (not all at once at the end). If the
+     script stops midway (e.g. gen3 fails), gen1 and gen2 are already on disk.
+  2) RESUME CHECKPOINT: a JSON state file next to the CSV tracks which
+     generations are already completed; a rerun skips those instead of
+     starting over.
+  3) Per-chromosome parallelization within each generation
+     (ProcessPoolExecutor): bcftools queries for different chromosomes are
+     independent.
+  4) Config (VCF paths, output folder) lives in gene_environment.config
+     instead of being hardcoded at the top of the script.
 
-FIX (rispetto alla versione precedente):
-  Il checkpoint teneva traccia solo delle generazioni completate, ma NON
-  congelava l'elenco delle varianti significative usato per costruire le
-  colonne del CSV. Se tra un run e l'altro il DB cambiava (es. modeling.py
-  rieseguito, nuove varianti significative aggiunte per un'altra exposure)
-  e per qualche motivo il checkpoint non era sincronizzato con lo stato del
-  file su disco (es. crash tra la scrittura del CSV e il salvataggio dello
-  stato), un rilancio poteva riscrivere/appendere una generazione con un
-  numero di colonne diverso da quello già su disco, producendo un CSV con
-  righe di lunghezza diversa (illeggibile da pandas: "Expected N fields,
-  saw M"). Ora:
-    - la lista di varianti viene congelata nel checkpoint alla prima
-      esecuzione (o alla prima con force=True);
-    - un rilancio senza force=True verifica che il set di varianti nel DB
-      non sia cambiato rispetto al checkpoint: se è cambiato, si ferma con
-      un errore esplicito invece di produrre un CSV incoerente;
-    - prima di ogni append, si valida che l'header già presente su disco
-      corrisponda esattamente alle colonne attese per quel run.
+Checkpoint consistency: the checkpoint tracks completed generations, and
+ALSO freezes the list of significant variants used to build the CSV
+columns. If the DB changed between runs (e.g. modeling.py re-run, new
+significant variants added for another exposure) and the checkpoint became
+out of sync with what's on disk (e.g. a crash between writing the CSV and
+saving the state), a rerun could otherwise append a generation with a
+different number of columns than what's already on disk, producing a CSV
+with rows of inconsistent length (unreadable by pandas: "Expected N
+fields, saw M"). To prevent this:
+    - the variant list is frozen into the checkpoint on the first run (or
+      the first run with force=True);
+    - a rerun without force=True verifies the variant set in the DB hasn't
+      changed relative to the checkpoint: if it has, it stops with an
+      explicit error instead of producing an inconsistent CSV;
+    - before every append, the header already on disk is validated against
+      the columns expected for that run.
 """
 from __future__ import annotations
 
@@ -143,13 +135,13 @@ def binarize_vectorized(df_dosage: pd.DataFrame) -> pd.DataFrame:
 
 
 def _extract_chrom_worker(args) -> tuple[str, dict, list[str]]:
-    """Estrae una singola combinazione (generazione, cromosoma). Eseguito in
-    processo separato -> ritorna dati serializzabili (dict), non DataFrame."""
+    """Extract a single (generation, chromosome) combination. Runs in a
+    separate process -> returns serializable data (dict), not a DataFrame."""
     generation, chrom, group_records, vcf_path, log_dir = args
     configure_logging(log_dir)
 
     if not os.path.exists(vcf_path):
-        log.warning("VCF non trovato per generazione %d, chr%s: %s", generation, chrom, vcf_path)
+        log.warning("VCF not found for generation %d, chr%s: %s", generation, chrom, vcf_path)
         return chrom, {}, [r["label"] for r in group_records]
 
     chrom_name = resolve_chrom_name(str(chrom), vcf_path)
@@ -158,7 +150,7 @@ def _extract_chrom_worker(args) -> tuple[str, dict, list[str]]:
     positions = [r["pos"] for r in group_records]
     t0 = time.perf_counter()
     rows = query_positions(vcf_path, chrom_name, positions)
-    log.info("gen%d chr%s: %d varianti richieste, %d righe trovate (%.2fs)",
+    log.info("gen%d chr%s: %d variants requested, %d rows found (%.2fs)",
               generation, chrom, len(positions), len(rows), time.perf_counter() - t0)
 
     rows_by_pos = defaultdict(list)
@@ -177,7 +169,7 @@ def _extract_chrom_worker(args) -> tuple[str, dict, list[str]]:
                 break
         if dosages is None:
             if candidate_rows:
-                log.warning("[MISMATCH] %s: REF/ALT non corrispondono (atteso %s>%s)", rec["label"], rec["ref"], rec["alt"])
+                log.warning("[MISMATCH] %s: REF/ALT don't match (expected %s>%s)", rec["label"], rec["ref"], rec["alt"])
             not_found.append(rec["label"])
             continue
         dosages_by_label[rec["label"]] = dict(zip(samples, dosages))
@@ -187,7 +179,7 @@ def _extract_chrom_worker(args) -> tuple[str, dict, list[str]]:
 
 def extract_generation(cfg, generation: int, variants_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     t_start = time.perf_counter()
-    log.info("=== Generazione %d: inizio ===", generation)
+    log.info("=== Generation %d: starting ===", generation)
 
     jobs = []
     for chrom, group in variants_df.groupby("chrom"):
@@ -206,13 +198,13 @@ def extract_generation(cfg, generation: int, variants_df: pd.DataFrame) -> tuple
             labels_not_found.extend(not_found)
 
     if not all_dosages:
-        log.error("Generazione %d: nessuna variante estratta.", generation)
+        log.error("Generation %d: no variants extracted.", generation)
         return pd.DataFrame(), labels_not_found
 
     df = pd.DataFrame(all_dosages)
     df_bin = binarize_vectorized(df)
 
-    log.info("=== Generazione %d: completata in %.1fs (%d pazienti, %d varianti trovate) ===",
+    log.info("=== Generation %d: completed in %.1fs (%d patients, %d variants found) ===",
               generation, time.perf_counter() - t_start, len(df_bin), df_bin.shape[1])
     return df_bin, labels_not_found
 
@@ -241,10 +233,10 @@ def run_extract_significant_matrices(force: bool = True, exposure: str | None = 
     cfg = get_config()
     configure_logging(cfg.log_dir)
 
-    log.info("Recupero varianti significative dal DB%s", f" (exposure={exposure})" if exposure else "")
+    log.info("Fetching significant variants from the DB%s", f" (exposure={exposure})" if exposure else "")
     sig = get_significant_results()
     if sig.empty:
-        log.info("Nessuna variante significativa trovata. Esco.")
+        log.info("No significant variants found. Exiting.")
         return None
 
     sig["ref"] = sig["mutation"].apply(lambda m: m.split("_", 1)[0])
@@ -254,7 +246,7 @@ def run_extract_significant_matrices(force: bool = True, exposure: str | None = 
     sig["label"] = sig.apply(lambda r: build_variant_label(r["chromosome"], r["position"], r["mutation"]), axis=1)
     variants_df = sig[["chrom", "pos", "ref", "alt", "label"]].drop_duplicates(subset="label")
     all_variant_labels = sorted(variants_df["label"].unique())
-    log.info("%d varianti uniche da estrarre.", len(variants_df))
+    log.info("%d unique variants to extract.", len(variants_df))
 
     os.makedirs(cfg.significant_matrix_dir, exist_ok=True)
     out_path = os.path.join(cfg.significant_matrix_dir, "combined_significant_variants.csv")
@@ -270,51 +262,51 @@ def run_extract_significant_matrices(force: bool = True, exposure: str | None = 
         state = _load_checkpoint(state_path)
 
         if state.get("variant_labels") is None:
-            # Nessun checkpoint precedente (o checkpoint da versione vecchia
-            # dello script, senza variant_labels): lo congeliamo ora.
+            # No prior checkpoint (or a checkpoint from an older script
+            # version without variant_labels): freeze it now.
             state["variant_labels"] = all_variant_labels
         elif state["variant_labels"] != all_variant_labels:
-            # Il set di varianti significative nel DB è cambiato rispetto a
-            # quando è stato scritto il checkpoint: continuare produrrebbe
-            # un CSV con colonne incoerenti tra generazioni. Ci si ferma
-            # esplicitamente invece di corrompere silenziosamente l'output.
+            # The significant-variant set in the DB changed since the
+            # checkpoint was written: continuing would produce a CSV with
+            # inconsistent columns across generations. Stop explicitly
+            # instead of silently corrupting the output.
             old_n = len(state["variant_labels"])
             new_n = len(all_variant_labels)
             raise RuntimeError(
-                f"Il set di varianti significative nel DB e' cambiato rispetto al "
-                f"checkpoint esistente ({old_n} varianti nel checkpoint, {new_n} ora). "
-                f"Rilancia con force=True per rigenerare '{out_path}' da zero, oppure "
-                f"ripristina il DB allo stato precedente se il cambiamento non era voluto."
+                f"The significant-variant set in the DB has changed relative to the "
+                f"existing checkpoint ({old_n} variants in the checkpoint, {new_n} now). "
+                f"Rerun with force=True to regenerate '{out_path}' from scratch, or "
+                f"restore the DB to its previous state if the change was unintended."
             )
 
-        # Anche se il checkpoint e' coerente con il DB, verifichiamo che
-        # l'header effettivamente scritto su disco corrisponda: protegge da
-        # CSV toccati a mano o da run interrotti in modo anomalo (es. crash
-        # durante la scrittura del CSV, prima del salvataggio dello stato).
+        # Even if the checkpoint is consistent with the DB, verify that the
+        # header actually written to disk matches: protects against
+        # manually-edited CSVs or abnormally interrupted runs (e.g. a crash
+        # during the CSV write, before the state was saved).
         existing_header = _read_existing_header(out_path)
         expected_header = ["id", "generation"] + all_variant_labels
         if existing_header is not None and existing_header != expected_header:
             raise RuntimeError(
-                f"L'header di '{out_path}' ({len(existing_header)} colonne) non "
-                f"corrisponde alle varianti attese ({len(expected_header)} colonne). "
-                f"Il file potrebbe essere corrotto da un run precedente incoerente. "
-                f"Rilancia con force=True per rigenerarlo da zero."
+                f"The header of '{out_path}' ({len(existing_header)} columns) doesn't "
+                f"match the expected variants ({len(expected_header)} columns). "
+                f"The file may have been corrupted by an earlier inconsistent run. "
+                f"Rerun with force=True to regenerate it from scratch."
             )
 
     header_written = os.path.exists(out_path) and os.path.getsize(out_path) > 0
 
     for gen in (1, 2, 3):
         if gen in state["completed_generations"]:
-            log.info("Generazione %d già completata (checkpoint), salto.", gen)
+            log.info("Generation %d already completed (checkpoint), skipping.", gen)
             continue
 
         df_bin, not_found = extract_generation(cfg, gen, variants_df)
         if not_found:
-            log.warning("Generazione %d: %d/%d varianti non trovate: %s",
+            log.warning("Generation %d: %d/%d variants not found: %s",
                         gen, len(not_found), len(all_variant_labels), not_found)
 
         if df_bin.empty:
-            log.warning("Generazione %d: nessun dato prodotto, non aggiunta al checkpoint (si può ritentare).", gen)
+            log.warning("Generation %d: no data produced, not added to checkpoint (can be retried).", gen)
             continue
 
         df_bin = df_bin.reindex(columns=all_variant_labels)
@@ -322,15 +314,15 @@ def run_extract_significant_matrices(force: bool = True, exposure: str | None = 
         df_bin.index.name = "id"
         df_bin.insert(0, "generation", gen)
 
-        # --- SCRITTURA INCREMENTALE: append subito, non a fine script ---
+        # --- INCREMENTAL WRITE: append immediately, not at the end of the script ---
         df_bin.to_csv(out_path, mode="a", header=not header_written)
         header_written = True
-        log.info("Generazione %d appesa a %s (%d pazienti)", gen, out_path, len(df_bin))
+        log.info("Generation %d appended to %s (%d patients)", gen, out_path, len(df_bin))
 
         state["completed_generations"].append(gen)
         _save_checkpoint(state_path, state)
 
-    log.info("Estrazione varianti significative completata. Output: %s", out_path)
+    log.info("Significant variant extraction complete. Output: %s", out_path)
     return out_path
 
 

@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-Single entry point for the pipeline. Replaces "ordine_comandi.txt" (a text
-file listing the scripts to run by hand, in the right order, hoping not to
-get it wrong) with a CLI that explicitly lists the available steps and the
-recommended order.
+"""Single entry point for the pipeline: a CLI that lists the available steps and the recommended order.
 
 Examples:
     python -m gene_environment.cli filter-vcf

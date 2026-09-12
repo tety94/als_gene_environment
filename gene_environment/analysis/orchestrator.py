@@ -1,29 +1,22 @@
-"""
-Orchestratore del run di analisi per-variante (ex main.py).
+"""Orchestrates the per-variant analysis run.
 
-NOVITA' (correzione per struttura di popolazione): se cfg.use_pca_covariates
-è True (default), carica pca_covariates.csv per la generazione corrente
-(cfg.generation) e lo fa il merge nel dataframe principale su IID PRIMA di
-salvare temp_df.pkl, cosi' i worker paralleli hanno gia' le colonne PC
-disponibili. La lista dei nomi colonna PC (es. ["PC1", ..., "PC5"]) viene
-passata a ciascun worker tramite l'initializer di ProcessPoolExecutor (stesso
-meccanismo gia' usato per il dataframe stesso), ed e' quello che
-modeling.py usa come covariate di correzione (non di interazione)
-nell'OLS. Se cfg.use_pca_covariates è False, covariate_cols resta [] e il
-comportamento è identico a prima di questa modifica.
+Population-structure correction: if cfg.use_pca_covariates is True
+(default), loads pca_covariates.csv for the current generation
+(cfg.generation) and merges it into the main dataframe on IID BEFORE
+saving temp_df.pkl, so the parallel workers already have the PC columns
+available. The list of PC column names (e.g. ["PC1", ..., "PC5"]) is
+passed to each worker through the ProcessPoolExecutor initializer (the
+same mechanism already used for the dataframe itself), and that's what
+modeling.py uses as correction (not interaction) covariates in the OLS.
+If cfg.use_pca_covariates is False, covariate_cols stays [] and the
+behavior is unaffected.
 
-Fix rispetto all'originale:
-  - Il buffer di risultati veniva scritto a DB con un `for` che chiamava
-    `save_variant_result` riga per riga dentro la stessa connessione: ora usa
-    `save_variant_results_bulk` (executemany, una sola transazione per batch).
-  - Path di `temp_df.pkl` ora configurabile (TEMP_DF_PATH) invece di hardcoded
-    relativo alla cwd (rompeva se lo script veniva lanciato da un'altra
-    directory).
-  - Le statistiche onset_age calcolate in modeling.py vengono salvate nello
-    stesso batch, colonna per colonna (vedi db/repository.py).
-  - Logging al posto di print(), incluso un riepilogo finale con conteggio
-    errori per variante (prima un'eccezione su una variante veniva solo
-    stampata e "persa").
+Results are written to the DB in batches via `save_variant_results_bulk`
+(executemany, a single transaction per batch), rather than one row at a
+time. The `temp_df.pkl` path is configurable (TEMP_DF_PATH) rather than
+hardcoded relative to the cwd. The onset_age statistics computed in
+modeling.py are saved in the same batch, column by column (see
+db/repository.py).
 """
 from __future__ import annotations
 
@@ -57,8 +50,8 @@ def init_worker(temp_df_path: str, log_dir: str, covariate_cols: list[str]):
         modeling.global_df = pickle.load(f)
     modeling.global_covariate_cols = covariate_cols
     log.info(
-        "Worker %d: dataset caricato da %s (covariate di correzione: %s)",
-        os.getpid(), temp_df_path, covariate_cols or "nessuna",
+        "Worker %d: dataset loaded from %s (correction covariates: %s)",
+        os.getpid(), temp_df_path, covariate_cols or "none",
     )
 
 
@@ -66,7 +59,7 @@ def init_worker(temp_df_path: str, log_dir: str, covariate_cols: list[str]):
 def run_parallel_processing(
     variants: list[str], mapping: dict, Ecols: list[str], covariate_cols: list[str], cfg, description: str = "", full_beta: bool = False,
 ) -> None:
-    log.info("Avvio processi paralleli: %s (%d varianti, %d worker)", description, len(variants), cfg.max_workers)
+    log.info("Starting parallel processes: %s (%d variants, %d workers)", description, len(variants), cfg.max_workers)
 
     buffer = []
     completed, skipped, errors = 0, 0, 0
@@ -90,18 +83,18 @@ def run_parallel_processing(
 
                 if len(buffer) >= BATCH_SIZE:
                     save_variant_results_bulk(buffer, cfg.exposure, cfg.generation, cfg.test_label)
-                    log.info("Progresso: %d completati, %d saltati, %d errori (su %d totali)",
+                    log.info("Progress: %d completed, %d skipped, %d errors (out of %d total)",
                               completed, skipped, errors, len(variants))
                     buffer = []
 
             except Exception:
                 errors += 1
-                log.exception("Errore imprevisto sulla variante %s", variant_name)
+                log.exception("Unexpected error on variant %s", variant_name)
 
     if buffer:
         save_variant_results_bulk(buffer, cfg.exposure, cfg.generation, cfg.test_label)
 
-    log.info("Run completato: %d completati, %d saltati, %d errori", completed, skipped, errors)
+    log.info("Run complete: %d completed, %d skipped, %d errors", completed, skipped, errors)
 
 
 def run_main_pipeline() -> None:
@@ -116,22 +109,22 @@ def run_main_pipeline() -> None:
     print("OUTPUT_FOLDER =", repr(cfg.output_folder))
     print("cwd =", os.getcwd())
     import gene_environment.config as configmod
-    print("map_path risolto =",
+    print("resolved map_path =",
           cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv"))
-    print("map_path esiste? =",
+    print("map_path exists? =",
           os.path.exists(cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv")))
     print("=====================")
 
     configure_logging(cfg.log_dir)
 
     start_time = datetime.now()
-    log.info("Analisi iniziata alle %s", start_time)
+    log.info("Analysis started at %s", start_time)
 
     df, variant_cols_safe, mapping, Ecols, variant_cols, covariate_cols = load_and_prepare_data(cfg)
 
     with open(cfg.temp_df_path, "wb") as f:
         pickle.dump(df, f)
-    log.info("Dataset temporaneo salvato in %s", cfg.temp_df_path)
+    log.info("Temporary dataset saved to %s", cfg.temp_df_path)
 
     variants_to_insert = []
     for v in variant_cols:
@@ -140,16 +133,16 @@ def run_main_pipeline() -> None:
     insert_new_variants(variants_to_insert, cfg.exposure, cfg.generation, cfg.test_label)
 
     variants_to_run = get_variants_to_run(mapping, variant_cols_safe, cfg.exposure, cfg.generation)
-    random.shuffle(variants_to_run)  # bilancia il carico fra worker (varianti "pesanti" sparse)
+    random.shuffle(variants_to_run)  # balances load across workers ("heavy" variants spread out)
 
     run_parallel_processing(
-        variants_to_run, mapping, Ecols, covariate_cols, cfg, description="run con permutazioni adattive",
+        variants_to_run, mapping, Ecols, covariate_cols, cfg, description="run with adaptive permutations",
         full_beta = False,
     )
 
     results_df = load_variant_results(cfg.exposure, cfg.n_perm_high)
     if results_df.empty:
-        log.warning("Nessun risultato con iterations=%d trovato in DB: volcano plot saltato.", cfg.n_perm_high)
+        log.warning("No results with iterations=%d found in DB: volcano plot skipped.", cfg.n_perm_high)
     else:
         results_df = add_fdr(results_df)
         os.makedirs(cfg.log_dir, exist_ok=True)
@@ -157,7 +150,7 @@ def run_main_pipeline() -> None:
         volcano_plot(results_df, save_path=volcano_path)
 
     duration = datetime.now() - start_time
-    log.info("Analisi terminata. Durata totale: %s", duration)
+    log.info("Analysis finished. Total duration: %s", duration)
 
 
 if __name__ == "__main__":

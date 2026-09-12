@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-Annotazione genica delle varianti significative. Unisce due script originali
-che facevano cose consecutive e correlate (e condividevano lo stesso
-pattern "ProcessPoolExecutor + chiamata API esterna"):
-  - process_variants.py     -> assegna il gene (Ensembl) a ogni variante
-  - main_gene_analysis.py   -> annota i geni trovati con info neuro (CTD/GO)
-
-"""
+"""Gene annotation of significant variants: assigns the Ensembl gene to each variant, then enriches genes with neuro annotations (CTD/GO)."""
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -30,7 +23,7 @@ def _get_ensembl_api():
         return EnsemblAPI
     except ImportError as e:
         raise ImportError(
-            "Modulo 'apis.ensembl_api.EnsemblAPI' non trovato."
+            "Module 'apis.ensembl_api.EnsemblAPI' not found."
         ) from e
 
 
@@ -40,21 +33,21 @@ def _get_gene_annotator():
         return GeneAnnotator
     except ImportError as e:
         raise ImportError(
-            "Modulo 'gene_environment.apis.gene_annotator' non trovato."
+            "Module 'gene_environment.apis.gene_annotator' not found."
         ) from e
 
 
 def run_assign_genes(iterations: int | None = None) -> None:
-    """ex process_variants.py: assegna il gene Ensembl a ogni variante
-    significativa senza gene ancora assegnato."""
+    """Assign the Ensembl gene to every significant variant that doesn't
+    have a gene assigned yet."""
     cfg = get_config()
     configure_logging(cfg.log_dir)
     EnsemblAPI = _get_ensembl_api()
 
     variants = get_empty_variants_gene()
-    log.info("Varianti senza gene assegnato: %d", len(variants))
+    log.info("Variants without an assigned gene: %d", len(variants))
 
-    COMMIT_EVERY = 20  # numero di varianti tra un commit e l'altro
+    COMMIT_EVERY = 20  # number of variants between commits
 
     ok, failed = 0, 0
     with get_connection() as conn:
@@ -63,7 +56,7 @@ def run_assign_genes(iterations: int | None = None) -> None:
             try:
                 gene_id, gene_name = EnsemblAPI.fetch_gene(chrom, pos)
             except Exception:
-                log.exception("Errore Ensembl per variante %s (chr%s:%s)", variant["variant"], chrom, pos)
+                log.exception("Ensembl error for variant %s (chr%s:%s)", variant["variant"], chrom, pos)
                 failed += 1
                 continue
 
@@ -73,16 +66,16 @@ def run_assign_genes(iterations: int | None = None) -> None:
                 ok += 1
             else:
                 update_variant_gene(conn, variant["variant"], "NO-GENE", "NO-GENE")
-                log.info("Nessun gene trovato per %s", variant["variant"])
+                log.info("No gene found for %s", variant["variant"])
                 ok += 1
 
             if i % COMMIT_EVERY == 0:
                 conn.commit()
-                log.info("Commit intermedio dopo %d varianti processate", i)
+                log.info("Intermediate commit after %d variants processed", i)
 
-        conn.commit()  # flush finale per l'ultimo blocco parziale (< 20 varianti)
+        conn.commit()  # final flush for the last partial batch (< 20 variants)
 
-    log.info("Assegnazione geni completata: %d ok, %d falliti", ok, failed)
+    log.info("Gene assignment complete: %d ok, %d failed", ok, failed)
 
 def _annotate_one_gene(gene: str) -> tuple[str, bool, str | None]:
     GeneAnnotator = _get_gene_annotator()
@@ -97,15 +90,14 @@ def run_annotate_gene_neuro_info() -> None:
     cfg = get_config()
     configure_logging(cfg.log_dir)
 
-
     genes = get_genes_to_annotate()
-    log.info("Geni da annotare: %d", len(genes))
+    log.info("Genes to annotate: %d", len(genes))
     if not genes:
         return
 
-    # Le API esterne (PanelApp, Open Targets) hanno rate limit propri,
-    # indipendenti da quanti core ha la macchina: max_workers generico
-    # è troppo aggressivo qui. Un valore basso e fisso è più sicuro.
+    # The external APIs (PanelApp, Open Targets) have their own rate limits,
+    # independent of how many cores the machine has: the generic
+    # max_workers is too aggressive here. A low, fixed value is safer.
     annotation_workers = min(cfg.max_workers, 3)
 
     failed = []
@@ -115,9 +107,9 @@ def run_annotate_gene_neuro_info() -> None:
             gene, ok, err = fut.result()
             if not ok:
                 failed.append((gene, err))
-                log.error("Errore sul gene %s: %s", gene, err)
+                log.error("Error on gene %s: %s", gene, err)
 
-    log.info("Annotazione completata: %d ok, %d falliti", len(genes) - len(failed), len(failed))
+    log.info("Annotation complete: %d ok, %d failed", len(genes) - len(failed), len(failed))
 
 if __name__ == "__main__":
     run_assign_genes()

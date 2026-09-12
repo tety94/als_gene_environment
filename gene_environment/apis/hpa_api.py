@@ -1,9 +1,9 @@
+"""Human Protein Atlas (HPA) client: fetches the full per-gene JSON and extracts single-cell expression info."""
 import requests
 
 class HPAAPI:
-    """
-    Interroga il JSON completo di HPA per un gene (non un endpoint single_cell dedicato).
-    Usa l'URL:
+    """Queries the full HPA JSON for a gene (there's no dedicated single_cell
+    endpoint). Uses the URL:
         https://www.proteinatlas.org/<ENSG>.json
     """
 
@@ -11,9 +11,7 @@ class HPAAPI:
 
     @staticmethod
     def fetch_hpa_json(ensg: str) -> dict:
-        """
-        Scarica il JSON completo per il gene.
-        """
+        """Download the full JSON for the gene."""
         url = f"{HPAAPI.BASE_URL}/{ensg}.json"
         try:
             r = requests.get(url, timeout=15)
@@ -24,11 +22,9 @@ class HPAAPI:
 
     @staticmethod
     def get_single_cell_info(ensg: str) -> dict:
-        """
-        Estrae i dati single-cell (se presenti) dal JSON HPA.
-        HPA non ha un endpoint REST single_cell dedicato ma il JSON
-        completo può contenere sezioni come 'rna_single_cell_type' o simili.
-        """
+        """Extract single-cell data (if present) from the HPA JSON.
+        HPA has no dedicated single_cell REST endpoint, but the full JSON
+        can contain sections like 'rna_single_cell_type' or similar."""
         j = HPAAPI.fetch_hpa_json(ensg)
         result = {
             "neurons": False,
@@ -36,8 +32,7 @@ class HPAAPI:
             "cell_types": []
         }
 
-        # Il JSON di HPA può avere varie sezioni
-        # controlla campi legati a "rna_single_cell"
+        # The HPA JSON can have various sections; check fields related to "rna_single_cell"
         sc_nCPM = j.get("RNA single cell type specific nCPM", {}) or {}
 
         for cell_type in sc_nCPM.keys():
@@ -48,6 +43,6 @@ class HPAAPI:
             if any(x in ct_lower for x in ["astro", "oligo", "microglia", "glia"]):
                 result["glia"] = True
 
-        # rimuovi duplicati
+        # remove duplicates
         result["cell_types"] = list(set(result["cell_types"]))
         return result

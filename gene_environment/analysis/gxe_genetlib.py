@@ -1,63 +1,62 @@
-"""
-Analisi G x E cromosoma-per-cromosoma con GENetLib.
+"""Chromosome-by-chromosome G x E analysis with GENetLib.
 
-Si integra nel resto della pipeline `gene_environment` (stesso config.py,
-stesso logging, stesse funzioni di normalizzazione id e caricamento PCA di
-build_dataset.py / pca_utils.py) invece di reinventarli.
+Integrates with the rest of the `gene_environment` pipeline (same
+config.py, same logging, same id-normalization and PCA-loading functions
+from build_dataset.py / pca_utils.py) instead of reinventing them.
 
 --------------------------------------------------------------------------
-DIFFERENZE RISPETTO AL RESTO DELLA PIPELINE (modeling.py / orchestrator.py)
+DIFFERENCES FROM THE REST OF THE PIPELINE (modeling.py / orchestrator.py)
 --------------------------------------------------------------------------
-Il resto della pipeline testa UNA variante alla volta con OLS + matching +
-permutazioni, con la formula:
+The rest of the pipeline tests ONE variant at a time with OLS + matching +
+permutations, using the formula:
 
-    onset_age ~ variant * (risaie_1500) + sex + PC1 + ... + PCk
+    onset_age ~ variant * (exposure) + sex + PC1 + ... + PCk
 
-(interazione variant x exposure, sex e PCA come covariate additive: vedi
-modeling.build_formula). Questo modulo fa concettualmente la STESSA cosa
-(PCA e "sex" additive, exposure interagisce con la genetica) ma con un
-modello diverso: invece di N regressioni OLS separate (una per variante),
-usa GENetLib (rete neurale con penalita' MCP + L2, package
-XMU-Kuangnan-Fang-Team/GENetLib) per stimare TUTTI gli SNP di un cromosoma
-insieme, con selezione automatica delle varianti importanti.
+(variant x exposure interaction, sex and PCA as additive covariates: see
+modeling.build_formula). This module conceptually does the SAME thing
+(PCA and "sex" additive, exposure interacts with the genetics) but with a
+different model: instead of N separate OLS regressions (one per variant),
+it uses GENetLib (a neural network with MCP + L2 penalty, package
+XMU-Kuangnan-Fang-Team/GENetLib) to estimate ALL the SNPs of a chromosome
+together, with automatic selection of important variants.
 
-Per ottenere lo stesso "PCA/sex additive, mai interazione G x PCA" qui si
-procede in due passaggi (coerente con l'approccio "correggi poi testa" gia'
-usato altrove nel progetto per la struttura di popolazione):
+To get the same "PCA/sex additive, never G x PCA interaction" constraint
+here, this proceeds in two steps (consistent with the "correct then test"
+approach already used elsewhere in the project for population structure):
 
-  STEP A (in questo modulo, `compute_pca_corrected_residuals`):
-      onset_age = [PCA_1..k, sex] . delta + eps      (OLS, per generazione)
+  STEP A (in this module, `compute_pca_corrected_residuals`):
+      onset_age = [PCA_1..k, sex] . delta + eps      (OLS, per generation)
       onset_age' = onset_age - [PCA, sex] . delta_hat
 
-  STEP B (GENetLib, per cromosoma):
-      onset_age' = G . beta + (G x E) . theta,   E = SOLO risaie_1500
+  STEP B (GENetLib, per chromosome):
+      onset_age' = G . beta + (G x E) . theta,   E = exposure ONLY
 
-GENetLib (funzione scalar_ge) non ha un parametro "solo additivo, non
-interattivo" per una covariata: qualunque colonna passata come E viene
-automaticamente incrociata con OGNI SNP. Per questo "sex" e le PCA NON
-possono essere passate come E a GENetLib (violerebbe il vincolo "niente
-G x PCA"): vengono invece rimosse dal fenotipo nello step di regressione
-preliminare, esattamente come le PCA.
+GENetLib (the scalar_ge function) has no "additive only, non-interactive"
+parameter for a covariate: any column passed as E is automatically
+crossed with EVERY SNP. That's why "sex" and the PCs CANNOT be passed as E
+to GENetLib (it would violate the "no G x PCA" constraint): they are
+instead removed from the phenotype in the preliminary regression step,
+just like the PCs.
 
 --------------------------------------------------------------------------
-FORMATO REALE DI RAW_FILE (gen.parquet), come costruito da
+ACTUAL FORMAT OF RAW_FILE (gen.parquet), as built by
 vcf_pipeline/vcf_to_parquet.py:
-  - formato WIDE: indice = id campione (gia' passato da clean_sample_id
-    durante la conversione VCF->parquet, poi ripulito ANCHE qui per
-    sicurezza), colonne = una per variante.
-  - nome colonna variante: "{CHROM}_{POS}_{REF}_{ALT}" (build_variant_label
-    usa lo stesso schema per il resto della pipeline). Il prefisso CHROM
-    puo' essere "1".."22" oppure "chr1".."chr22" a seconda di come il VCF
-    sorgente nominava i contig (vedi extract_matrix.resolve_chrom_name):
-    qui viene rilevato automaticamente.
-  - valori: int8 0/1 (presenza di almeno un allele mutato: la
-    binarizzazione avviene gia' in vcf_to_parquet.merge_chromosome,
-    "arr[arr > 0] = 1" -- NON e' un dosaggio 0/1/2).
-  - NON esiste alcuna colonna "generazione" nel parquet: la generazione di
-    ogni campione si ottiene SOLO da sample_generation_map.csv (prodotto da
-    vcf_to_parquet.save_sample_generation_map), esattamente come fa
-    build_dataset._build_narrow_covariates. Qui la stessa logica di
-    risoluzione e' replicata in `resolve_generation_map`.
+  - WIDE format: index = sample id (already passed through
+    clean_sample_id during the VCF->parquet conversion, cleaned again here
+    for safety), columns = one per variant.
+  - variant column name: "{CHROM}_{POS}_{REF}_{ALT}" (build_variant_label
+    uses the same scheme for the rest of the pipeline). The CHROM prefix
+    can be "1".."22" or "chr1".."chr22" depending on how the source VCF
+    named its contigs (see extract_matrix.resolve_chrom_name): detected
+    automatically here.
+  - values: int8 0/1 (presence of at least one mutant allele: binarization
+    already happens in vcf_to_parquet.merge_chromosome,
+    "arr[arr > 0] = 1" -- NOT a 0/1/2 dosage).
+  - there is NO "generation" column in the parquet: each sample's
+    generation is obtained ONLY from sample_generation_map.csv (produced
+    by vcf_to_parquet.save_sample_generation_map), exactly like
+    build_dataset._build_narrow_covariates does. The same resolution logic
+    is replicated here in `resolve_generation_map`.
 --------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -105,18 +104,18 @@ from gene_environment.vcf_pipeline.vcf_to_parquet import CHROMOSOMES
 
 log = get_logger(__name__)
 
-# Codifica sesso identica a build_dataset.py (SEX_ENCODING), tenuta qui
-# separata (non importata) perche' in build_dataset.py e' locale alla
-# funzione e non esposta come costante di modulo.
+# Sex encoding identical to build_dataset.py (SEX_ENCODING), kept separate
+# here (not imported) because in build_dataset.py it's local to the
+# function and not exposed as a module constant.
 SEX_ENCODING = {"M": 1, "F": 0}
 
 
 # ============================================================================
-# 1. CONFIGURAZIONE SPECIFICA DI GENetLib (variabili GXE_*)
+# 1. GENetLib-SPECIFIC CONFIGURATION (GXE_* variables)
 # ============================================================================
-# Riusa gli helper privati di gene_environment.config (_env, _env_int, ...)
-# per restare nello stesso stile/convenzione del resto del progetto: tutti i
-# valori vengono da variabili d'ambiente / .env, con default sensati.
+# Reuses the private helpers from gene_environment.config (_env, _env_int,
+# ...) to stay in the same style/convention as the rest of the project: all
+# values come from environment variables / .env, with sensible defaults.
 
 def _env_float_optional(name: str) -> Optional[float]:
     val = os.environ.get(name)
@@ -129,18 +128,18 @@ def _env_int_list(name: str, default: str) -> list:
 
 @dataclass(frozen=True)
 class GXEConfig:
-    # Cromosomi da processare (default: tutti quelli prodotti da build-matrix)
+    # Chromosomes to process (default: all those produced by build-matrix)
     chromosomes: list = field(default_factory=lambda: _env_list("GXE_CHROMOSOMES", ",".join(CHROMOSOMES)) or CHROMOSOMES)
 
-    # Generazioni da includere nel run. Se vuoto, usa SOLO cfg.generation
-    # (comportamento identico al resto della pipeline, che processa una
-    # generazione per run). Se valorizzato (es. "1,2"), le residualizza
-    # PCA-per-generazione e le combina in un unico modello GENetLib per
-    # cromosoma (analisi congiunta delle due coorti).
+    # Generations to include in the run. If empty, uses ONLY cfg.generation
+    # (same behavior as the rest of the pipeline, which processes one
+    # generation per run). If set (e.g. "1,2"), residualizes them
+    # per-generation PCA and combines them into a single GENetLib model per
+    # chromosome (joint analysis of both cohorts).
     generations: list = field(default_factory=lambda: _env_int_list("GXE_GENERATIONS", ""))
 
-    # Iperparametri scalar_ge (vedi docstring di run_genetlib_scalar_ge per
-    # la corrispondenza con i concetti "lam"/"alpha"/"max_iter")
+    # scalar_ge hyperparameters (see the run_genetlib_scalar_ge docstring
+    # for the mapping to the "lam"/"alpha"/"max_iter" concepts)
     num_hidden_layers: int = field(default_factory=lambda: _env_int("GXE_NUM_HIDDEN_LAYERS", 2))
     nodes_hidden_layer: list = field(default_factory=lambda: _env_int_list("GXE_NODES_HIDDEN_LAYER", "64,16"))
     num_epochs: int = field(default_factory=lambda: _env_int("GXE_NUM_EPOCHS", 100))
@@ -152,8 +151,8 @@ class GXEConfig:
     split_type: int = field(default_factory=lambda: _env_int("GXE_SPLIT_TYPE", 0))
     ratio: list = field(default_factory=lambda: _env_int_list("GXE_RATIO", "7,3"))
 
-    # Soglia di significativita' (frazione del massimo |peso| assoluto,
-    # convenzione nativa di GENetLib -- NON un p-value)
+    # Significance threshold (fraction of the max absolute |weight|,
+    # GENetLib's native convention -- NOT a p-value)
     significance_threshold: float = field(default_factory=lambda: _env_float("GXE_SIGNIFICANCE_THRESHOLD", 0.3))
 
     min_samples_required: int = field(default_factory=lambda: _env_int("GXE_MIN_SAMPLES", 30))
@@ -165,54 +164,52 @@ class GXEConfig:
 
 
 # ============================================================================
-# 2. STEP A - REGRESSIONE PRELIMINARE onset_age ~ PCA + covariate ADDITIVE
+# 2. STEP A - PRELIMINARY REGRESSION onset_age ~ PCA + ADDITIVE covariates
 # ============================================================================
 
 def resolve_generation_map(cfg: Config) -> Optional[pd.DataFrame]:
-    """
-    Replica la logica di priorita' usata in
+    """Replicates the priority logic used in
     vcf_pipeline.build_dataset._build_narrow_covariates:
-        1) sample_generation_map.csv (cfg.sample_generation_map, o
-           <OUTPUT_FOLDER>/sample_generation_map.csv se non impostato)
-        2) colonna cfg.env_generation_col nel file ambientale (legacy)
-        3) nessun filtro possibile -> None (tutte le righe, generazione
-           sconosciuta: NON utilizzabile per Step A, che richiede la
-           generazione per scegliere il file PCA giusto)
+        1) sample_generation_map.csv (cfg.sample_generation_map, or
+           <OUTPUT_FOLDER>/sample_generation_map.csv if not set)
+        2) cfg.env_generation_col column in the environmental file (legacy)
+        3) no filter possible -> None (all rows, unknown generation: NOT
+           usable for Step A, which needs the generation to pick the right
+           PCA file)
 
-    Ritorna un DataFrame [id, generation] oppure None se non c'e' modo di
-    determinare la generazione dei campioni.
+    Returns a DataFrame [id, generation], or None if there's no way to
+    determine the samples' generation.
     """
     map_path = cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv")
     if os.path.exists(map_path):
         gen_map = pd.read_csv(map_path, dtype={"id": str})
         gen_map["id"] = gen_map["id"].astype(str)
-        log.info("Mappa id->generazione caricata da %s (%d campioni)", map_path, len(gen_map))
+        log.info("id->generation map loaded from %s (%d samples)", map_path, len(gen_map))
         return gen_map[["id", "generation"]]
 
     log.warning(
-        "Nessuna mappa id->generazione trovata in %s. Se il file ambientale ha una "
-        "colonna di generazione, impostala in ENV_GENERATION_COL; altrimenti Step A "
-        "(regressione PCA, specifica per generazione) non puo' essere eseguito "
-        "correttamente.", map_path,
+        "No id->generation map found at %s. If the environmental file has a "
+        "generation column, set it in ENV_GENERATION_COL; otherwise Step A "
+        "(per-generation PCA regression) cannot run correctly.", map_path,
     )
     return None
 
 
 def _encode_covariates(df_env: pd.DataFrame, covariates: list) -> tuple[pd.DataFrame, list]:
-    """Codifica le covariate additive (es. 'sex') esattamente come
-    build_dataset._build_narrow_covariates, ritornando il dataframe con le
-    colonne codificate e la lista dei nomi colonna effettivamente numerici
-    e utilizzabili nella regressione."""
+    """Encodes the additive covariates (e.g. 'sex') exactly like
+    build_dataset._build_narrow_covariates, returning the dataframe with
+    the encoded columns and the list of column names that are actually
+    numeric and usable in the regression."""
     df = df_env.copy()
     resolved = []
     for cov in covariates:
         if cov not in df.columns:
-            log.warning("Covariata '%s' non trovata nel file ambientale: ignorata.", cov)
+            log.warning("Covariate '%s' not found in the environmental file: ignored.", cov)
             continue
         if cov == "sex":
             unmapped = set(df["sex"].dropna().unique()) - set(SEX_ENCODING.keys())
             if unmapped:
-                raise ValueError(f"'sex': valori non riconosciuti {unmapped}, aggiorna SEX_ENCODING")
+                raise ValueError(f"'sex': unrecognized values {unmapped}, update SEX_ENCODING")
             df["sex"] = df["sex"].map(SEX_ENCODING).astype(float)
         else:
             df[cov] = pd.to_numeric(df[cov], errors="coerce")
@@ -221,16 +218,16 @@ def _encode_covariates(df_env: pd.DataFrame, covariates: list) -> tuple[pd.DataF
 
 
 def load_environment_and_phenotype(cfg: Config, logger) -> pd.DataFrame:
-    """Carica ENV_FILE, valida le colonne richieste (SAMPLE_ID_COL, TARGET_COL)."""
+    """Loads ENV_FILE and validates the required columns (SAMPLE_ID_COL, TARGET_COL)."""
     if not os.path.exists(cfg.env_file):
-        raise FileNotFoundError(f"ENV_FILE non trovato: {cfg.env_file}")
+        raise FileNotFoundError(f"ENV_FILE not found: {cfg.env_file}")
 
     df_env = pd.read_csv(cfg.env_file, sep=cfg.sep, decimal=cfg.decimal)
 
     required = [cfg.sample_id_col, cfg.target_col, cfg.exposure]
     missing = [c for c in required if c not in df_env.columns]
     if missing:
-        raise ValueError(f"Colonne mancanti in {cfg.env_file}: {missing}. Disponibili: {list(df_env.columns)}")
+        raise ValueError(f"Missing columns in {cfg.env_file}: {missing}. Available: {list(df_env.columns)}")
 
     df_env[cfg.sample_id_col] = df_env[cfg.sample_id_col].astype(str)
     df_env[cfg.target_col] = pd.to_numeric(df_env[cfg.target_col], errors="coerce")
@@ -239,15 +236,15 @@ def load_environment_and_phenotype(cfg: Config, logger) -> pd.DataFrame:
     n_before = len(df_env)
     df_env = df_env.dropna(subset=[cfg.target_col, cfg.exposure]).drop_duplicates(cfg.sample_id_col)
     if len(df_env) < n_before:
-        logger.warning("[ENV] Rimossi %d pazienti con %s/%s mancante o id duplicato", n_before - len(df_env), cfg.target_col, cfg.exposure)
+        logger.warning("[ENV] Removed %d patients with missing %s/%s or duplicate id", n_before - len(df_env), cfg.target_col, cfg.exposure)
 
-    logger.info("[ENV] Caricati %d pazienti da %s", len(df_env), cfg.env_file)
+    logger.info("[ENV] Loaded %d patients from %s", len(df_env), cfg.env_file)
     return df_env
 
 
 def build_exposure_column(cfg: Config, df: pd.DataFrame) -> str:
-    """Standardizza EXPOSURE come in build_dataset.py (StandardScaler se
-    cfg.standardize=True) e ritorna il nome della colonna da usare come E."""
+    """Standardizes EXPOSURE like build_dataset.py does (StandardScaler if
+    cfg.standardize=True) and returns the column name to use as E."""
     if cfg.standardize:
         col = f"{cfg.exposure}_std"
         df[col] = StandardScaler().fit_transform(df[[cfg.exposure]])
@@ -258,20 +255,19 @@ def build_exposure_column(cfg: Config, df: pd.DataFrame) -> str:
 def compute_pca_corrected_residuals(
     cfg: Config, gxe_cfg: GXEConfig, df_env: pd.DataFrame, gen_map: Optional[pd.DataFrame], logger,
 ) -> pd.DataFrame:
-    """
-    STEP A: per ciascuna generazione richiesta,
-        onset_age  = [PCA_1..k, covariate additive] . delta + eps
-        onset_age' = onset_age - [PCA, covariate] . delta_hat
+    """STEP A: for each requested generation,
+        onset_age  = [PCA_1..k, additive covariates] . delta + eps
+        onset_age' = onset_age - [PCA, covariates] . delta_hat
 
-    Le PCA (e le covariate additive come 'sex') sono usate SOLO qui. Non
-    vengono mai passate a GENetLib.
+    The PCs (and additive covariates like 'sex') are used ONLY here. They
+    are never passed to GENetLib.
     """
     generations = gxe_cfg.generations or [cfg.generation]
 
     if gen_map is None and len(generations) > 0:
         raise RuntimeError(
-            "Impossibile eseguire Step A: nessuna mappa id->generazione disponibile "
-            "(vedi resolve_generation_map) e le PCA sono specifiche per generazione."
+            "Cannot run Step A: no id->generation map available "
+            "(see resolve_generation_map) and the PCA data is generation-specific."
         )
 
     all_residuals = []
@@ -279,7 +275,7 @@ def compute_pca_corrected_residuals(
         ids_this_gen = set(gen_map.loc[gen_map["generation"] == generation, "id"])
         sub = df_env[df_env[cfg.sample_id_col].isin(ids_this_gen)].copy()
         if sub.empty:
-            logger.warning("[STEP A] generazione=%s: nessun paziente trovato, salto", generation)
+            logger.warning("[STEP A] generation=%s: no patients found, skipping", generation)
             continue
 
         sub, covariate_cols = _encode_covariates(sub, cfg.covariates)
@@ -293,7 +289,7 @@ def compute_pca_corrected_residuals(
             sub = sub.merge(pca_df, left_on=cfg.sample_id_col, right_on=PCA_ID_COLUMN, how="inner")
             if len(sub) < n_before:
                 logger.warning(
-                    "[STEP A] generazione=%s: %d pazienti persi nel merge con le PCA (id non in comune)",
+                    "[STEP A] generation=%s: %d patients lost in the merge with the PCA data (id not in common)",
                     generation, n_before - len(sub),
                 )
 
@@ -301,8 +297,8 @@ def compute_pca_corrected_residuals(
         sub = sub.dropna(subset=[cfg.target_col] + design_cols)
         if sub.empty or not design_cols:
             logger.warning(
-                "[STEP A] generazione=%s: dataset vuoto o nessuna covariata di correzione "
-                "disponibile (PCA=%s, covariate=%s), salto", generation, cfg.use_pca_covariates, cfg.covariates,
+                "[STEP A] generation=%s: empty dataset or no correction covariate "
+                "available (PCA=%s, covariates=%s), skipping", generation, cfg.use_pca_covariates, cfg.covariates,
             )
             continue
 
@@ -314,7 +310,7 @@ def compute_pca_corrected_residuals(
         residuals = y - reg.predict(X)
         r2 = reg.score(X, y)
         logger.info(
-            "[STEP A] generazione=%s: regressione %s ~ %s su %d pazienti, R2=%.4f",
+            "[STEP A] generation=%s: regression %s ~ %s on %d patients, R2=%.4f",
             generation, cfg.target_col, design_cols, len(sub), r2,
         )
 
@@ -325,34 +321,34 @@ def compute_pca_corrected_residuals(
         all_residuals.append(out)
 
     if not all_residuals:
-        raise RuntimeError("STEP A: nessun residuo calcolato per nessuna generazione richiesta.")
+        raise RuntimeError("STEP A: no residuals computed for any requested generation.")
 
     result = pd.concat(all_residuals, ignore_index=True)
-    logger.info("[STEP A] Totale pazienti con fenotipo corretto (Y'): %d", len(result))
+    logger.info("[STEP A] Total patients with corrected phenotype (Y'): %d", len(result))
     return result
 
 
 # ============================================================================
-# 3. LETTURA GENOTIPO PER CROMOSOMA (gen.parquet, formato WIDE)
+# 3. GENOTYPE READING PER CHROMOSOME (gen.parquet, WIDE format)
 # ============================================================================
 
 def get_variant_schema(raw_file: str) -> list:
-    """Legge SOLO lo schema (nomi colonna) del parquet, senza caricare i
-    dati: efficiente anche con ~1.3M colonne (legge solo il footer)."""
+    """Reads ONLY the parquet schema (column names), without loading the
+    data: efficient even with ~1.3M columns (reads only the footer)."""
     return pq.ParquetFile(raw_file).schema_arrow.names
 
 
 def _chrom_prefix_candidates(chrom: str) -> set:
-    """I contig VCF sorgente possono essere nominati '1' o 'chr1' (vedi
-    extract_matrix.resolve_chrom_name): qui accettiamo entrambe le
-    convenzioni senza doverle conoscere a priori."""
+    """Source VCF contigs may be named '1' or 'chr1' (see
+    extract_matrix.resolve_chrom_name): both conventions are accepted here
+    without needing to know which one in advance."""
     return {str(chrom), f"chr{chrom}", f"Chr{chrom}", f"CHR{chrom}"}
 
 
 def select_columns_for_chromosome(all_columns: list, chrom: str, id_col: str = "id") -> list:
-    """Seleziona, fra tutte le colonne del parquet, quelle relative alle
-    varianti del cromosoma richiesto (formato nome colonna:
-    '{CHROM}_{POS}_{REF}_{ALT}', vedi id_utils.build_variant_label)."""
+    """Selects, among all parquet columns, those belonging to the
+    requested chromosome's variants (column name format:
+    '{CHROM}_{POS}_{REF}_{ALT}', see id_utils.build_variant_label)."""
     candidates = _chrom_prefix_candidates(chrom)
     variant_cols = [
         c for c in all_columns
@@ -364,14 +360,13 @@ def select_columns_for_chromosome(all_columns: list, chrom: str, id_col: str = "
 def load_genotype_matrix_for_chromosome(
     cfg: Config, chromosome: str, all_columns: list, patient_ids: set, logger,
 ) -> pd.DataFrame:
-    """
-    Legge da gen.parquet, via DuckDB, SOLO la colonna id + le colonne SNP
-    del cromosoma richiesto (column pruning: DuckDB/parquet leggono da
-    disco solo le colonne selezionate, non l'intero file da ~1.3M colonne).
-    """
+    """Reads from gen.parquet, via DuckDB, ONLY the id column + the SNP
+    columns for the requested chromosome (column pruning: DuckDB/parquet
+    read from disk only the selected columns, not the entire ~1.3M-column
+    file)."""
     variant_cols = select_columns_for_chromosome(all_columns, chromosome, cfg.sample_id_col)
     if not variant_cols:
-        logger.warning("[chr%s] Nessuna colonna SNP trovata per questo cromosoma nel Parquet", chromosome)
+        logger.warning("[chr%s] No SNP column found for this chromosome in the Parquet file", chromosome)
         return pd.DataFrame()
 
     con = duckdb.connect(database=":memory:")
@@ -386,19 +381,19 @@ def load_genotype_matrix_for_chromosome(
     g_wide[cfg.sample_id_col] = g_wide[cfg.sample_id_col].astype(str).map(clean_sample_id)
     g_wide = g_wide.drop_duplicates(cfg.sample_id_col).set_index(cfg.sample_id_col)
 
-    # Filtra subito ai soli pazienti che ci servono (riduce il costo delle
-    # operazioni successive, in particolare per cromosomi molto popolati)
+    # Filter immediately to just the patients we need (reduces the cost of
+    # subsequent operations, especially for heavily populated chromosomes)
     g_wide = g_wide[g_wide.index.isin(patient_ids)]
 
     logger.info(
-        "[chr%s] Genotipo caricato: %d pazienti x %d SNP (colonne lette selettivamente dal Parquet)",
+        "[chr%s] Genotype loaded: %d patients x %d SNPs (columns selectively read from Parquet)",
         chromosome, len(g_wide), len(variant_cols),
     )
     return g_wide
 
 
 # ============================================================================
-# 4. COSTRUZIONE DATASET (G, E, Y') PER IL MODELLO
+# 4. DATASET (G, E, Y') CONSTRUCTION FOR THE MODEL
 # ============================================================================
 
 def build_chromosome_dataset(
@@ -414,7 +409,7 @@ def build_chromosome_dataset(
     merged = g_wide.join(narrow, how="inner").dropna()
     if len(merged) < gxe_cfg.min_samples_required:
         logger.warning(
-            "[chr%s] Solo %d pazienti disponibili dopo il merge (minimo richiesto: %d), salto",
+            "[chr%s] Only %d patients available after the merge (minimum required: %d), skipping",
             chromosome, len(merged), gxe_cfg.min_samples_required,
         )
         return None
@@ -427,33 +422,32 @@ def build_chromosome_dataset(
     variances = G_df.var(axis=0)
     zero_var = variances[variances == 0].index.tolist()
     if zero_var:
-        logger.info("[chr%s] Rimossi %d SNP monomorfici sul campione corrente", chromosome, len(zero_var))
+        logger.info("[chr%s] Removed %d monomorphic SNPs in the current sample", chromosome, len(zero_var))
         G_df = G_df.drop(columns=zero_var)
 
     if G_df.shape[1] == 0:
-        logger.warning("[chr%s] Nessuno SNP polimorfico rimasto, salto", chromosome)
+        logger.warning("[chr%s] No polymorphic SNPs left, skipping", chromosome)
         return None
 
     logger.info(
-        "[chr%s] Dataset finale: %d pazienti, %d SNP, E=%s",
+        "[chr%s] Final dataset: %d patients, %d SNPs, E=%s",
         chromosome, len(merged), G_df.shape[1], list(E_df.columns),
     )
     return G_df, E_df, y_resid, list(G_df.columns), list(merged.index)
 
 
 # ============================================================================
-# 5. TRAINING GENetLib (scalar_ge) ED ESTRAZIONE COEFFICIENTI
+# 5. GENetLib (scalar_ge) TRAINING AND COEFFICIENT EXTRACTION
 # ============================================================================
 
 def run_genetlib_scalar_ge(gxe_cfg: GXEConfig, chromosome: str, G_df: pd.DataFrame, E_df: pd.DataFrame, y_resid: np.ndarray, logger):
-    """
-    Y' = G*beta + (G x E)*theta ,  E = SOLO risaie_1500 (mai PCA/sex).
+    """Y' = G*beta + (G x E)*theta ,  E = exposure ONLY (never PCA/sex).
 
-    NOTA: GENetLib e' una rete neurale (MCP + L2), non una regressione
-    lineare classica: "coefficienti" = pesi del layer sparso della rete
-    dopo il training (net.sparse1 = effetto G principale, net.sparse2 =
-    interazione G x E). "lam"/"alpha"/"max_iter" del task originale
-    corrispondono a lambda2/Lambda/num_epochs.
+    NOTE: GENetLib is a neural network (MCP + L2), not a classic linear
+    regression: "coefficients" = the network's sparse layer weights after
+    training (net.sparse1 = main G effect, net.sparse2 = G x E
+    interaction). "lam"/"alpha"/"max_iter" map to
+    lambda2/Lambda/num_epochs.
     """
     torch.manual_seed(0)
     G = G_df.to_numpy(dtype=float)
@@ -489,7 +483,7 @@ def run_genetlib_scalar_ge(gxe_cfg: GXEConfig, chromosome: str, G_df: pd.DataFra
         eval_r2 = float(eval_r2.detach().cpu().numpy())
 
     logger.info(
-        "[chr%s] Training completato: MSE_train=%.4f MSE_valid=%.4f R2_train=%.4f R2_valid=%.4f",
+        "[chr%s] Training complete: MSE_train=%.4f MSE_valid=%.4f R2_train=%.4f R2_valid=%.4f",
         chromosome, float(np.asarray(train_loss).reshape(-1)[0]), float(np.asarray(eval_loss).reshape(-1)[0]), train_r2, eval_r2,
     )
 
@@ -540,7 +534,7 @@ def build_results_table(snp_names, env_names, coef_main, coef_inter_matrix, impo
 
 
 # ============================================================================
-# 6. SALVATAGGIO OUTPUT PER CROMOSOMA
+# 6. PER-CHROMOSOME OUTPUT SAVING
 # ============================================================================
 
 def save_chromosome_outputs(gxe_cfg: GXEConfig, chromosome: str, results_df, coef_main, coef_inter_matrix, snp_names, env_names, metrics, logger) -> Path:
@@ -561,21 +555,21 @@ def save_chromosome_outputs(gxe_cfg: GXEConfig, chromosome: str, results_df, coe
             fig, ax = plt.subplots(figsize=(9, 6))
             colors = ["#d62728" if s else "#1f77b4" for s in top["significant_overall"]]
             ax.barh(top["snp_id"].astype(str), top["coef_main"], color=colors)
-            ax.set_xlabel("Coefficiente effetto principale G (peso sparse1)")
-            ax.set_title(f"Chr{chromosome}: top 25 SNP per |coefficiente| (rosso = significativo)")
+            ax.set_xlabel("Main G effect coefficient (sparse1 weight)")
+            ax.set_title(f"Chr{chromosome}: top 25 SNPs by |coefficient| (red = significant)")
             ax.invert_yaxis()
             fig.tight_layout()
             fig.savefig(chrom_dir / "top_snp_coefficients.png", dpi=150)
             plt.close(fig)
         except Exception:
-            logger.warning("[chr%s] Impossibile generare il grafico: %s", chromosome, traceback.format_exc())
+            logger.warning("[chr%s] Could not generate the plot: %s", chromosome, traceback.format_exc())
 
-    logger.info("[chr%s] Risultati salvati in %s", chromosome, chrom_dir)
+    logger.info("[chr%s] Results saved to %s", chromosome, chrom_dir)
     return chrom_dir
 
 
 # ============================================================================
-# 7. PIPELINE PER SINGOLO CROMOSOMA (worker parallelo)
+# 7. SINGLE-CHROMOSOME PIPELINE (parallel worker)
 # ============================================================================
 
 def process_chromosome(args) -> dict:
@@ -593,7 +587,7 @@ def process_chromosome(args) -> dict:
     status = {"chromosome": chromosome, "status": "unknown", "error": None}
 
     try:
-        logger.info("===== INIZIO elaborazione cromosoma %s =====", chromosome)
+        logger.info("===== STARTING processing of chromosome %s =====", chromosome)
         patient_ids = set(residual_df[cfg.sample_id_col])
 
         g_wide = load_genotype_matrix_for_chromosome(cfg, chromosome, all_columns, patient_ids, logger)
@@ -610,7 +604,7 @@ def process_chromosome(args) -> dict:
             model_out["important_snp_idx"], model_out["important_interaction_idx"],
         )
         n_sig = int(results_df["significant_overall"].sum())
-        logger.info("[chr%s] SNP significativi: %d / %d", chromosome, n_sig, len(results_df))
+        logger.info("[chr%s] Significant SNPs: %d / %d", chromosome, n_sig, len(results_df))
 
         chrom_dir = save_chromosome_outputs(
             gxe_cfg, chromosome, results_df, model_out["coef_main"], model_out["coef_inter_matrix"],
@@ -622,37 +616,37 @@ def process_chromosome(args) -> dict:
             "n_significant": n_sig, "output_dir": str(chrom_dir), "metrics": model_out["metrics"],
             "elapsed_sec": round(time.time() - t0, 1),
         })
-        logger.info("===== FINE cromosoma %s in %.1fs =====", chromosome, status["elapsed_sec"])
+        logger.info("===== FINISHED chromosome %s in %.1fs =====", chromosome, status["elapsed_sec"])
         return status
 
     except Exception as e:
-        logger.error("[chr%s] ERRORE: %s\n%s", chromosome, e, traceback.format_exc())
+        logger.error("[chr%s] ERROR: %s\n%s", chromosome, e, traceback.format_exc())
         status.update({"status": "error", "error": str(e), "elapsed_sec": round(time.time() - t0, 1)})
         return status
 
 
 # ============================================================================
-# 8. REPORT WORD RIASSUNTIVO (opzionale)
+# 8. SUMMARY WORD REPORT (optional)
 # ============================================================================
 
 def write_word_summary(gxe_cfg: GXEConfig, run_results: list, logger) -> Optional[Path]:
     if not gxe_cfg.save_word_summary:
         return None
     if not _HAS_DOCX:
-        logger.warning("python-docx non installato: report Word non generato")
+        logger.warning("python-docx not installed: Word report not generated")
         return None
 
     doc = Document()
-    doc.add_heading("Pipeline G x E (GENetLib) - Report riassuntivo", level=1)
-    doc.add_paragraph(f"Generato il {datetime.now():%Y-%m-%d %H:%M:%S}")
+    doc.add_heading("G x E Pipeline (GENetLib) - Summary Report", level=1)
+    doc.add_paragraph(f"Generated on {datetime.now():%Y-%m-%d %H:%M:%S}")
     doc.add_paragraph(
-        "PCA e covariate additive (sex) rimosse dal fenotipo in uno step di regressione "
-        "preliminare (onset_age ~ PCA + sex); GENetLib stimato sui residui, con E = "
-        "sola esposizione (nessuna interazione G x PCA/sex)."
+        "PCA and additive covariates (sex) removed from the phenotype in a preliminary "
+        "regression step (onset_age ~ PCA + sex); GENetLib estimated on the residuals, "
+        "with E = exposure only (no G x PCA/sex interaction)."
     )
     table = doc.add_table(rows=1, cols=7)
     table.style = "Light Grid Accent 1"
-    for i, h in enumerate(["Chr", "Stato", "N pazienti", "N SNP", "N sig.", "R2 valid", "Tempo (s)"]):
+    for i, h in enumerate(["Chr", "Status", "N patients", "N SNPs", "N sig.", "R2 valid", "Time (s)"]):
         table.rows[0].cells[i].text = h
     for r in run_results:
         row = table.add_row().cells
@@ -667,12 +661,12 @@ def write_word_summary(gxe_cfg: GXEConfig, run_results: list, logger) -> Optiona
 
     out_path = Path(gxe_cfg.output_dir) / "summary_report.docx"
     doc.save(out_path)
-    logger.info("Report Word salvato in %s", out_path)
+    logger.info("Word report saved to %s", out_path)
     return out_path
 
 
 # ============================================================================
-# 9. ORCHESTRAZIONE PRINCIPALE
+# 9. MAIN ORCHESTRATION
 # ============================================================================
 
 def run_gxe_genetlib_pipeline(cfg: Optional[Config] = None, gxe_cfg: Optional[GXEConfig] = None) -> None:
@@ -681,37 +675,37 @@ def run_gxe_genetlib_pipeline(cfg: Optional[Config] = None, gxe_cfg: Optional[GX
 
     configure_logging(cfg.log_dir)
     logger = get_logger(__name__)
-    logger.info("========== AVVIO PIPELINE G x E (GENetLib) ==========")
+    logger.info("========== STARTING G x E PIPELINE (GENetLib) ==========")
     logger.info("RAW_FILE=%s ENV_FILE=%s EXPOSURE=%s TARGET=%s", cfg.raw_file, cfg.env_file, cfg.exposure, cfg.target_col)
-    logger.info("Cromosomi: %s | Generazioni: %s", gxe_cfg.chromosomes, gxe_cfg.generations or [cfg.generation])
+    logger.info("Chromosomes: %s | Generations: %s", gxe_cfg.chromosomes, gxe_cfg.generations or [cfg.generation])
 
     for path, label in [(cfg.raw_file, "RAW_FILE"), (cfg.env_file, "ENV_FILE")]:
         if not os.path.exists(path):
-            raise FileNotFoundError(f"{label} non trovato: {path}")
+            raise FileNotFoundError(f"{label} not found: {path}")
 
     all_columns = get_variant_schema(cfg.raw_file)
     if cfg.sample_id_col not in all_columns:
         raise ValueError(
-            f"Colonna id campione '{cfg.sample_id_col}' non trovata nello schema di {cfg.raw_file}. "
-            f"Colonne (prime 20 di {len(all_columns)}): {all_columns[:20]}"
+            f"Sample id column '{cfg.sample_id_col}' not found in the schema of {cfg.raw_file}. "
+            f"Columns (first 20 of {len(all_columns)}): {all_columns[:20]}"
         )
-    logger.info("Schema Parquet letto: %d colonne totali (%d varianti attese)", len(all_columns), len(all_columns) - 1)
+    logger.info("Parquet schema read: %d total columns (%d expected variants)", len(all_columns), len(all_columns) - 1)
 
     df_env = load_environment_and_phenotype(cfg, logger)
     exposure_col = build_exposure_column(cfg, df_env)
     gen_map = resolve_generation_map(cfg)
 
     residual_df = compute_pca_corrected_residuals(cfg, gxe_cfg, df_env, gen_map, logger)
-    # exposure_col e' stato calcolato su df_env (prima del merge con le PCA in
-    # Step A): lo riportiamo dentro residual_df per il resto della pipeline.
+    # exposure_col was computed on df_env (before the merge with the PCA
+    # data in Step A): carry it into residual_df for the rest of the pipeline.
     residual_df = residual_df.merge(df_env[[cfg.sample_id_col, exposure_col]], on=cfg.sample_id_col, how="inner")
 
     residual_records = residual_df.to_dict("records")
 
     from dataclasses import asdict
     cfg_dict = asdict(cfg) if not isinstance(cfg, dict) else cfg
-    # DBConfig annidata non serve ai worker e puo' contenere credenziali:
-    # non la propaghiamo ai processi figli.
+    # The nested DBConfig isn't needed by workers and may hold credentials:
+    # don't propagate it to child processes.
     cfg_dict.pop("db", None)
     cfg_for_workers = Config(**{k: v for k, v in cfg_dict.items()})
     gxe_cfg_dict = asdict(gxe_cfg)
@@ -721,26 +715,26 @@ def run_gxe_genetlib_pipeline(cfg: Optional[Config] = None, gxe_cfg: Optional[GX
         for chrom in gxe_cfg.chromosomes
     ]
 
-    logger.info("Avvio elaborazione parallela di %d cromosomi con %d worker", len(tasks), cfg.max_workers)
+    logger.info("Starting parallel processing of %d chromosomes with %d workers", len(tasks), cfg.max_workers)
     run_results = []
     with ProcessPoolExecutor(max_workers=cfg.max_workers) as executor:
         futures = {executor.submit(process_chromosome, t): t[0] for t in tasks}
         iterator = as_completed(futures)
         if _HAS_TQDM:
-            iterator = tqdm(iterator, total=len(futures), desc="Cromosomi processati")
+            iterator = tqdm(iterator, total=len(futures), desc="Chromosomes processed")
         for future in iterator:
             chrom = futures[future]
             try:
                 res = future.result()
             except Exception as e:
-                logger.error("[chr%s] Eccezione non gestita nel worker: %s", chrom, e)
+                logger.error("[chr%s] Unhandled exception in worker: %s", chrom, e)
                 res = {"chromosome": chrom, "status": "error", "error": str(e)}
             run_results.append(res)
 
     n_ok = sum(1 for r in run_results if r["status"] == "success")
     n_err = sum(1 for r in run_results if r["status"] == "error")
     n_skip = sum(1 for r in run_results if r["status"] == "skipped_insufficient_data")
-    logger.info("===== PIPELINE COMPLETATA: %d ok, %d errori, %d saltati =====", n_ok, n_err, n_skip)
+    logger.info("===== PIPELINE COMPLETE: %d ok, %d errors, %d skipped =====", n_ok, n_err, n_skip)
 
     os.makedirs(gxe_cfg.output_dir, exist_ok=True)
     pd.DataFrame(run_results).to_csv(Path(gxe_cfg.output_dir) / "run_summary.csv", index=False)

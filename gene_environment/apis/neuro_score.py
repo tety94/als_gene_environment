@@ -1,36 +1,28 @@
 # gene_environment/apis/neuro_score.py
-"""
-Calcolo dello score di "plausibilita' neuro" per geni candidati SLA.
+"""Computes a "neuro plausibility" score for ALS candidate genes.
 
-Lo score e' una combinazione pesata di tre famiglie di evidenza:
+The score is a weighted combination of three families of evidence:
 
-    1. Espressione nel sistema nervoso centrale (GTEx / HPA).
-    2. Evidenza CTD (Comparative Toxicogenomics Database) su
-       malattia neuro-motoria e/o esposizione a pesticidi.
-    3. Evidenza SLA-specifica curata (PanelApp, Open Targets).
+    1. Expression in the central nervous system (GTEx / HPA).
+    2. CTD (Comparative Toxicogenomics Database) evidence on
+       neuro-motor disease and/or pesticide exposure.
+    3. Curated ALS-specific evidence (PanelApp, Open Targets).
 
-Il GO (Gene Ontology) e' attualmente disattivato a monte (vedi
-GeneAnnotator) e non contribuisce allo score.
+GO (Gene Ontology) is currently disabled upstream (see GeneAnnotator)
+and does not contribute to the score.
 
-Lo score non ha un limite superiore fisso ed e' pensato per il
-RANKING relativo dei geni candidati all'interno di uno stesso run,
-non come probabilita' o metrica normalizzata.
-
-IMPORTANTE: questo modulo mantiene invariate le regole di scoring
-originali (pesi, ordine di combinazione, segnali mutuamente esclusivi
-vs. additivi). Le uniche modifiche rispetto alla versione precedente
-sono di organizzazione del codice, documentazione e robustezza di
-fronte a campi mancanti o malformati: nessun peso e nessuna
-interpretazione dei campi e' stata alterata.
+The score has no fixed upper bound and is meant for RANKING candidate
+genes relative to each other within the same run, not as a probability
+or normalized metric.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-# --- Pesi dello score -------------------------------------------------
-# Costanti isolate solo per leggibilita' e per evitare "numeri magici"
-# sparsi nel codice: i valori sono identici alla versione originale.
+# --- Score weights ------------------------------------------------
+# Isolated as constants purely for readability, to avoid magic numbers
+# scattered through the code.
 
 WEIGHT_EXPRESSED_BRAIN: float = 1
 WEIGHT_EXPRESSED_NEURONS: float = 1
@@ -46,41 +38,36 @@ WEIGHT_PANELAPP_AMBER: float = 1.5
 PANELAPP_CONFIDENCE_GREEN: str = "3"
 PANELAPP_CONFIDENCE_AMBER: str = "2"
 
-# Lo score Open Targets e' 0.0-1.0: viene riscalato per pesare quanto
-# gli altri segnali (invariato rispetto all'originale).
+# The Open Targets score is 0.0-1.0: rescaled to weigh comparably to the other signals.
 OPENTARGETS_SCALING_FACTOR: float = 2
 
 
 @dataclass(frozen=True)
 class NeuroScoreInput:
-    """
-    Vista tipizzata sui soli campi del dizionario di annotazione del
-    gene (prodotto da ``GeneAnnotator.annotate``) effettivamente usati
-    da ``NeuroScore``. Gli altri campi (``gene_id``, ``gene_symbol``,
-    ``gene_type``, ``go_*``, ...) non partecipano allo scoring e sono
-    volutamente omessi qui.
+    """Typed view over just the fields of the gene annotation dict
+    (produced by ``GeneAnnotator.annotate``) that are actually used by
+    ``NeuroScore``. Other fields (``gene_id``, ``gene_symbol``,
+    ``gene_type``, ``go_*``, ...) don't participate in scoring and are
+    deliberately omitted here.
 
     Attributes:
-        expressed_brain: espressione nel tessuto cerebrale (GTEx).
-        expressed_neurons: espressione nei neuroni (HPA single-cell).
-        expressed_glia: espressione nelle cellule gliali (HPA single-cell).
-        ctd_neuro_disease_direct: CTD riporta un'associazione diretta,
-            curata in letteratura, tra il gene e una malattia
-            SLA/motoneuronale.
-        ctd_neuro_disease_pesticide_mediated: CTD riporta
-            un'associazione mediata da pesticidi tra il gene e una
-            malattia SLA/motoneuronale (gene -> chimico -> malattia).
-        ctd_chemicals: il gene e' associato in CTD a un'esposizione a
-            pesticidi, senza un legame a malattia riportato da CTD
-            (es. stringa di nomi chimici separati da virgola, o valore
-            falsy se assente).
-        als_panelapp_confidence: livello di confidenza del pannello SLA
-            PanelApp, come stringa: "3" = green (diagnostic-grade),
-            "2" = amber (moderata); altri valori/None = nessun peso
-            aggiuntivo.
-        als_opentargets_score: score di associazione SLA da Open
-            Targets, nell'intervallo 0.0-1.0, oppure None/0 se non
-            disponibile.
+        expressed_brain: expression in brain tissue (GTEx).
+        expressed_neurons: expression in neurons (HPA single-cell).
+        expressed_glia: expression in glial cells (HPA single-cell).
+        ctd_neuro_disease_direct: CTD reports a direct, literature-curated
+            association between the gene and an ALS/motor-neuron disease.
+        ctd_neuro_disease_pesticide_mediated: CTD reports a
+            pesticide-mediated association between the gene and an
+            ALS/motor-neuron disease (gene -> chemical -> disease).
+        ctd_chemicals: the gene is associated in CTD with a pesticide
+            exposure, with no disease link reported by CTD (e.g. a
+            comma-separated string of chemical names, or a falsy value
+            if absent).
+        als_panelapp_confidence: PanelApp ALS panel confidence level, as
+            a string: "3" = green (diagnostic-grade), "2" = amber
+            (moderate); other values/None = no additional weight.
+        als_opentargets_score: ALS association score from Open Targets,
+            in the 0.0-1.0 range, or None/0 if unavailable.
     """
 
     expressed_brain: bool = False
@@ -94,12 +81,8 @@ class NeuroScoreInput:
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "NeuroScoreInput":
-        """
-        Costruisce un ``NeuroScoreInput`` a partire dal dizionario di
-        annotazione grezzo, tollerando chiavi mancanti esattamente come
-        faceva l'implementazione originale basata su ``dict.get()``
-        (chiave assente == nessuna evidenza == falsy).
-        """
+        """Build a ``NeuroScoreInput`` from the raw annotation dict,
+        tolerating missing keys (missing key == no evidence == falsy)."""
         return cls(
             expressed_brain=bool(d.get("expressed_brain")),
             expressed_neurons=bool(d.get("expressed_neurons")),
@@ -115,16 +98,11 @@ class NeuroScoreInput:
 
 
 def _safe_numeric(value: Any) -> float:
-    """
-    Converte ``value`` in ``float`` in modo robusto, per proteggere lo
-    score da campi malformati (es. stringa non numerica) senza far
-    sollevare un'eccezione all'intera pipeline di annotazione.
+    """Robustly convert ``value`` to ``float``, to protect the score from
+    malformed fields (e.g. a non-numeric string) without raising an
+    exception in the whole annotation pipeline.
 
-    Restituisce 0.0 se ``value`` e' None/falsy o non convertibile.
-    Per input validi (int/float, incluso 0.0) il comportamento e'
-    identico all'originale: un valore falsy (None, 0, 0.0) contribuisce
-    comunque 0 allo score, con o senza questa funzione di sicurezza.
-    """
+    Returns 0.0 if ``value`` is None/falsy or not convertible."""
     if not value:
         return 0.0
     try:
@@ -134,35 +112,26 @@ def _safe_numeric(value: Any) -> float:
 
 
 class NeuroScore:
-    """
-    Calcola lo score composito di plausibilita' neuro per un gene
-    candidato.
+    """Computes the composite neuro-plausibility score for a candidate gene.
 
-    Vedi il docstring di modulo per il razionale dello scoring. Tutti i
-    pesi e la logica di combinazione sono invariati rispetto
-    all'implementazione originale; questa classe si limita a
-    riorganizzare il codice in componenti piu' leggibili e testabili.
-    """
+    See the module docstring for the scoring rationale."""
 
     @staticmethod
     def compute(d: Mapping[str, Any]) -> float:
-        """
-        Calcola lo score di plausibilita' neuro per un singolo gene.
+        """Compute the neuro-plausibility score for a single gene.
 
         Args:
-            d: dizionario di annotazione del gene (come costruito da
-                ``GeneAnnotator.annotate``). Vengono letti solo i campi
-                descritti in ``NeuroScoreInput``; le altre chiavi sono
-                ignorate. Campi mancanti o None sono trattati come
-                "nessuna evidenza" e contribuiscono 0 allo score,
-                esattamente come nell'implementazione originale basata
-                su ``dict.get()``.
+            d: gene annotation dict (as built by
+                ``GeneAnnotator.annotate``). Only the fields described in
+                ``NeuroScoreInput`` are read; other keys are ignored.
+                Missing or None fields are treated as "no evidence" and
+                contribute 0 to the score.
 
         Returns:
-            Lo score totale di plausibilita' neuro (float, senza limite
-            superiore fisso; piu' alto = piu' plausibile). Pensato per
-            confrontare geni tra loro all'interno dello stesso run, non
-            come misura assoluta.
+            The total neuro-plausibility score (float, no fixed upper
+            bound; higher = more plausible). Meant for comparing genes
+            against each other within the same run, not as an absolute
+            measure.
         """
         inputs = NeuroScoreInput.from_dict(d)
 
@@ -174,11 +143,8 @@ class NeuroScore:
 
     @staticmethod
     def _expression_score(inputs: NeuroScoreInput) -> float:
-        """
-        Evidenza di espressione nel SNC: +1 per ciascuno tra espressione
-        cerebrale / neuronale / gliale presente. Segnali indipendenti e
-        additivi (massimo 3 punti).
-        """
+        """CNS expression evidence: +1 for each of brain / neuronal / glial
+        expression present. Independent, additive signals (max 3 points)."""
         score = 0.0
         if inputs.expressed_brain:
             score += WEIGHT_EXPRESSED_BRAIN
@@ -190,36 +156,31 @@ class NeuroScore:
 
     @staticmethod
     def _ctd_score(inputs: NeuroScoreInput) -> float:
-        """
-        Evidenza CTD (Comparative Toxicogenomics Database).
+        """CTD (Comparative Toxicogenomics Database) evidence.
 
-        Il GO e' disattivato a monte (vedi GeneAnnotator) e non
-        contribuisce allo score. CTD fornisce invece tre segnali
-        distinti, pesati in base a quanto direttamente supportano
-        l'ipotesi gene-ambiente in esame:
+        GO is disabled upstream (see GeneAnnotator) and does not
+        contribute to the score. CTD instead provides three distinct
+        signals, weighted by how directly they support the gene x
+        environment hypothesis under study:
 
-          - ``ctd_neuro_disease_pesticide_mediated``: CTD stessa
-            collega il gene a una malattia SLA/motoneuronale
-            PASSANDO per uno specifico pesticida. E' il segnale piu'
-            specifico per questo studio, perche' conferma da una fonte
-            indipendente esattamente l'ipotesi gene-ambiente testata
-            -> peso piu' alto.
+          - ``ctd_neuro_disease_pesticide_mediated``: CTD itself links the
+            gene to an ALS/motor-neuron disease THROUGH a specific
+            pesticide. This is the most specific signal for this study,
+            because it confirms the exact gene x environment hypothesis
+            being tested from an independent source -> highest weight.
 
-          - ``ctd_neuro_disease_direct``: associazione diretta,
-            curata in letteratura, tra gene e malattia -- stessa
-            "famiglia" di evidenza di PanelApp/Open Targets -> peso
-            comparabile a quello.
+          - ``ctd_neuro_disease_direct``: a direct, literature-curated
+            association between gene and disease -- the same "family" of
+            evidence as PanelApp/Open Targets -> comparable weight.
 
-            (Questi due segnali di malattia sono mutuamente esclusivi
-            nello scoring: conta solo il piu' forte tra i due presenti,
-            come nell'if/elif originale.)
+            (These two disease signals are mutually exclusive in the
+            scoring: only the stronger of the two present counts.)
 
-          - ``ctd_chemicals``: il gene e' influenzato da
-            un'esposizione ambientale nota (pesticidi), ma CTD non
-            collega esplicitamente quel chimico alla SLA. Plausibilita'
-            meccanicistica piu' debole -> peso minore. E' indipendente
-            dai due segnali di malattia sopra e puo' sommarsi a
-            entrambi.
+          - ``ctd_chemicals``: the gene is affected by a known
+            environmental exposure (pesticides), but CTD does not
+            explicitly link that chemical to ALS. Weaker mechanistic
+            plausibility -> lower weight. Independent of the two disease
+            signals above and can add to either.
         """
         score = 0.0
         if inputs.ctd_neuro_disease_pesticide_mediated:
@@ -234,16 +195,14 @@ class NeuroScore:
 
     @staticmethod
     def _als_evidence_score(inputs: NeuroScoreInput) -> float:
-        """
-        Evidenza SLA-specifica curata, pesata in base all'affidabilita'
-        della fonte:
+        """Curated ALS-specific evidence, weighted by source reliability:
 
-          - PanelApp "green" (confidence "3") = evidenza
-            diagnostic-grade, il segnale piu' forte.
-          - PanelApp "amber" (confidence "2") = evidenza moderata.
-          - Score Open Targets = evidenza aggregata continua
-            (letteratura + GWAS + altro), riscalata per pesare quanto
-            gli altri segnali.
+          - PanelApp "green" (confidence "3") = diagnostic-grade evidence,
+            the strongest signal.
+          - PanelApp "amber" (confidence "2") = moderate evidence.
+          - Open Targets score = continuous aggregated evidence
+            (literature + GWAS + other), rescaled to weigh comparably to
+            the other signals.
         """
         score = 0.0
 

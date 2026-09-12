@@ -1,17 +1,16 @@
-"""
-Client per file .tsv scaricati manualmente dal CTD Batch Query
+"""Client for .tsv files manually downloaded from the CTD Batch Query
 (https://ctdbase.org/tools/batchQuery.go).
 
-Uso: l'utente esegue la query a mano nel browser (report "Chemical-Gene
-Interactions" e/o "Gene-Disease Associations"), scarica il TSV, e lo passa
-a questo modulo per costruire un indice gene -> interazioni.
+Usage: the user runs the query by hand in the browser (the "Chemical-Gene
+Interactions" and/or "Gene-Disease Associations" report), downloads the
+TSV, and passes it to this module to build a gene -> interactions index.
 
-Formato Chemical-Gene Interactions (esempio osservato):
+Chemical-Gene Interactions format (observed example):
   # Input  ChemicalName  ChemicalID  CasRN  GeneSymbol  GeneID  Organism
     OrganismID  Interaction  InteractionActions  PubMedIDs
 
-Formato Gene-Disease Associations: colonne diverse (da confermare al primo
-file reale — il parser rileva il tipo guardando l'header).
+Gene-Disease Associations format: different columns (the parser detects
+the type by looking at the header).
 """
 from __future__ import annotations
 
@@ -57,8 +56,8 @@ class GeneDiseaseAssociation:
     disease_name: str
     disease_id: str
     disease_categories: str
-    direct_evidence: str              # non vuoto = associazione curata diretta
-    inference_chemical_name: str      # valorizzato = associazione inferita TRAMITE questo chimico
+    direct_evidence: str              # non-empty = direct curated association
+    inference_chemical_name: str      # set = association inferred THROUGH this chemical
     inference_score: Optional[float]
     omim_ids: str
     pubmed_ids: List[str] = field(default_factory=list)
@@ -79,7 +78,7 @@ class GeneDiseaseAssociation:
 
 
 class CTDAPI:
-    # path di default, sovrascrivibili da config se preferisci
+    # default paths, can be overridden via config if preferred
     CHEM_GENE_TSV_PATH = "/srv/python-projects/gene_environment_v2/data/ctd_chem_gene_export.tsv"
     DISEASE_TSV_PATH = "/srv/python-projects/gene_environment_v2/data/ctd_gene_disease_export.tsv"
 
@@ -89,12 +88,12 @@ class CTDAPI:
     @staticmethod
     def build_disease_index(path: str, keyword_filter: Optional[str] = None
                              ) -> Dict[str, List[GeneDiseaseAssociation]]:
-        """Formato reale: Input, DiseaseName, DiseaseID, GeneSymbol, GeneID,
+        """Real format: Input, DiseaseName, DiseaseID, GeneSymbol, GeneID,
         DiseaseCategories, DirectEvidence, InferenceChemicalName,
         InferenceScore, OmimIDs, PubMedIDs
 
-        keyword_filter: se valorizzato, tiene solo le righe il cui
-        DiseaseName contiene questa stringa (case-insensitive)."""
+        keyword_filter: if set, keeps only rows whose DiseaseName contains
+        this string (case-insensitive)."""
         rows = CTDAPI._read_tsv_rows(path)
         index: Dict[str, List[GeneDiseaseAssociation]] = {}
         skipped_no_gene = 0
@@ -130,7 +129,7 @@ class CTDAPI:
             ))
 
         log.info(
-            "CTD disease index: %d geni distinti, %d righe senza gene risolto (filtro keyword='%s')",
+            "CTD disease index: %d distinct genes, %d rows with no resolved gene (keyword filter='%s')",
             len(index), skipped_no_gene, keyword_filter,
         )
         return index
@@ -139,9 +138,9 @@ class CTDAPI:
 
     @classmethod
     def get_chem_index(cls) -> Dict[str, List["ChemGeneInteraction"]]:
-        """Lazy-load, cache a livello di processo. In un ProcessPoolExecutor
-        ogni worker ha la propria cache: il file viene letto una volta per
-        processo, non una volta per gene."""
+        """Lazy-load, process-level cache. In a ProcessPoolExecutor each
+        worker has its own cache: the file is read once per process, not
+        once per gene."""
         if cls._chem_index_cache is None:
             cls._chem_index_cache = cls.build_chem_gene_index(cls.CHEM_GENE_TSV_PATH)
         return cls._chem_index_cache
@@ -154,9 +153,9 @@ class CTDAPI:
 
     @staticmethod
     def _read_tsv_rows(path: str) -> List[dict]:
-        """Legge un TSV di CTD Batch Query: trova l'header (riga che inizia
-        con '#' contenente i nomi colonna, tipicamente l'ultima riga di
-        commento prima dei dati) e ritorna una lista di dict per riga."""
+        """Read a CTD Batch Query TSV: finds the header (the line starting
+        with '#' containing the column names, typically the last comment
+        line before the data) and returns a list of dicts, one per row."""
         header = None
         rows = []
         with open(path, "r", encoding="utf-8") as f:
@@ -175,19 +174,18 @@ class CTDAPI:
                 elif len(values) > len(header):
                     values = values[:len(header)]
                 rows.append(dict(zip(header, values)))
-        log.info("CTD batch file %s: %d righe dati lette (header=%s)", path, len(rows), header)
+        log.info("CTD batch file %s: %d data rows read (header=%s)", path, len(rows), header)
         return rows
 
     @staticmethod
     def build_chem_gene_index(path: str, organism_filter: Optional[str] = "Homo sapiens"
                                ) -> Dict[str, List[ChemGeneInteraction]]:
-        """Costruisce indice gene_symbol -> lista interazioni chimiche, dal
-        file 'Chemical-Gene Interactions' scaricato dal Batch Query.
+        """Build a gene_symbol -> chemical interactions list index from the
+        'Chemical-Gene Interactions' file downloaded from the Batch Query.
 
-        organism_filter: se valorizzato, tiene solo le righe con quell'
-        organismo esatto (default: solo Homo sapiens, dato che i risultati
-        CTD includono anche modelli murini/ratto che potrebbero non
-        interessarti). Passa None per tenere tutte le specie."""
+        organism_filter: if set, keeps only rows matching that exact
+        organism (default: Homo sapiens only, since CTD results also
+        include mouse/rat models). Pass None to keep all species."""
         rows = CTDAPI._read_tsv_rows(path)
         index: Dict[str, List[ChemGeneInteraction]] = {}
         skipped_organism = 0
@@ -217,13 +215,13 @@ class CTDAPI:
             ))
 
         log.info(
-            "CTD chem-gene index: %d geni distinti, %d righe scartate per filtro organismo (%s)",
+            "CTD chem-gene index: %d distinct genes, %d rows dropped by organism filter (%s)",
             len(index), skipped_organism, organism_filter,
         )
         return index
 
     # --------------------------------------------------------------
-    # Query per singolo gene (lookup in memoria)
+    # Single-gene query (in-memory lookup)
     # --------------------------------------------------------------
 
     @staticmethod
@@ -235,7 +233,7 @@ class CTDAPI:
         symbol = (gene_symbol or "").strip().upper()
 
         if not symbol or symbol.startswith("ENSG"):
-            log.warning("CTD: simbolo gene mancante o non risolto ('%s'), skip.", gene_symbol)
+            log.warning("CTD: missing or unresolved gene symbol ('%s'), skipping.", gene_symbol)
             return {"chemicals": [], "chemical_interactions": [], "pesticide_interactions": [], "diseases": []}
 
         chem_interactions = chem_index.get(symbol, [])
@@ -243,13 +241,13 @@ class CTDAPI:
         diseases = disease_index.get(symbol, []) if disease_index else []
 
         log.info(
-            "CTD: gene=%s -> %d interazioni chimiche totali (%d pesticidi), %d malattie associate",
+            "CTD: gene=%s -> %d total chemical interactions (%d pesticides), %d associated diseases",
             symbol, len(chem_interactions), len(pesticide_interactions), len(diseases),
         )
 
         if pesticide_interactions:
             log.info(
-                "CTD MATCH pesticidi: gene=%s pesticidi=%s",
+                "CTD pesticide MATCH: gene=%s pesticides=%s",
                 symbol, [ci.chemical_name for ci in pesticide_interactions],
             )
 

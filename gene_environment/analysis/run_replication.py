@@ -1,23 +1,22 @@
-"""
-Replication run: prende le varianti risultate significative su una
-generazione già completata (stessa `exposure`), e lancia `modeling.py` SOLO
-su quelle, ma sulla generazione target — usando il pickle/dataset già
-costruito per quella generazione se presente, altrimenti costruendolo.
+"""Replication run: takes the variants found significant on an already
+completed generation (same `exposure`), and runs `modeling.py` ONLY on
+those, but on the target generation -- reusing the pickle/dataset already
+built for that generation if present, otherwise building it.
 
-Deliberatamente NON riusa `extract-significant` (estrae genotipo grezzo dai
-VCF per gen1/2/3, per i plot di report_onset_age.py) né
-`export-significant-csv` (CSV di reporting umano): nessuno dei due produce
-un input eseguibile da `process_single_variant`. La lista di varianti
-significative viene presa con la stessa logica già usata da
-`export_significant_csv.fetch_current_results` + `add_fdr` (singola
-generazione, non la stored procedure a due coorti — qui non serve
-confrontare due coorti già finite, serve solo "quali varianti erano
-significative in gen X" per poi testarle su gen Y).
+Deliberately does NOT reuse `extract-significant` (extracts raw genotype
+from the VCFs for gen1/2/3, for report_onset_age.py's plots) nor
+`export-significant-csv` (human-reporting CSV): neither produces an input
+that `process_single_variant` can run on. The significant-variant list is
+built with the same logic already used by
+`export_significant_csv.fetch_current_results` + `add_fdr` (single
+generation, not the two-cohort stored procedure -- there's no need here to
+compare two already-finished cohorts, just "which variants were
+significant in gen X" to then test them on gen Y).
 
-Risultati salvati con lo stesso `exposure`, `generation=target_generation`,
-ma `test_label` DIVERSO (default: "replication_of_gen{source}") per non
-confonderli in DB con un eventuale sweep completo già fatto/in corso sulla
-stessa generazione target con lo stesso test_label di default.
+Results are saved with the same `exposure`, `generation=target_generation`,
+but a DIFFERENT `test_label` (default: "replication_of_gen{source}") so
+they aren't confused in the DB with a full sweep already done/in progress
+on the same target generation with the default test_label.
 """
 from __future__ import annotations
 
@@ -39,23 +38,22 @@ log = get_logger(__name__)
 
 
 def get_significant_variant_labels(exposure: str, generation: int, iterations: int, alpha: float) -> list[str]:
-    """Stessa logica di `export_significant_csv.run_export`, ma ritorna solo
-    la lista di label variante (formato CHROM_POS_MUTATION), non un CSV."""
+    """Same logic as `export_significant_csv.run_export`, but returns only
+    the list of variant labels (CHROM_POS_MUTATION format), not a CSV."""
     df = fetch_current_results(exposure, generation, iterations)
     if df.empty:
         return []
     df = add_fdr(df, p_col="empirical_p", fdr_col="fdr")
-    # significant = df[df["fdr"] < alpha]
     significant = df.copy()
     return sorted(significant["variant"].unique().tolist())
 
 
 def _target_dataset_paths(cfg: Config, target_generation: int) -> tuple[str, str]:
-    """Path dedicati alla generazione target, SEPARATI da cfg.temp_df_path:
-    quello è il file che `run-model` (sweep completo) sovrascrive ad ogni
-    lancio — riusarlo qui creerebbe una race condition se un replication run
-    e uno sweep completo girano nello stesso momento sulla stessa macchina.
-    Ritorna (df_path, meta_path)."""
+    """Paths dedicated to the target generation, SEPARATE from
+    cfg.temp_df_path: that's the file `run-model` (full sweep) overwrites
+    on every run -- reusing it here would create a race condition if a
+    replication run and a full sweep run on the same machine at the same
+    time. Returns (df_path, meta_path)."""
     base, ext = os.path.splitext(cfg.temp_df_path)
     df_path = f"{base}_gen{target_generation}{ext}"
     meta_path = f"{base}_gen{target_generation}_meta.pkl"
@@ -86,22 +84,22 @@ def run_replication_on_significant_variants(
     sig_labels = get_significant_variant_labels(exposure, source_generation, cfg.n_perm_high, alpha)
     if not sig_labels:
         log.info(
-            "Nessuna variante significativa trovata per exposure=%s, generation=%d, iterations=%d, alpha=%.3f. Esco.",
+            "No significant variants found for exposure=%s, generation=%d, iterations=%d, alpha=%.3f. Exiting.",
             exposure, source_generation, cfg.n_perm_high, alpha,
         )
         return
-    log.info("%d varianti significative in generation=%d da ritestare su generation=%d",
+    log.info("%d significant variants in generation=%d to re-test on generation=%d",
               len(sig_labels), source_generation, target_generation)
 
-    # ---- dataset della generazione TARGET: path dedicato (vedi
-    # _target_dataset_paths), MAI cfg.temp_df_path condiviso col run
-    # principale. Riusa il pickle se già presente, altrimenti lo costruisce
-    # (stesso load_and_prepare_data del run principale, con
+    # ---- TARGET generation dataset: dedicated path (see
+    # _target_dataset_paths), NEVER shares cfg.temp_df_path with the main
+    # run. Reuses the pickle if already present, otherwise builds it (same
+    # load_and_prepare_data as the main run, with
     # GENERATION=target_generation). ----
-    # Config è un dataclass frozen=True: l'assegnazione diretta
-    # (target_cfg.generation = ...) solleverebbe FrozenInstanceError, quindi
-    # bypassiamo l'__setattr__ del dataclass sulla COPIA locale (non tocca
-    # l'istanza globale restituita da get_config()).
+    # Config is a frozen=True dataclass: direct assignment
+    # (target_cfg.generation = ...) would raise FrozenInstanceError, so we
+    # bypass the dataclass's __setattr__ on the LOCAL COPY (doesn't touch
+    # the global instance returned by get_config()).
     target_cfg = Config.__new__(Config)
     target_cfg.__dict__.update(cfg.__dict__)
     object.__setattr__(target_cfg, "generation", target_generation)
@@ -110,28 +108,28 @@ def run_replication_on_significant_variants(
 
     df_path, meta_path = _target_dataset_paths(cfg, target_generation)
     if os.path.exists(df_path) and os.path.exists(meta_path) and not force_rebuild_dataset:
-        log.info("Riuso dataset già presente per generation=%d: %s", target_generation, df_path)
+        log.info("Reusing existing dataset for generation=%d: %s", target_generation, df_path)
         with open(meta_path, "rb") as f:
             variant_cols_safe, mapping, Ecols, variant_cols = pickle.load(f)
     else:
-        log.info("Costruisco il dataset per generation=%d (non trovato o force_rebuild_dataset=True)", target_generation)
+        log.info("Building the dataset for generation=%d (not found or force_rebuild_dataset=True)", target_generation)
         df, variant_cols_safe, mapping, Ecols, variant_cols, covariate_cols = load_and_prepare_data(target_cfg)
         with open(df_path, "wb") as f:
             pickle.dump(df, f)
         with open(meta_path, "wb") as f:
             pickle.dump((variant_cols_safe, mapping, Ecols, variant_cols), f)
-        log.info("Dataset generation=%d salvato in %s (riusabile in run successivi)", target_generation, df_path)
+        log.info("Dataset for generation=%d saved to %s (reusable in later runs)", target_generation, df_path)
 
-    # init_worker (vedi orchestrator.py) carica il df dal path in
-    # target_cfg.temp_df_path -> lo puntiamo al file dedicato di questa
-    # generazione, NON a cfg.temp_df_path (quello resta libero per un run
-    # principale eventualmente in corso in parallelo).
+    # init_worker (see orchestrator.py) loads the df from the path in
+    # target_cfg.temp_df_path -> point it to this generation's dedicated
+    # file, NOT cfg.temp_df_path (that stays free for a main run possibly
+    # in progress in parallel).
     object.__setattr__(target_cfg, "temp_df_path", df_path)
 
-    # ---- mappa label originale -> nome colonna "safe" nel dataset target.
-    # Una variante significativa in source_generation potrebbe non essere
-    # genotipata nei VCF della generazione target: la segnaliamo, non la
-    # saltiamo silenziosamente. ----
+    # ---- map from original label -> "safe" column name in the target
+    # dataset. A variant significant in source_generation might not be
+    # genotyped in the target generation's VCFs: flag it, don't silently
+    # skip it. ----
     orig_to_safe = {v: k for k, v in mapping.items()}
     variants_to_run_safe = []
     missing = []
@@ -143,13 +141,13 @@ def run_replication_on_significant_variants(
 
     if missing:
         log.warning(
-            "%d/%d varianti significative non trovate nel dataset di generation=%d (non genotipate in quei VCF): %s",
+            "%d/%d significant variants not found in the generation=%d dataset (not genotyped in those VCFs): %s",
             len(missing), len(sig_labels), target_generation,
             missing[:20] if len(missing) > 20 else missing,
         )
 
     if not variants_to_run_safe:
-        log.warning("Nessuna delle varianti significative è presente nella generazione target. Esco.")
+        log.warning("None of the significant variants are present in the target generation. Exiting.")
         return
 
     variants_to_insert = []
@@ -162,9 +160,8 @@ def run_replication_on_significant_variants(
     random.shuffle(variants_to_run_safe)
 
     start_time = datetime.now()
-    # run_replication.py, in fondo a run_replication_on_significant_variants()
     run_parallel_processing(
-        variants_to_run_safe, mapping, Ecols, covariate_cols, target_cfg,  # <-- covariate_cols mancava
-        description=f"replication gen{source_generation}->gen{target_generation} ({len(variants_to_run_safe)} varianti)",
+        variants_to_run_safe, mapping, Ecols, covariate_cols, target_cfg,
+        description=f"replication gen{source_generation}->gen{target_generation} ({len(variants_to_run_safe)} variants)",
     )
-    log.info("Replication run completato in %s", datetime.now() - start_time)
+    log.info("Replication run complete in %s", datetime.now() - start_time)

@@ -1,18 +1,4 @@
-"""
-Logging centralizzato.
-
-PRIMA: quasi ogni script usava `print()` per lo stato di avanzamento. Questo
-significa: nessun timestamp uniforme, nessun livello (info/warning/error),
-niente file di log persistente, e output completamente mischiato/perso nei
-worker paralleli (ProcessPoolExecutor).
-
-ORA: un solo punto di configurazione. Ogni modulo fa
-    from gene_environment.logging_utils import get_logger
-    log = get_logger(__name__)
-e ottiene un logger che scrive sia su console sia su file (con rotazione),
-con timestamp, livello, nome modulo e (nei worker) il PID, cosi' i log dei
-processi paralleli restano distinguibili.
-"""
+"""Centralized logging setup: writes to both console and a rotating log file, with timestamp, level, module name, and PID (to keep parallel worker output distinguishable)."""
 from __future__ import annotations
 
 import logging
@@ -44,7 +30,7 @@ def configure_logging(log_dir: str = "./logs", filename: str = "pipeline.log", l
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
-    # librerie terze troppo verbose
+    # Third-party libraries that are too verbose at INFO level.
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
@@ -53,9 +39,9 @@ def configure_logging(log_dir: str = "./logs", filename: str = "pipeline.log", l
 
 def get_logger(name: str) -> logging.Logger:
     if not _CONFIGURED:
-        # fallback: se qualcuno importa il logger senza aver chiamato
-        # configure_logging esplicitamente (es. in un worker figlio), usiamo
-        # comunque una config di default cosi' non si perdono i log.
+        # Fallback: if a logger is imported without configure_logging having
+        # been called explicitly (e.g. in a child worker), use a default
+        # config so logs aren't lost.
         try:
             from gene_environment.config import get_config
             configure_logging(get_config().log_dir)

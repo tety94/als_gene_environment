@@ -1,19 +1,17 @@
-"""
-SCRIPT 3/3 — mergia il file genetico ridotto (output dello script 2, solo
-varianti significative) con il file ambientale, filtra per generazione, e
-calcola per ciascuna variante:
-  - statistiche onset_age POOLED (mutati vs non mutati, come oggi)
-  - statistiche onset_age STRATIFICATE per esposizione:
-      mutati-esposti vs non_mutati-esposti
-      mutati-non_esposti vs non_mutati-non_esposti
-  - boxplot a 4 gruppi
+"""Merges the reduced genetic file (step2's output, significant variants
+only) with the environmental file, filters by generation, and computes for
+each variant:
+  - POOLED onset_age statistics (mutant vs wild-type)
+  - onset_age statistics STRATIFIED by exposure:
+      mutant-exposed vs wild-type-exposed
+      mutant-unexposed vs wild-type-unexposed
+  - a 4-group boxplot
 
-"esposto" = valore GREZZO dell'esposizione > 0, "non esposto" = 0 (come
-confermato). Nessuna scrittura a DB: tutto ricalcolabile da file, riusa
-`compute_onset_age_result` (stessa funzione usata da modeling.py, stessa
-definizione di p-value/CI/low_power — coerenza garantita) e
-`NON_GEN_COLS`/convenzioni di build_dataset.py per restare allineato al
-resto della pipeline.
+"exposed" = RAW exposure value > 0, "unexposed" = 0. No DB writes: everything
+is recomputable from files. Reuses `compute_onset_age_result` (the same
+function used by modeling.py, same p-value/CI/low_power definition -- so
+consistency is guaranteed) and the `NON_GEN_COLS`/conventions from
+build_dataset.py to stay aligned with the rest of the pipeline.
 """
 from __future__ import annotations
 
@@ -47,7 +45,7 @@ def _load_merged(genetic_path: str, target_generation: int, cfg) -> tuple[pd.Dat
     df_env["id"] = df_env["id"].astype(str)
 
     df = pd.merge(df_env, df_gen, on="id", how="inner")
-    log.info("Merge ambiente(%d) x genetica(%d) -> %d righe", len(df_env), len(df_gen), len(df))
+    log.info("Merge environment(%d) x genetics(%d) -> %d rows", len(df_env), len(df_gen), len(df))
 
     map_path = cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv")
     if os.path.exists(map_path):
@@ -55,14 +53,14 @@ def _load_merged(genetic_path: str, target_generation: int, cfg) -> tuple[pd.Dat
         n_before = len(df)
         df = df.merge(gen_map, on="id", how="left")
         df = df[df["generation"] == target_generation]
-        log.info("Filtro generation=%d: %d -> %d righe", target_generation, n_before, len(df))
+        log.info("Filter generation=%d: %d -> %d rows", target_generation, n_before, len(df))
     else:
-        log.warning("Mappa id->generazione non trovata in %s: nessun filtro per generazione applicato.", map_path)
+        log.warning("id->generation map not found at %s: no generation filter applied.", map_path)
 
     if not cfg.exposure or cfg.exposure not in df.columns:
         raise RuntimeError(
-            f"cfg.exposure={cfg.exposure!r} non presente nel file ambientale dopo il merge: "
-            f"non posso stratificare per esposizione."
+            f"cfg.exposure={cfg.exposure!r} not present in the environmental file after the merge: "
+            f"cannot stratify by exposure."
         )
 
     return df, variant_cols
@@ -74,10 +72,10 @@ def _stratified_stats_for_variant(df: pd.DataFrame, variant_col: str, cfg) -> di
     sub["_mutato"] = (sub[variant_col] > 0).astype(int)
     sub["_esposto"] = (sub[cfg.exposure] > 0).astype(int)
 
-    def _onset(mask_mutato, mask_esposto=None):
-        m = sub["_mutato"] == mask_mutato
-        if mask_esposto is not None:
-            m = m & (sub["_esposto"] == mask_esposto)
+    def _onset(mask_mutant, mask_exposed=None):
+        m = sub["_mutato"] == mask_mutant
+        if mask_exposed is not None:
+            m = m & (sub["_esposto"] == mask_exposed)
         return sub.loc[m, cfg.target_col]
 
     onset_kwargs = dict(
@@ -91,15 +89,15 @@ def _stratified_stats_for_variant(df: pd.DataFrame, variant_col: str, cfg) -> di
     non_exposed = compute_onset_age_result(_onset(1, 0), _onset(0, 0), **onset_kwargs)
 
     groups = {
-        "mutati_esposti": _onset(1, 1), "non_mutati_esposti": _onset(0, 1),
-        "mutati_non_esposti": _onset(1, 0), "non_mutati_non_esposti": _onset(0, 0),
+        "mutant_exposed": _onset(1, 1), "wildtype_exposed": _onset(0, 1),
+        "mutant_unexposed": _onset(1, 0), "wildtype_unexposed": _onset(0, 0),
     }
     return {"pooled": pooled, "exposed": exposed, "non_exposed": non_exposed, "groups": groups}
 
 
-def _boxplot_4gruppi(groups: dict, variant: str, out_dir: str) -> None:
-    order = ["non_mutati_non_esposti", "mutati_non_esposti", "non_mutati_esposti", "mutati_esposti"]
-    labels_base = ["WT\nnon esposti", "Mutato\nnon esposti", "WT\nesposti", "Mutato\nesposti"]
+def _boxplot_4groups(groups: dict, variant: str, out_dir: str) -> None:
+    order = ["wildtype_unexposed", "mutant_unexposed", "wildtype_exposed", "mutant_exposed"]
+    labels_base = ["WT\nunexposed", "Mutant\nunexposed", "WT\nexposed", "Mutant\nexposed"]
     plot_groups, plot_labels = [], []
     for key, label in zip(order, labels_base):
         g = groups[key]
@@ -111,7 +109,7 @@ def _boxplot_4gruppi(groups: dict, variant: str, out_dir: str) -> None:
 
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.boxplot(plot_groups, tick_labels=plot_labels, showmeans=True)
-    ax.set_ylabel("Età d'esordio")
+    ax.set_ylabel("Onset age")
     ax.set_title(variant)
     fig.tight_layout()
     os.makedirs(out_dir, exist_ok=True)
@@ -133,7 +131,7 @@ def run(genetic_path: str, target_generation: int, out_csv: str, plots_dir: str)
     configure_logging(cfg.log_dir)
 
     df, variant_cols = _load_merged(genetic_path, target_generation, cfg)
-    log.info("%d varianti da processare su generation=%d", len(variant_cols), target_generation)
+    log.info("%d variants to process for generation=%d", len(variant_cols), target_generation)
 
     rows = []
     for variant_col in variant_cols:
@@ -143,12 +141,12 @@ def run(genetic_path: str, target_generation: int, out_csv: str, plots_dir: str)
         row.update(_flatten("exposed_", stats["exposed"]))
         row.update(_flatten("non_exposed_", stats["non_exposed"]))
         rows.append(row)
-        _boxplot_4gruppi(stats["groups"], variant_col, plots_dir)
+        _boxplot_4groups(stats["groups"], variant_col, plots_dir)
 
     out_df = pd.DataFrame(rows)
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     out_df.to_csv(out_csv, index=False)
-    log.info("Report completato: %d varianti -> %s (boxplot in %s)", len(rows), out_csv, plots_dir)
+    log.info("Report complete: %d variants -> %s (boxplots in %s)", len(rows), out_csv, plots_dir)
     return out_csv
 
 

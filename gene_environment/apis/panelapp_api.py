@@ -1,4 +1,5 @@
 # gene_environment/apis/panelapp_api.py
+"""PanelApp Genomics England client: checks whether a gene appears in an ALS/motor-neuron-disease gene panel."""
 from __future__ import annotations
 
 import time
@@ -13,9 +14,9 @@ ALS_KEYWORDS = ("amyotrophic lateral sclerosis", "motor neuron", "motor neurone"
 
 
 def _get_with_retry(url: str, params: dict, timeout: int, max_retries: int = 5) -> requests.Response:
-    """GET con retry/backoff su 429 (rate limit) e 5xx (errori transitori
-    del server). Rispetta l'header Retry-After se presente, altrimenti
-    usa un backoff esponenziale con jitter."""
+    """GET with retry/backoff on 429 (rate limit) and 5xx (transient server
+    errors). Honors the Retry-After header if present, otherwise uses
+    exponential backoff with jitter."""
     for attempt in range(max_retries):
         resp = requests.get(url, params=params, timeout=timeout)
 
@@ -24,9 +25,9 @@ def _get_with_retry(url: str, params: dict, timeout: int, max_retries: int = 5) 
             if retry_after is not None:
                 wait = float(retry_after)
             else:
-                wait = (2 ** attempt) + (0.1 * attempt)  # backoff esponenziale + piccolo jitter
+                wait = (2 ** attempt) + (0.1 * attempt)  # exponential backoff + small jitter
             log.warning(
-                "PanelApp %s (tentativo %d/%d), attendo %.1fs: %s",
+                "PanelApp %s (attempt %d/%d), waiting %.1fs: %s",
                 resp.status_code, attempt + 1, max_retries, wait, url,
             )
             time.sleep(wait)
@@ -35,7 +36,7 @@ def _get_with_retry(url: str, params: dict, timeout: int, max_retries: int = 5) 
         resp.raise_for_status()
         return resp
 
-    resp.raise_for_status()  # ultimo tentativo: se ancora in errore, solleva
+    resp.raise_for_status()  # last attempt: if still failing, raise
     return resp
 
 
@@ -45,7 +46,7 @@ class PanelAppAPI:
     def get_als_status(gene_symbol: str, timeout: int = 15) -> dict:
         if not gene_symbol or gene_symbol.startswith("ENSG"):
             log.warning(
-                "PanelApp: simbolo gene mancante o non risolto ('%s'), skip query.",
+                "PanelApp: missing or unresolved gene symbol ('%s'), skipping query.",
                 gene_symbol,
             )
             return {"found_in_als_panel": False, "confidence_level": None,
@@ -55,7 +56,7 @@ class PanelAppAPI:
         payload = resp.json()
 
         log.info(
-            "PanelApp query gene_symbol=%s -> count=%s risultati totali",
+            "PanelApp query gene_symbol=%s -> count=%s total results",
             gene_symbol, payload.get("count"),
         )
 
@@ -74,7 +75,7 @@ class PanelAppAPI:
 
         if not als_matches:
             log.info(
-                "PanelApp: gene=%s trovato in %d pannelli totali, nessuno relativo a SLA/MND",
+                "PanelApp: gene=%s found in %d total panels, none ALS/MND-related",
                 gene_symbol, len(results),
             )
             return {"found_in_als_panel": False, "confidence_level": None,

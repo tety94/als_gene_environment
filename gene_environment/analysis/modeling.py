@@ -1,57 +1,52 @@
-"""
-Core del test per singola variante: matching + regressione + permutation test
-+ statistiche di differenza onset_age, tutto salvato insieme.
+"""Core of the per-variant test: matching + regression + permutation test
++ onset_age difference statistics, all saved together.
 
-NOVITA' (correzione per struttura di popolazione): il modello OLS include
-ora, DI DEFAULT, le prime N componenti principali (PCA) come covariate di
-correzione -- NON di interazione -- caricate per la generazione corrente
-(cfg.generation) da gene_environment/utils/pca_utils.py. Le colonne PCA
-sono popolate una volta per worker da `orchestrator.init_worker` in
-`global_covariate_cols` (stesso pattern di `global_df`), cosi' non serve
-ripassarle ad ogni submit al ProcessPoolExecutor.
+Population-structure correction: the OLS model includes, by default, the
+first N principal components (PCA) as correction (NOT interaction)
+covariates, loaded for the current generation (cfg.generation) from
+gene_environment/utils/pca_utils.py. The PCA columns are populated once
+per worker by `orchestrator.init_worker` into `global_covariate_cols`
+(same pattern as `global_df`), so they don't need to be repassed on every
+submit to the ProcessPoolExecutor.
 
-Per disattivarle: cfg.use_pca_covariates = False (env USE_PCA_COVARIATES=
-false) -> global_covariate_cols resta [] e il modello torna esattamente
-quello di prima (nessuna covariata aggiuntiva, ne' nel path smf.ols ne' nel
-fast path delle permutazioni).
+To disable them: cfg.use_pca_covariates = False (env
+USE_PCA_COVARIATES=false) -> global_covariate_cols stays [] and the model
+has no additional covariates, neither in the smf.ols path nor in the fast
+permutation path.
 
-BUG CRITICO trovato e corretto (invariato dalla versione precedente):
-  `rng = np.random.RandomState(RANDOM_STATE + (abs(hash(variant_col)) % 2_000_000))`
-  `hash()` su una stringa in Python NON è stabile fra esecuzioni diverse del
-  processo (randomizzazione dell'hash attivata di default dal 2012, PEP 456)
-  a meno di impostare esplicitamente PYTHONHASHSEED=0. Questo significa che
-  gli stessi identici dati, con lo stesso RANDOM_STATE, potevano produrre
-  permutazioni (e quindi p-value empirici) leggermente diversi ad ogni
-  rilancio della pipeline: risultati non riproducibili, un problema serio
-  per un'analisi statistica. Corretto usando hashlib.md5 (hash stabile,
-  deterministico, indipendente da PYTHONHASHSEED).
+Permutation seeding: `rng` is seeded via a stable MD5-based hash
+(`_stable_seed`) rather than Python's built-in `hash()` on a string.
+`hash()` on a string is NOT stable across different process runs (hash
+randomization has been on by default since 2012, PEP 456) unless
+PYTHONHASHSEED=0 is set explicitly -- using it would mean the same data
+with the same RANDOM_STATE could still produce slightly different
+permutations (and empirical p-values) on every pipeline run, which is a
+reproducibility problem for a statistical analysis.
 
-ALTRE MODIFICHE (invariate dalla versione precedente):
-  - tqdm dentro ai worker di ProcessPoolExecutor produceva output confuso
-    (decine di processi che scrivono barre di progresso sullo stesso
-    terminale). Sostituito con log periodici (ogni N permutazioni) tramite
-    il logger centralizzato.
-  - "Adaptive early stopping" per le permutazioni LIGHT: se dopo
-    `adaptive_perm_check_every` permutazioni il numero di permutazioni con
-    |beta_perm| >= |beta_oss| è già chiaramente troppo alto (futility check),
-    ci si ferma prima di sprecare le permutazioni rimanenti su una variante
-    che non risulterà comunque significativa. Ottimizzazione importante dato
-    che il matching+OLS per permutazione è l'operazione più costosa della
-    pipeline e viene ripetuta N_PERM (fino a N_PERM_HIGH) volte per
-    variante.
-  - Le statistiche di differenza onset_age (mutati vs non mutati, sullo
-    stesso identico dataset usato per il modello) vengono calcolate qui,
-    SUBITO, e restituite insieme al resto -> salvate a DB nella stessa riga,
-    niente più script separato da rilanciare a posteriori.
+Other notes:
+  - tqdm inside ProcessPoolExecutor workers produces garbled output (dozens
+    of processes writing progress bars to the same terminal), so periodic
+    log lines (every N permutations) through the centralized logger are
+    used instead.
+  - "Adaptive early stopping" for the LIGHT permutations: every
+    `adaptive_perm_check_every` permutations, checks whether the number of
+    permutations with |beta_perm| >= |beta_obs| is already clearly too high
+    (futility check), in which case it stops before wasting the remaining
+    permutations on a variant that won't end up significant anyway. This
+    matters because matching+OLS per permutation is the most expensive
+    operation in the pipeline and is repeated N_PERM (up to N_PERM_HIGH)
+    times per variant.
+  - The onset_age difference statistics (mutant vs non-mutant, on the same
+    exact dataset used for the model) are computed here, immediately, and
+    returned together with the rest -> saved to the DB on the same row, no
+    separate script to rerun afterwards.
 
-NOTA (non affrontata qui, vedi conversazione): cfg.covariates (es. "sex")
-esiste in config.py ma NON viene ancora usato in build_formula qui sotto
-(passato come lista vuota nel path "osservato" prima di questa modifica).
-Non l'ho unito automaticamente alle PCA in questo intervento perche' se
-"sex" fosse salvato come stringa non numerica romperebbe
-`assert_numeric_covariates` nel fast path per OGNI variante (il fast path
-non fa dummy-encoding come patsy) -- va verificato il dtype reale prima di
-aggiungerlo.
+NOTE: cfg.covariates (e.g. "sex") exists in config.py but is NOT yet used
+in build_formula below (passed as an empty list). It hasn't been merged
+automatically with the PCA covariates here because if "sex" were stored as
+a non-numeric string it would break `assert_numeric_covariates` in the
+fast path for EVERY variant (the fast path doesn't do dummy-encoding like
+patsy) -- the actual dtype needs to be verified before adding it.
 """
 from __future__ import annotations
 
@@ -78,16 +73,16 @@ from gene_environment.logging_utils import get_logger
 
 log = get_logger(__name__)
 
-# Popolati dall'initializer del worker (vedi orchestrator.py) — evita di
-# passare/pickle-are il dataframe intero (e la lista di covariate) ad ogni
+# Populated by the worker initializer (see orchestrator.py) -- avoids
+# passing/pickling the entire dataframe (and covariate list) on every
 # submit.
 global_df = None
 global_covariate_cols: list[str] = []
 
 
 def _stable_seed(base_seed: int, variant_col: str) -> int:
-    """Seed deterministico e riproducibile fra esecuzioni diverse, a
-    differenza di hash() su stringa (vedi docstring del modulo)."""
+    """Deterministic seed, reproducible across different runs, unlike
+    hash() on a string (see the module docstring)."""
     digest = hashlib.md5(variant_col.encode("utf-8")).hexdigest()
     offset = int(digest[:8], 16) % 2_000_000
     return base_seed + offset
@@ -112,7 +107,7 @@ def _find_interaction_term(mod_params_index, variant_col: str) -> str | None:
 from gene_environment.analysis.fast_ols import (
     assert_numeric_covariates,
     build_design_and_solve,
-    design_column_names,          # nuovo import
+    design_column_names,
     interaction_column_index,
 )
 
@@ -154,7 +149,7 @@ def _run_permutation_batch(
             betas[i] = beta[inter_idx]
 
         if (i + 1) % 500 == 0:
-            log.debug("%s: %d/%d permutazioni completate", log_prefix, i + 1, n_perm)
+            log.debug("%s: %d/%d permutations completed", log_prefix, i + 1, n_perm)
 
     if full_beta:
         valid = ~np.isnan(betas[:, 0])
@@ -164,7 +159,7 @@ def _run_permutation_batch(
 def process_single_variant(variant_col: str, variant_original: str, Ecols: list[str],  full_beta: bool = False) -> dict | None:
     cfg = get_config()
     df = global_df
-    covariate_cols = global_covariate_cols  # es. le PC, popolate da init_worker; [] se disattivate
+    covariate_cols = global_covariate_cols  # e.g. the PCs, populated by init_worker; [] if disabled
 
     df = df[df[variant_col] != "."].copy()
     df[variant_col] = df[variant_col].astype(int)
@@ -191,24 +186,24 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     if n_treated < cfg.min_treated or n_control < cfg.min_treated:
         return _empty()
 
-    # covariate_cols (le PC) entra qui nella selezione colonne: se un
-    # campione non ha PCA (merge fallito per quel IID, vedi pca_utils.py)
-    # viene scartato dal dropna() esattamente come per qualunque altra
-    # covariata mancante -- stesso trattamento, nessuna gestione speciale.
+    # covariate_cols (the PCs) enters here into the column selection: if a
+    # sample has no PCA (merge failed for that IID, see pca_utils.py) it is
+    # dropped by dropna() exactly like any other missing covariate -- same
+    # treatment, no special handling.
     cols = [cfg.target_col, variant_col, "_match_variant"] + Ecols + covariate_cols
     df_model = df[cols].dropna()
     if df_model.shape[0] < cfg.min_sample_size:
         return _empty()
 
-    # ---- Statistiche onset_age POOLED (mutati vs non mutati, esposizione
-    # ignorata): calcolate qui, sullo stesso dataset usato per il modello,
-    # così sono coerenti col resto del risultato e vengono salvate a DB
-    # nella stessa riga/stessa transazione.
-    # NB: la versione STRATIFICATA per esposizione (mutati/non mutati x
-    # esposti/non esposti) NON viene calcolata qui — costerebbe lavoro su
-    # milioni di varianti che nella stragrande maggioranza non sono
-    # significative. Si calcola a valle, solo sulle varianti significative,
-    # con lo script dedicato (vedi significant_variants/). ----
+    # ---- POOLED onset_age statistics (mutant vs non-mutant, exposure
+    # ignored): computed here, on the same dataset used for the model, so
+    # they're consistent with the rest of the result and get saved to the
+    # DB on the same row/transaction.
+    # NB: the version STRATIFIED by exposure (mutant/non-mutant x
+    # exposed/unexposed) is NOT computed here -- it would cost work on
+    # millions of variants, the vast majority of which aren't significant.
+    # It's computed downstream, only for significant variants, by the
+    # dedicated script (see significant_variants/). ----
     mutati_age = df_model.loc[df_model["_match_variant"] == 1, cfg.target_col]
     non_mutati_age = df_model.loc[df_model["_match_variant"] == 0, cfg.target_col]
     onset_result = compute_onset_age_result(
@@ -234,14 +229,14 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     if max_smd > cfg.max_smd:
         return _empty(max_smd=max_smd, onset=onset_dict)
 
-    # covariate_cols (sesso, PC) entra qui nella formula come termine
-    # additivo "+ sex + PC1 + PC2 + ..." FUORI dalla moltiplicazione con
-    # variant -> corregge il modello senza introdurre interazioni
-    # variant:covariata (vedi build_formula e fast_ols.py per la struttura
-    # della design matrix). Le stesse covariate sono usate ANCHE nel
-    # matching sopra (covariates_for_matching=Ecols + covariate_cols): il
-    # matching bilancia esposizione, sesso e struttura di popolazione
-    # insieme tra portatori e non portatori, non la sola esposizione.
+    # covariate_cols (sex, PCs) enters here into the formula as an additive
+    # term "+ sex + PC1 + PC2 + ..." OUTSIDE the multiplication with
+    # variant -> corrects the model without introducing variant:covariate
+    # interactions (see build_formula and fast_ols.py for the design
+    # matrix structure). The same covariates are ALSO used in the matching
+    # above (covariates_for_matching=Ecols + covariate_cols): matching
+    # balances exposure, sex and population structure together between
+    # carriers and non-carriers, not exposure alone.
     formula = build_formula(cfg.target_col, variant_col, Ecols, covariate_cols, matched_obs)
     mod = smf.ols(formula=formula, data=matched_obs).fit()
     interaction_name = _find_interaction_term(mod.params.index, variant_col)
@@ -314,23 +309,23 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
 
     rng = np.random.RandomState(_stable_seed(cfg.random_state, variant_col))
 
-    # Scaler sulle covariate di MATCHING (Ecols + covariate_cols, cioè
-    # esposizione + sesso + PC insieme) fittato UNA VOLTA per variante (non
-    # ad ogni permutazione, vedi fast_ols.py/matching.py). Deve usare lo
-    # STESSO insieme di colonne usato per il matching osservato sopra,
-    # altrimenti la matrice scalata qui non sarebbe comparabile a quella
-    # usata per ottenere matched_obs. Calcolato solo qui, dopo il filtro
-    # min_obs_coef, per non sprecare lavoro sulle varianti che non arrivano
-    # comunque alla fase di permutazione.
+    # Scaler on the MATCHING covariates (Ecols + covariate_cols, i.e.
+    # exposure + sex + PCs together) fitted ONCE per variant (not on every
+    # permutation, see fast_ols.py/matching.py). Must use the SAME set of
+    # columns used for the observed matching above, otherwise the scaled
+    # matrix here wouldn't be comparable to the one used to get
+    # matched_obs. Computed only here, after the min_obs_coef filter, to
+    # avoid wasted work on variants that won't reach the permutation phase
+    # anyway.
     assert_numeric_covariates(df_model[Ecols + covariate_cols])
     X_scaled = precompute_scaled_covariates(df_model, Ecols + covariate_cols)
 
     # ======================================================
-    # PERMUTAZIONI LIGHT, con futility check adattivo:
-    # ogni `adaptive_perm_check_every` permutazioni controlliamo se il
-    # p-value parziale è già ben oltre la soglia (futility), nel qual caso
-    # ci fermiamo prima di finire tutte le N_PERM: la variante non sarà
-    # comunque promossa alle permutazioni HIGH.
+    # LIGHT permutations, with adaptive futility check:
+    # every `adaptive_perm_check_every` permutations we check whether the
+    # partial p-value is already well beyond the threshold (futility), in
+    # which case we stop before finishing all N_PERM: the variant won't be
+    # promoted to HIGH permutations anyway.
     # ======================================================
     perm_betas_light = []
     check_every = max(1, cfg.adaptive_perm_check_every)
@@ -350,7 +345,7 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
             partial_p = float(np.mean(np.abs(partial) >= abs(obs_coef)))
             if partial_p >= cfg.adaptive_perm_futility_p:
                 log.debug(
-                    "[%s] futility stop dopo %d/%d permutazioni (p parziale=%.3f >= %.3f)",
+                    "[%s] futility stop after %d/%d permutations (partial p=%.3f >= %.3f)",
                     variant_col, done, cfg.n_perm, partial_p, cfg.adaptive_perm_futility_p,
                 )
                 stopped_early = True
@@ -361,8 +356,8 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     iterations_light = len(perm_betas_light) if stopped_early else cfg.n_perm
 
     # ======================================================
-    # PERMUTAZIONI HIGH — solo se la LIGHT è significativa e non ci si è
-    # fermati per futility.
+    # HIGH permutations -- only if LIGHT is significant and we didn't stop
+    # for futility.
     # ======================================================
     if not stopped_early and p_emp_light is not None and p_emp_light <= cfg.pvalue_threshold:
         n_additional = cfg.n_perm_high - cfg.n_perm

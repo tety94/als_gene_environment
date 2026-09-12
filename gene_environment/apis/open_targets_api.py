@@ -1,10 +1,9 @@
 # gene_environment/apis/open_targets_api.py
-"""
-Client per Open Targets Platform (https://platform.opentargets.org).
-API GraphQL pubblica, nessuna key richiesta.
+"""Client for the Open Targets Platform (https://platform.opentargets.org).
+Public GraphQL API, no key required.
 
-Usata per ottenere lo score di associazione gene-malattia (aggregato da
-letteratura, GWAS, modelli animali, ecc.) per SLA, dato un Ensembl gene ID.
+Used to fetch the gene-disease association score (aggregated from
+literature, GWAS, animal models, etc.) for ALS, given an Ensembl gene ID.
 """
 from __future__ import annotations
 
@@ -50,17 +49,17 @@ class OpenTargetsAPI:
         payload = resp.json()
 
         if "errors" in payload:
-            log.error("Open Targets API error per %s: %s", ensembl_gene_id, payload["errors"])
+            log.error("Open Targets API error for %s: %s", ensembl_gene_id, payload["errors"])
             return {"associated": False, "score": None, "disease_name": None, "disease_id": None}
 
         target = (payload.get("data") or {}).get("target")
         if not target:
-            log.info("Open Targets: %s non trovato (target=None, gene non in Open Targets)", ensembl_gene_id)
+            log.info("Open Targets: %s not found (target=None, gene not in Open Targets)", ensembl_gene_id)
             return {"associated": False, "score": None, "disease_name": None, "disease_id": None}
 
         rows = ((target.get("associatedDiseases") or {}).get("rows")) or []
         log.info(
-            "Open Targets: %s (%s) trovato, %d malattie associate totali",
+            "Open Targets: %s (%s) found, %d total associated diseases",
             ensembl_gene_id, target.get("approvedSymbol"), len(rows),
         )
 
@@ -71,7 +70,7 @@ class OpenTargetsAPI:
 
         if not als_rows:
             log.info(
-                "Open Targets: %s ha %d malattie associate, nessuna relativa a SLA",
+                "Open Targets: %s has %d associated diseases, none ALS-related",
                 ensembl_gene_id, len(rows),
             )
             return {"associated": False, "score": None, "disease_name": None, "disease_id": None}

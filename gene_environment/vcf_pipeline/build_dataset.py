@@ -1,24 +1,19 @@
-"""
-Prepara il dataset finale (merge genetica + ambientale + PCA) usato dal modeling.
+"""Prepares the final dataset (genetics + environment + PCA merge) used by modeling.
 
-RISTRUTTURAZIONE (fix performance): il dataframe genetico (df_gen) ha
-~1.3M colonne. Ogni merge/rename che lo tocca ricostruisce l'intero
-BlockManager di pandas, quindi il costo NON dipende solo dalle righe ma
-da quante volte l'oggetto largo viene "rimescolato". La versione
-precedente lo toccava 3 volte (merge con env, merge con gen_map, merge
-con PCA in orchestrator.py) + un rename. Qui invece:
+The genetic dataframe (df_gen) has ~1.3M columns. Every merge/rename that
+touches it rebuilds pandas' entire BlockManager, so the cost depends not
+just on the number of rows but on how many times the wide object gets
+"reshuffled". To minimize that:
 
-  1. Tutte le parti "strette" (env, gen_map, PCA) vengono unite fra loro
-     PRIMA -- sono piccole, quindi economico farlo quante volte serve.
-  2. df_gen viene rinominato (safe names) una volta, subito dopo il
-     caricamento.
-  3. Un SOLO merge finale unisce il blocco di covariate strette con
-     df_gen.
+  1. All the "narrow" parts (env, gen_map, PCA) are merged together FIRST
+     -- they're small, so it's cheap to do as many times as needed.
+  2. df_gen is renamed (to safe names) once, right after loading.
+  3. A SINGLE final merge joins the narrow covariate block with df_gen.
 
-La logica di caricamento PCA (load_pca_covariates) resta in
-pca_utils.py ma viene chiamata da qui invece che dall'orchestrator, cosi'
-il merge con le PCA avviene sul dataframe stretto e non su quello largo.
-merge_pca_covariates (in pca_utils.py) non e' piu' usata.
+The PCA-loading logic (load_pca_covariates) stays in pca_utils.py but is
+called from here instead of from the orchestrator, so the merge with the
+PCA data happens on the narrow dataframe, not the wide one.
+merge_pca_covariates (in pca_utils.py) is no longer used.
 """
 from __future__ import annotations
 
@@ -43,7 +38,7 @@ def _load_genetic_data(cfg: Config) -> tuple[pd.DataFrame, list[str], dict, list
     if fmt == "auto":
         fmt = "parquet" if cfg.raw_file.endswith(".parquet") else "csv"
 
-    log.info("Carico file genetica da %s (formato=%s)", cfg.raw_file, fmt)
+    log.info("Loading genetic file from %s (format=%s)", cfg.raw_file, fmt)
     if fmt == "parquet":
         df_gen = pq.ParquetFile(
             cfg.raw_file,
@@ -61,10 +56,10 @@ def _load_genetic_data(cfg: Config) -> tuple[pd.DataFrame, list[str], dict, list
             df_gen["id"] = df_gen["id"].astype(str).map(clean_sample_id)
 
     variant_cols = [c for c in df_gen.columns if c not in NON_GEN_COLS]
-    log.info("Colonne varianti individuate: %d", len(variant_cols))
+    log.info("Variant columns detected: %d", len(variant_cols))
 
-    # Rename a nomi "safe" (variant_i) subito: unico touch del frame largo
-    # per questa operazione, invece di farlo dopo altri merge.
+    # Rename to "safe" names (variant_i) immediately: a single touch of the
+    # wide frame for this operation, instead of doing it after other merges.
     safe = {g: f"variant_{i}" for i, g in enumerate(variant_cols)}
     df_gen = df_gen.rename(columns=safe)
     variant_cols_safe = list(safe.values())
@@ -74,65 +69,65 @@ def _load_genetic_data(cfg: Config) -> tuple[pd.DataFrame, list[str], dict, list
 
 
 def _build_narrow_covariates(cfg: Config, gen_ids: pd.Series) -> tuple[pd.DataFrame, list[str], list[str]]:
-    """Costruisce il blocco 'stretto' (env + mappa generazione + PCA),
-    tutte operazioni economiche perche' i frame coinvolti sono piccoli.
-    gen_ids e' passato solo a scopo diagnostico (log di quanti id
-    combaciano), non viene mai fatto merge diretto con df_gen qui."""
+    """Builds the 'narrow' block (env + generation map + PCA), all cheap
+    operations since the frames involved are small. gen_ids is passed
+    purely for diagnostic purposes (logging how many ids match), it is
+    never merged directly with df_gen here."""
 
-    log.info("Carico file ambientale da %s", cfg.env_file)
+    log.info("Loading environmental file from %s", cfg.env_file)
     df_env = pd.read_csv(cfg.env_file, sep=cfg.sep, decimal=cfg.decimal)
     df_env["id"] = df_env["id"].astype(str)
     SEX_ENCODING = {"M": 1, "F": 0}
     if "sex" in df_env.columns:
         unmapped = set(df_env["sex"].dropna().unique()) - set(SEX_ENCODING.keys())
         if unmapped:
-            raise ValueError(f"'sex': valori non riconosciuti {unmapped}, aggiorna SEX_ENCODING in {__name__}")
+            raise ValueError(f"'sex': unrecognized values {unmapped}, update SEX_ENCODING in {__name__}")
         df_env["sex"] = df_env["sex"].map(SEX_ENCODING).astype(float)
-        log.info("sex codificata con %s", SEX_ENCODING)
+        log.info("sex encoded with %s", SEX_ENCODING)
     if "onset_site" in df_env.columns:
         df_env["onset_site"] = df_env["onset_site"].astype("category")
 
     df = df_env
 
-    # ---- Mappa id -> generazione ----
+    # ---- id -> generation map ----
     map_path = cfg.sample_generation_map or os.path.join(cfg.output_folder, "sample_generation_map.csv")
     if os.path.exists(map_path):
         gen_map = pd.read_csv(map_path, dtype={"id": str})
-        print("DEBUG generation richiesta:", cfg.generation)
-        print("DEBUG generazioni presenti in gen_map:", gen_map["generation"].unique())
-        print("DEBUG righe dopo filtro generazione:", len(df))
-        print("DEBUG esempio id filtrati:", df["id"].head(5).tolist())
+        print("DEBUG requested generation:", cfg.generation)
+        print("DEBUG generations present in gen_map:", gen_map["generation"].unique())
+        print("DEBUG rows before generation filter:", len(df))
+        print("DEBUG sample filtered ids:", df["id"].head(5).tolist())
         n_before = len(df)
         df = df.merge(gen_map, on="id", how="left")
         n_missing_map = df["generation"].isna().sum()
         if n_missing_map:
             log.warning(
-                "%d pazienti non sono presenti nella mappa id->generazione (%s): "
-                "verranno esclusi dal run (generazione sconosciuta).", n_missing_map, map_path,
+                "%d patients are not present in the id->generation map (%s): "
+                "they will be excluded from the run (unknown generation).", n_missing_map, map_path,
             )
         df = df[df["generation"] == cfg.generation].drop(columns=["generation"])
         log.info(
-            "Filtro per generazione=%s (mappa id->generazione da build-matrix): %d -> %d righe",
+            "Filter for generation=%s (id->generation map from build-matrix): %d -> %d rows",
             cfg.generation, n_before, len(df),
         )
     elif cfg.env_generation_col and cfg.env_generation_col in df_env.columns:
         n_before = len(df)
         df = df[df[cfg.env_generation_col].astype(str) == str(cfg.generation)]
         log.info(
-            "Filtro per generazione=%s (colonna '%s' nel file ambientale): %d -> %d righe",
+            "Filter for generation=%s (column '%s' in the environmental file): %d -> %d rows",
             cfg.generation, cfg.env_generation_col, n_before, len(df),
         )
     else:
         log.warning(
-            "Nessuna mappa id->generazione trovata (%s) e nessuna ENV_GENERATION_COL configurata: "
-            "uso TUTTE le righe senza filtro per generazione.", map_path,
+            "No id->generation map found (%s) and no ENV_GENERATION_COL configured: "
+            "using ALL rows with no generation filter.", map_path,
         )
 
     df = df.drop_duplicates("id")
 
-    # ---- Standardizzazione esposizione (sul frame stretto) ----
+    # ---- Exposure standardization (on the narrow frame) ----
     df[cfg.target_col] = pd.to_numeric(df[cfg.target_col], errors="coerce")
-    log.info("Standardizzazione dell'esposizione '%s' (standardize=%s)", cfg.exposure, cfg.standardize)
+    log.info("Standardizing exposure '%s' (standardize=%s)", cfg.exposure, cfg.standardize)
     Ecols = []
     df[cfg.exposure] = pd.to_numeric(df[cfg.exposure], errors="coerce")
     if cfg.standardize:
@@ -141,14 +136,14 @@ def _build_narrow_covariates(cfg: Config, gen_ids: pd.Series) -> tuple[pd.DataFr
     else:
         Ecols.append(cfg.exposure)
 
-    # ---- PCA (frame stretto, merge economico) ----
+    # ---- PCA (narrow frame, cheap merge) ----
     covariate_cols: list[str] = []
     if cfg.use_pca_covariates:
         pca_df = load_pca_covariates(cfg.pca_covariates_path_template, cfg.generation, cfg.pca_n_components)
 
         if "id" in df.columns and PCA_ID_COLUMN not in df.columns:
             n_match = df["id"].isin(pca_df[PCA_ID_COLUMN]).sum()
-            log.info("PCA: %d/%d id del blocco covariate trovano corrispondenza in IID.", n_match, len(df))
+            log.info("PCA: %d/%d ids in the covariate block matched in IID.", n_match, len(df))
             df = df.merge(pca_df, left_on="id", right_on=PCA_ID_COLUMN, how="left")
         else:
             df = df.merge(pca_df, on=PCA_ID_COLUMN, how="left")
@@ -158,27 +153,27 @@ def _build_narrow_covariates(cfg: Config, gen_ids: pd.Series) -> tuple[pd.DataFr
         if n_missing:
             pct = 100 * n_missing / len(df)
             log.warning(
-                "PCA: %d/%d campioni (%.1f%%) senza corrispondenza dopo il merge (blocco stretto).",
+                "PCA: %d/%d samples (%.1f%%) had no match after the merge (narrow block).",
                 n_missing, len(df), pct,
             )
         else:
-            log.info("PCA: merge completato, tutti i %d campioni hanno le PC.", len(df))
+            log.info("PCA: merge complete, all %d samples have PCs.", len(df))
     else:
-        log.info("PCA disattivate (cfg.use_pca_covariates=False): nessuna covariata di popolazione.")
+        log.info("PCA disabled (cfg.use_pca_covariates=False): no population-structure covariate.")
 
     if "sex" in df.columns:
         n_missing_sex = int(df["sex"].isna().sum())
         if n_missing_sex:
             pct = 100 * n_missing_sex / len(df)
-            log.warning("sex: %d/%d campioni (%.1f%%) senza valore, verranno esclusi da dropna().", n_missing_sex,
+            log.warning("sex: %d/%d samples (%.1f%%) have no value, will be excluded by dropna().", n_missing_sex,
                         len(df), pct)
         else:
-            log.info("sex: nessun valore mancante su %d campioni.", len(df))
+            log.info("sex: no missing values across %d samples.", len(df))
         covariate_cols = covariate_cols + ["sex"]
     else:
-        log.warning("Colonna 'sex' non trovata nel file ambientale: covariata non aggiunta.")
+        log.warning("Column 'sex' not found in the environmental file: covariate not added.")
 
-    log.info("Covariate di correzione usate nel modello: %s", covariate_cols or "nessuna")
+    log.info("Correction covariates used in the model: %s", covariate_cols or "none")
     print(df.columns)
     return df, Ecols, covariate_cols
 
@@ -190,25 +185,25 @@ def load_and_prepare_data(cfg: Config | None = None):
 
     covariates, Ecols, covariate_cols = _build_narrow_covariates(cfg, df_gen["id"])
 
-    log.info("Merge finale (unico touch del dataframe genetico largo) su 'id'")
-    print("DEBUG id covariates (dopo filtro gen):", covariates["id"].head(10).tolist())
-    print("DEBUG id df_gen (genetica):", df_gen["id"].head(10).tolist())
+    log.info("Final merge (single touch of the wide genetic dataframe) on 'id'")
+    print("DEBUG covariates id (after generation filter):", covariates["id"].head(10).tolist())
+    print("DEBUG df_gen id (genetics):", df_gen["id"].head(10).tolist())
     print("DEBUG overlap:", len(set(covariates["id"]) & set(df_gen["id"])))
     df = pd.merge(covariates, df_gen, on="id", how="inner")
 
     n_cov, n_gen, n_merged = len(covariates), len(df_gen), len(df)
-    log.info("Righe covariate=%d, genetica=%d, dopo merge finale (inner)=%d", n_cov, n_gen, n_merged)
+    log.info("Rows covariates=%d, genetics=%d, after final merge (inner)=%d", n_cov, n_gen, n_merged)
     if n_merged == 0:
         log.warning(
-            "Il merge finale ha prodotto 0 righe: nessun id in comune fra covariate e genetica. "
-            "Controlla il formato degli id (prefissi genN_, duplicazioni XXX_XXX ecc.)."
+            "The final merge produced 0 rows: no id in common between covariates and genetics. "
+            "Check the id format (genN_ prefixes, XXX_XXX duplication, etc.)."
         )
     elif n_merged < 0.5 * min(n_cov, n_gen):
         log.warning(
-            "Il merge finale ha 'perso' più del 50%% delle righe attese (%d su min(%d,%d)): "
-            "verifica la coerenza degli id fra i file.", n_merged, n_cov, n_gen
+            "The final merge 'lost' more than 50%% of the expected rows (%d out of min(%d,%d)): "
+            "check id consistency across the files.", n_merged, n_cov, n_gen
         )
 
-    log.info("Id unici post-merge: %d (righe totali: %d)", df["id"].nunique(), len(df))
+    log.info("Unique ids post-merge: %d (total rows: %d)", df["id"].nunique(), len(df))
 
     return df, variant_cols_safe, mapping, Ecols, variant_cols, covariate_cols

@@ -1,11 +1,8 @@
-"""
-SCRIPT 1/3 — estrae la lista di varianti significative (stored procedure
-`get_significant_results`, coorte 1 e 2 affiancate) e la salva su un file
-di testo, una variante per riga (label originale CHROM_POS_MUTATION).
-
-Nessuna scrittura a DB, nessun genotipo: solo la lista di nomi. Input per
-lo script 2 (extract_significant_genetic_columns.py).
-"""
+"""Extracts the list of significant variants (via the
+`get_significant_results` stored procedure, cohort 1 and 2 side by side)
+and saves it to a text file, one variant per line (CHROM_POS_MUTATION
+label). No DB writes, no genotypes: just the list of names, used as input
+for step2 (extract_significant_genetic_columns.py)."""
 from __future__ import annotations
 
 import argparse
@@ -30,12 +27,12 @@ def run(exposure: str | None, out_path: str) -> str:
     configure_logging(cfg.log_dir)
 
     labels = get_significant_labels(exposure)
-    log.info("%d varianti significative trovate (exposure=%s)", len(labels), exposure or cfg.exposure)
+    log.info("%d significant variants found (exposure=%s)", len(labels), exposure or cfg.exposure)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w") as f:
         f.write("\n".join(labels) + ("\n" if labels else ""))
-    log.info("Lista salvata in %s", out_path)
+    log.info("List saved to %s", out_path)
     return out_path
 
 

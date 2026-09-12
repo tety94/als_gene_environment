@@ -1,23 +1,4 @@
-"""
-Funzioni condivise per la gestione degli ID campione e dei nomi variante.
-
-PROBLEMA TROVATO nel codice originale:
-  - `data_loader.py` faceva:  df_env['id'] = df_env['id'] + '_' + df_env['id']
-    cioè duplicava artificialmente l'id (es. "RES02977" -> "RES02977_RES02977")
-    SOLO per farlo combaciare con gli id del file genetico (che evidentemente
-    arrivavano già in quel formato duplicato per qualche ragione a monte, mai
-    spiegata nei commenti).
-  - Poi, chilometri di codice più avanti, `analyze_variant_onset_age.py`
-    doveva fare l'operazione INVERSA (`clean_id`) per togliere la
-    duplicazione e recuperare l'id "pulito".
-  Risultato: la stessa logica di trasformazione duplicata in due punti
-  lontani del codice, con il rischio concreto che uno dei due venga
-  aggiornato e l'altro no (bug silenzioso: join che non matcha più nulla).
-
-SOLUZIONE: un'unica funzione, usata ovunque serva normalizzare un id
-campione, con la logica esplicitata e documentata. Se in futuro il formato
-degli id a monte cambia, si aggiorna in un solo posto.
-"""
+"""Shared helpers for normalizing sample ids and building/parsing variant labels."""
 from __future__ import annotations
 
 import re
@@ -26,16 +7,11 @@ _DUP_ID_RE = re.compile(r"^(.+)_\1$")
 
 
 def clean_sample_id(raw_id: str) -> str:
-    """
-    Normalizza un id campione:
-      - rimuove un eventuale prefisso "genN_" (N=1,2,3)
-      - se l'id è nella forma "XXX_XXX" (stessa stringa ripetuta, separata da
-        underscore) lo riduce a "XXX". Questo pattern è stato osservato nei
-        dati sorgente (es. "RES02977_RES02977") ed è l'unica ragione per cui
-        prima si "duplicava" artificialmente l'id nel loader ambientale: qui
-        lo normalizziamo una volta sola, alla fonte, invece di duplicare
-        l'id altrove per farlo combaciare.
-    """
+    """Normalize a sample id:
+      - strips an optional "genN_" prefix (N=1,2,3)
+      - if the id has the form "XXX_XXX" (same string repeated, separated by
+        an underscore), reduces it to "XXX". This pattern has been observed
+        in the source data (e.g. "RES02977_RES02977")."""
     if raw_id is None:
         return raw_id
     val = raw_id
@@ -53,12 +29,9 @@ def build_variant_label(chromosome: str, position, mutation: str) -> str:
 
 
 def parse_variant_label(variant_label: str) -> tuple[str | None, int | None, str | None]:
-    """
-    Split robusto di un label variante nel formato "CHROM_POS_MUTATION"
-    (dove MUTATION può a sua volta contenere underscore, es. "A_G").
-    Usa split(max=2) per non troncare la mutazione, come già faceva il
-    codice originale in vari punti (ora unificato qui).
-    """
+    """Robustly split a variant label of the form "CHROM_POS_MUTATION"
+    (where MUTATION may itself contain underscores, e.g. "A_G").
+    Uses split(max=2) to avoid truncating the mutation."""
     parts = variant_label.split("_", 2)
     chrom = parts[0] if len(parts) > 0 else None
     pos = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None

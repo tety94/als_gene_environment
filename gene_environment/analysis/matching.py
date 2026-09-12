@@ -1,17 +1,4 @@
-"""
-Matching (nearest-neighbor) fra pazienti mutati e non mutati sulle covariate.
-
-Fix rispetto all'originale (matching.py):
-  - Aggiunti type hints e logging (nessun comportamento cambia rispetto
-    all'originale: la logica del matching era corretta).
-  - `_prepare_matching_matrix`: se una colonna richiesta non esiste nel
-    dataframe veniva silenziosamente saltata (`continue`); ora viene
-    loggato un warning esplicito, così un typo nei nomi delle covariate
-    (facile con EXPOSURE + "_std" costruito a runtime) non passa
-    inosservato.
-  - `check_balance`: se `matched_df` è None l'originale ritornava {} in
-    silenzio; mantenuto per compatibilità ma ora con un log di debug.
-"""
+"""Nearest-neighbor matching between mutant and non-mutant patients on covariates."""
 from __future__ import annotations
 
 import numpy as np
@@ -27,12 +14,12 @@ log = get_logger(__name__)
 
 def _prepare_matching_matrix(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     if not cols:
-        raise ValueError("Nessuna colonna fornita per il matching")
+        raise ValueError("No columns provided for matching")
 
     features = []
     for c in cols:
         if c not in df.columns:
-            log.warning("Colonna di matching '%s' non trovata nel dataframe: saltata", c)
+            log.warning("Matching column '%s' not found in dataframe: skipped", c)
             continue
         if pd.api.types.is_numeric_dtype(df[c]):
             features.append(df[c].fillna(df[c].mean()))
@@ -41,7 +28,7 @@ def _prepare_matching_matrix(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
             features.append(dummies)
 
     if not features:
-        raise ValueError("Nessuna feature di matching valida trovata nel dataframe")
+        raise ValueError("No valid matching feature found in dataframe")
 
     X = pd.concat(features, axis=1)
     X_scaled = pd.DataFrame(StandardScaler().fit_transform(X), columns=X.columns, index=X.index)
@@ -78,15 +65,13 @@ def match_control_units(
     nn = NearestNeighbors(n_neighbors=k_used).fit(X_other.values)
     distances, _ = nn.kneighbors(X_base.values)
 
-    # Gestione dei pareggi: se più punti "other" sono alla STESSA distanza
-    # del k-esimo vicino (es. una massa di valori identici nella covariata
-    # di matching, come una categoria "non esposto" numericamente
-    # consistente), li si include TUTTI, non solo i primi k trovati.
-    # Comportamento standard nella letteratura sul matching (es. R MatchIt).
-    # Senza questo, np.unique(indices.flatten()) troncava arbitrariamente i
-    # pareggi a k rappresentanti, sbilanciando sistematicamente il campione
-    # appaiato ogni volta che la covariata aveva molti valori ripetuti — e
-    # peggiorando, non migliorando, all'aumentare del numero di pazienti.
+    # Tie handling: if multiple "other" points are at the SAME distance as
+    # the k-th neighbor (e.g. a cluster of identical values in the matching
+    # covariate, such as a numerically consistent "unexposed" category),
+    # include ALL of them, not just the first k found. This is standard
+    # practice in the matching literature (e.g. R's MatchIt). Without this,
+    # ties would be arbitrarily truncated to k representatives, biasing the
+    # matched sample whenever the covariate had many repeated values.
     kth_dist = distances[:, -1]
     D_full = cdist(X_base.values, X_other.values)
     selected_other_pos = np.unique(np.where(D_full <= kth_dist[:, None] + 1e-9)[1])
@@ -99,21 +84,17 @@ def match_control_units(
 
 
 def precompute_scaled_covariates(df: pd.DataFrame, covariates_for_matching: list[str]) -> np.ndarray:
-    """Fitta lo StandardScaler UNA SOLA VOLTA sulle covariate di matching.
+    """Fit the StandardScaler ONCE on the matching covariates.
 
-    Le covariate (Ecols) non cambiano mai tra una permutazione e l'altra —
-    cambia solo l'etichetta trattato/controllo (_match_variant). L'originale
-    rifaceva `_prepare_matching_matrix` (fit+transform dello scaler) dentro
-    ogni singola chiamata a `match_control_units`, quindi ad ogni
-    permutazione: puro lavoro ripetuto identico. Chiamare questa funzione
-    una volta per variante e passare il risultato a
-    `match_control_units_indices` elimina quella ridondanza.
+    The covariates (Ecols) never change between permutations -- only the
+    treated/control label changes (_match_variant). Calling this function
+    once per variant and passing the result to `match_control_units_indices`
+    avoids re-fitting the scaler on every single permutation.
 
-    NB: `_prepare_matching_matrix` scala su `df_matching` (base+other, cioè
-    l'intero dataframe passato), quindi statisticamente equivalente a
-    scalare una volta sull'intero `df_model` come si fa qui: stesso insieme
-    di righe, stessa media/std, indipendentemente dall'ordine con cui
-    vengono concatenate base/other.
+    Note: `_prepare_matching_matrix` scales on `df_matching` (base+other,
+    i.e. the whole dataframe passed in), so it's statistically equivalent
+    to scaling once on the whole `df_model` as done here: same set of rows,
+    same mean/std, regardless of the order base/other are concatenated in.
     """
     return _prepare_matching_matrix(df, covariates_for_matching).values
 
@@ -121,18 +102,18 @@ def precompute_scaled_covariates(df: pd.DataFrame, covariates_for_matching: list
 def match_control_units_indices(
     labels: np.ndarray, X_scaled: np.ndarray, k: int = 2
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Equivalente veloce di `match_control_units`, usato nel loop di
-    permutazione: invece di ri-fittare `NearestNeighbors` (costruzione
-    albero ad ogni chiamata) usa `cdist` + `argpartition` su una matrice di
-    covariate GIA' scalata (vedi `precompute_scaled_covariates`).
+    """Fast equivalent of `match_control_units`, used in the permutation
+    loop: instead of re-fitting `NearestNeighbors` (building a tree on
+    every call) it uses `cdist` + `argpartition` on an ALREADY scaled
+    covariate matrix (see `precompute_scaled_covariates`).
 
-    Gestisce i pareggi come `match_control_units` (vedi commento lì): se più
-    punti "other" sono alla stessa distanza del k-esimo vicino, li include
-    tutti, non solo i primi k trovati da argpartition.
+    Handles ties like `match_control_units` (see the comment there): if
+    multiple "other" points are at the same distance as the k-th neighbor,
+    all of them are included, not just the first k found by argpartition.
 
-    Ritorna (matched_base_idx, matched_other_idx): array di POSIZIONI
-    intere in `X_scaled`/`labels` (non indici pandas), oppure None se un
-    gruppo è vuoto o non ci sono vicini disponibili.
+    Returns (matched_base_idx, matched_other_idx): arrays of integer
+    POSITIONS in `X_scaled`/`labels` (not pandas indices), or None if a
+    group is empty or no neighbors are available.
     """
     group1 = np.where(labels == 1)[0]
     group0 = np.where(labels == 0)[0]
@@ -159,7 +140,7 @@ def match_control_units_indices(
 
 def check_balance(matched_df: pd.DataFrame | None, variant_col: str, covariates_for_matching: list[str]) -> dict:
     if matched_df is None:
-        log.debug("check_balance: matched_df è None, nessun balance calcolato")
+        log.debug("check_balance: matched_df is None, no balance computed")
         return {}
 
     treated = matched_df[matched_df[variant_col] == 1]

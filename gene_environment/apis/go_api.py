@@ -1,19 +1,18 @@
+"""Gene Ontology (QuickGO) API client: fetches GO terms for a gene product and filters for neuro/toxic-related terms."""
 import requests
 
-# GENE ONTOLOGY API
+
 class GOAPI:
     GO_REST = "https://www.ebi.ac.uk/QuickGO/services"
 
     @staticmethod
     def get_go_terms(uniprot: str) -> dict:
-        """
-        Recupera termini GO associati a un geneProductId (UniProt).
-        Filtra termini contenenti parole chiave 'neuro' e 'toxic'.
-        """
+        """Fetch GO terms associated with a geneProductId (UniProt),
+        filtered to terms matching 'neuro' or 'toxic' keywords."""
 
         url = f"{GOAPI.GO_REST}/annotation/search"
         params = {
-            "geneProductId": uniprot,  # esempio: "UniProtKB:P04637"
+            "geneProductId": uniprot,  # e.g. "UniProtKB:P04637"
             "limit": 200
         }
 
@@ -21,7 +20,7 @@ class GOAPI:
             r = requests.get(url, params=params)
             r.raise_for_status()
         except requests.RequestException as e:
-            print(f"Errore API: {e}")
+            print(f"API error: {e}")
             return {"neuro": [], "toxic": []}
 
         neuro = set()
@@ -45,7 +44,7 @@ class GOAPI:
 
     @staticmethod
     def lookup_go_name(go_id: str) -> str:
-        """Recupera il nome leggibile di un GO term dato il suo ID."""
+        """Fetch the human-readable name of a GO term given its ID."""
         if not go_id:
             return None
         url = f"{GOAPI.GO_REST}/ontology/go/terms/{go_id}"
