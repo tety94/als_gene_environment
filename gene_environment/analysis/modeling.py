@@ -90,6 +90,14 @@ log = get_logger(__name__)
 global_df = None
 global_covariate_cols: list[str] = []
 
+# Observed |beta| above this is treated as numerically implausible (almost
+# always a sign of an unstable fit -- near-separation, a tiny or very
+# unbalanced matched sample, etc.) and the variant is skipped before any
+# permutation is run. Not read from cfg on purpose: it's a numerical
+# sanity guard, not a modeling choice -- move it into config.py instead if
+# you want it tunable per run.
+MAX_ABS_OBS_COEF = 100.0
+
 
 def _stable_seed(base_seed: int, variant_col: str) -> int:
     """Deterministic seed, reproducible across different runs, unlike
@@ -258,6 +266,18 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     obs_coef = float(mod.params[interaction_name])
     n_treated_matched = int(matched_obs["_match_variant"].sum())
     n_control_matched = int((matched_obs["_match_variant"] == 0).sum())
+
+    # Guard against implausibly large observed beta (typically a sign of a
+    # numerically unstable fit -- near-separation, a tiny/unbalanced
+    # matched sample, etc.). Returned before the costly full_beta branch
+    # and before any permutation is run, exactly like the other early-exit
+    # checks above (min_treated, min_sample_size, max_smd).
+    if abs(obs_coef) > MAX_ABS_OBS_COEF:
+        log.warning(
+            "[%s] obs_coef=%.3f oltre la soglia di plausibilita' (%.3f): variante scartata senza permutazioni",
+            variant_col, obs_coef, MAX_ABS_OBS_COEF,
+        )
+        return _empty(obs_coef=obs_coef, max_smd=max_smd, onset=onset_dict)
 
     if full_beta:
         col_names = design_column_names(variant_col, Ecols, covariate_cols)
