@@ -3,11 +3,22 @@
 Generate Table 2b Word files and figures by calling the stored routine
 get_significant_results_table_2b via the project's MySQL connection helpers.
 
-Usage (from project root):
+Usage (from project root; run generate_table2 FIRST):
+    python3 -m gene_environment.report.generate_table2
     python3 -m gene_environment.report.generate_table2b
 
 Requirements:
     pip install pandas python-docx matplotlib seaborn mysql-connector-python
+
+CHANGES vs previous version
+- Table2b_top10.docx now contains the annotations of EXACTLY the variants shown in
+  Table 2 (same rows, same order), read from output/table2/top10_keys.csv written
+  by generate_table2.py. If that file is missing, a warning is printed and the
+  first 10 rows of the routine are used (old behaviour).
+- Gene-level summaries (gene-type counts, expression, score histograms) now ignore
+  rows without a mapped gene_symbol (intergenic variants), so they no longer count
+  a spurious "Unknown" gene.
+- Caption updated accordingly.
 
 Behavior:
 - Calls the stored routine `get_significant_results_table_2b()` and uses the
@@ -19,10 +30,8 @@ Behavior:
   this script is purely descriptive: no significance highlighting, no
   statistical enrichment test. It reports gene annotation content instead.
 - Translates the `exposure` column from the source dataset's Italian
-  land-use terms to English (see `gene_environment.report.exposure_labels`)
-  right after fetching, since (unlike Table 2) nothing downstream needs the
-  raw value to query the DB again.
-- Produces POOLED (all-exposures) outputs exactly as before:
+  land-use terms to English right after fetching.
+- Produces POOLED (all-exposures) outputs:
     output/table2b/Table2b_top10.docx
     output/table2b/Table2b_full_supplementary.docx
     output/table2b/table2b_raw_results.csv
@@ -35,41 +44,13 @@ Behavior:
     output/table2b/figures/ctd_chemicals_top20.png
     output/table2b/table2b_gene_type_counts.csv
     output/table2b/table2b_chemicals_frequency.csv
-- NEW: Produces PER-EXPOSURE outputs, mirroring the by_exposure pattern used
-  in generate_table2.py:
-    output/table2b/figures/by_exposure/<slug>/variants_per_chromosome.png
-    output/table2b/figures/by_exposure/<slug>/gene_type_distribution.png
-    output/table2b/figures/by_exposure/<slug>/expressed_brain_neurons_glia.png
-    output/table2b/figures/by_exposure/<slug>/als_opentargets_score_histogram.png
-    output/table2b/figures/by_exposure/<slug>/neuro_plausibility_score_histogram.png
-    output/table2b/figures/by_exposure/<slug>/ctd_chemicals_top20.png
-    output/table2b/figures/by_exposure/<slug>/gene_type_counts.csv
-    output/table2b/figures/by_exposure/<slug>/chemicals_frequency.csv
-  plus one combined grid figure per metric (one panel per exposure), same
-  idea as `observed_vs_expected_by_chromosome_per_exposure.png` in Table 2:
-    output/table2b/figures/gene_type_distribution_by_exposure.png
-    output/table2b/figures/expressed_brain_neurons_glia_by_exposure.png
-  <slug> uses the same `slugify(translate_exposure_value(...))` convention
-  as Table 2, and is computed from the already-translated (English)
-  exposure label, since (unlike Table 2) this script has no further DB
-  queries downstream that need the raw Italian value.
-  The full supplementary Word doc gets a new "Per-exposure figures" section
-  with one subsection (heading + all 6 figures) per exposure.
+- And PER-EXPOSURE outputs under output/table2b/figures/by_exposure/<slug>/,
+  plus combined grid figures per metric.
 
-Notes on ambiguous column types (documented here since the astore only
-gives column names, not types):
-- expressed_brain / expressed_neurons / expressed_glia: could be a 0/1 flag
-  or a continuous score. This script inspects the actual observed values at
-  runtime -- if every non-null value across the three columns is in {0, 1},
-  it treats them as binary flags and plots proportion-of-genes-expressed;
-  otherwise it treats them as continuous scores and plots histograms. A
-  message is printed to stderr saying which path was taken. This detection
-  is done ONCE on the pooled dataset, and the same mode is reused for every
-  per-exposure panel so that all panels are visually comparable (a mode
-  that flips exposure-to-exposure would make the by-exposure grid useless).
-- ctd_chemicals: assumed to be a delimited list of chemical names per row
-  (comma / semicolon / pipe separated). Frequency is counted after
-  splitting on any of those delimiters and stripping whitespace.
+Notes on ambiguous column types:
+- expressed_brain / expressed_neurons / expressed_glia: binary vs continuous is
+  detected ONCE on the pooled dataset and reused for every per-exposure panel.
+- ctd_chemicals: assumed to be a delimited list (comma / semicolon / pipe).
 """
 
 from __future__ import annotations
@@ -106,6 +87,9 @@ from gene_environment.report.word_utils import (
 OUT_DIR = Path("output/table2b")
 FIG_DIR = OUT_DIR / "figures"
 BY_EXPOSURE_DIR = FIG_DIR / "by_exposure"
+
+# Written by generate_table2.py (same rows / order as Table 2).
+TABLE2_KEYS_PATH = Path("output/table2/top10_keys.csv")
 
 ASTORE_NAME = "get_significant_results_table_2b"
 
@@ -167,8 +151,36 @@ _FALSE_TOKENS = {"0", "0.0", "false", "f", "no", "n"}
 
 
 # ---------------------------------------------------------------------------
-# Formatting helpers
+# Helpers
 # ---------------------------------------------------------------------------
+
+def _genes_only(df: pd.DataFrame) -> pd.DataFrame:
+    """Unique genes: drop rows without a mapped gene_symbol, dedupe by symbol."""
+    return df.dropna(subset=["gene_symbol"]).drop_duplicates(subset=["gene_symbol"])
+
+
+def select_rows_matching_table2(df: pd.DataFrame, keys_path: Path = TABLE2_KEYS_PATH) -> pd.DataFrame:
+    """Rows of Table 2b for exactly the (exposure, variant) pairs of Table 2,
+    in the same order. Falls back to the first 10 rows if the keys file is missing."""
+    keys_path = Path(keys_path)
+    if not keys_path.exists():
+        print(f"[warn] {keys_path} not found -- run generate_table2 first. "
+              "Falling back to the first 10 rows of the routine (NOT matched to Table 2).",
+              file=sys.stderr)
+        return df.head(10)
+
+    keys = pd.read_csv(keys_path)
+    keys["_order"] = range(len(keys))
+    merged = keys.merge(df, on=["exposure", "variant"], how="left")
+
+    missing = merged[merged["gene_symbol"].isna() & merged["gene_id"].isna()]
+    if not missing.empty:
+        print("[warn] Table 2 variants with no annotation row in Table 2b (intergenic or not returned): "
+              + ", ".join(missing["variant"].astype(str).tolist()), file=sys.stderr)
+
+    merged = merged.sort_values("_order", kind="stable").drop(columns=["_order"])
+    return merged
+
 
 def _format_bool_like(val) -> str:
     """Best-effort formatting of a value that might be a 0/1 flag, a
@@ -225,6 +237,7 @@ def add_table_to_doc(
         h = doc.add_heading(title, level=2)
         h.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
 
+    df = df.copy()
     for c in TABLE_COLUMNS:
         if c not in df.columns:
             df[c] = pd.NA
@@ -276,16 +289,12 @@ def add_table_to_doc(
 
 
 # ---------------------------------------------------------------------------
-# Figures -- all of these now take an explicit `fig_dir` / `out_dir` so they
-# can be reused unchanged for both the pooled (all-exposures) run and each
-# per-exposure run: pooled calls pass FIG_DIR/OUT_DIR, per-exposure calls
-# pass BY_EXPOSURE_DIR/<slug>/ for both (figures and their companion CSVs
-# live together in that per-exposure folder).
+# Figures -- all take explicit `fig_dir` / `out_dir` so they can be reused for
+# both the pooled (all-exposures) run and each per-exposure run.
 # ---------------------------------------------------------------------------
 
 def make_chromosome_figures(df: pd.DataFrame, fig_dir: Path, title_suffix: str = "") -> None:
-    """Purely descriptive chromosome-level figures (no significance concept
-    here -- every row in this dataset is already the astore's output)."""
+    """Purely descriptive chromosome-level figures."""
     df = df.copy()
     df["chromosome"] = df["variant"].apply(lambda v: extract_chromosome(v) if pd.notna(v) else "NA")
 
@@ -320,9 +329,9 @@ def make_chromosome_figures(df: pd.DataFrame, fig_dir: Path, title_suffix: str =
 
 
 def make_gene_type_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path, title_suffix: str = "") -> pd.DataFrame:
-    """Bar chart of unique genes per gene_type. Returns the counts table,
+    """Bar chart of unique (mapped) genes per gene_type. Returns the counts table,
     also saved to CSV."""
-    genes = df.drop_duplicates(subset=["gene_symbol"])
+    genes = _genes_only(df)
     counts = genes["gene_type"].fillna("Unknown").value_counts().rename_axis("gene_type").reset_index(name="n_genes")
     counts = counts.sort_values("n_genes", ascending=False)
     counts.to_csv(out_dir / "gene_type_counts.csv" if out_dir != OUT_DIR else out_dir / "table2b_gene_type_counts.csv",
@@ -342,15 +351,12 @@ def make_gene_type_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path, title_
 
 def make_expression_figure(df: pd.DataFrame, fig_dir: Path, mode: Optional[str] = None,
                             title_suffix: str = "") -> str:
-    """expressed_brain / expressed_neurons / expressed_glia: if `mode` is
-    given ('binary' or 'continuous') it is used as-is -- this lets
-    per-exposure calls reuse the mode detected once on the pooled dataset,
-    so every panel in the by-exposure grid is visually comparable. If
-    `mode` is None (pooled call), auto-detects whether the observed values
-    look like binary flags (all in {0,1}) or continuous scores. Returns
-    the mode used ('binary' or 'continuous') for logging / reuse."""
+    """expressed_brain / expressed_neurons / expressed_glia. If `mode` is given
+    ('binary' or 'continuous') it is used as-is (per-exposure calls reuse the
+    pooled mode so all panels are comparable); if None, it is auto-detected.
+    Returns the mode used."""
     cols = ["expressed_brain", "expressed_neurons", "expressed_glia"]
-    genes = df.drop_duplicates(subset=["gene_symbol"])[["gene_symbol"] + cols].copy()
+    genes = _genes_only(df)[["gene_symbol"] + cols].copy()
 
     numeric = {}
     for c in cols:
@@ -400,9 +406,8 @@ def make_expression_figure(df: pd.DataFrame, fig_dir: Path, mode: Optional[str] 
 
 
 def make_score_histogram(df: pd.DataFrame, col: str, fig_dir: Path, fig_name: str, title: str) -> None:
-    """Histogram of a numeric score column, deduplicated by gene_symbol so a
-    gene tested against multiple exposures/variants isn't overweighted."""
-    genes = df.drop_duplicates(subset=["gene_symbol"])
+    """Histogram of a numeric score column, deduplicated by gene_symbol (mapped genes only)."""
+    genes = _genes_only(df)
     vals = pd.to_numeric(genes.get(col, pd.Series(dtype=float)), errors="coerce").dropna()
 
     fig_path = fig_dir / fig_name
@@ -421,9 +426,7 @@ def make_score_histogram(df: pd.DataFrame, col: str, fig_dir: Path, fig_name: st
 
 
 def make_chemicals_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path, title_suffix: str = "") -> pd.DataFrame:
-    """Top-N most frequent CTD chemicals across all rows. Frequency counts
-    rows (variant x exposure x gene), not unique genes, since the same
-    chemical linked to different genes/variants is still relevant signal.
+    """Top-N most frequent CTD chemicals across all rows (row-level counts).
     Returns the frequency table, also saved to CSV."""
     counter: Counter = Counter()
     for raw in df.get("ctd_chemicals", pd.Series(dtype=object)):
@@ -446,7 +449,7 @@ def make_chemicals_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path, title_
     freq = pd.DataFrame(counter.most_common(), columns=["chemical", "n_occurrences"])
     freq.to_csv(freq_path, index=False)
 
-    top = freq.head(CTD_CHEMICALS_TOP_N).iloc[::-1]  # reverse for horizontal bar (largest on top)
+    top = freq.head(CTD_CHEMICALS_TOP_N).iloc[::-1]
     plt.figure(figsize=(8, max(5, 0.3 * len(top))))
     ax = sns.barplot(data=top, y="chemical", x="n_occurrences", color="#4472C4", orient="h")
     ax.set_xlabel("Occurrences")
@@ -459,7 +462,7 @@ def make_chemicals_figure(df: pd.DataFrame, out_dir: Path, fig_dir: Path, title_
 
 
 # ---------------------------------------------------------------------------
-# Per-exposure orchestration (new)
+# Per-exposure orchestration
 # ---------------------------------------------------------------------------
 
 def run_per_exposure_figures(
@@ -469,20 +472,12 @@ def run_per_exposure_figures(
     by_exposure_dir: Path,
     fig_dir: Path,
 ) -> Dict[str, Path]:
-    """For each (already-translated/English) exposure label, filter df and
-    regenerate the full set of descriptive figures + companion CSVs into
-    their own subfolder `by_exposure/<slug>/`, then build one combined grid
-    figure per metric (gene-type distribution, expression) with one panel
-    per exposure -- mirroring `observed_vs_expected_by_chromosome_per_exposure`
-    in generate_table2.py. Returns {exposure: slug_dir} for use when
-    building the Word doc.
-
-    Exposures with zero rows (shouldn't normally happen since `exposures`
-    is derived from df itself) are skipped defensively.
-    """
+    """For each (English) exposure label, regenerate the full set of descriptive
+    figures + companion CSVs into `by_exposure/<slug>/`, then build one combined
+    grid figure per metric. Returns {exposure: slug_dir}."""
     slug_dirs: Dict[str, Path] = {}
     gene_type_panels: List[Tuple[str, pd.DataFrame]] = []
-    expression_panels: List[str] = []  # just track exposures with data, for the grid
+    expression_panels: List[str] = []
 
     for exposure in exposures:
         df_sub = df.loc[df["exposure"] == exposure]
@@ -511,7 +506,6 @@ def run_per_exposure_figures(
         gene_type_panels.append((exposure, counts))
         expression_panels.append(exposure)
 
-    # --- combined grid: gene type distribution by exposure ---
     if gene_type_panels:
         n = len(gene_type_panels)
         ncols = min(3, n)
@@ -533,7 +527,6 @@ def run_per_exposure_figures(
         plt.savefig(fig_dir / "gene_type_distribution_by_exposure.png", dpi=200)
         plt.close(fig)
 
-    # --- combined grid: expression by exposure (reuses the per-exposure PNGs) ---
     if expression_panels:
         n = len(expression_panels)
         ncols = min(3, n)
@@ -577,10 +570,7 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
         if c not in df.columns:
             df[c] = pd.NA
 
-    # No further DB round-trip depends on the raw exposure value here (this
-    # script, unlike Table 2, has no per-exposure DB queries), so translate
-    # immediately -- everything downstream, including the by-exposure slugs,
-    # uses the English label.
+    # Translate immediately: nothing downstream needs the raw exposure value.
     df = translate_exposure(df)
 
     df.to_csv(out_dir / "table2b_raw_results.csv", index=False)
@@ -589,7 +579,7 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
         print("[warn] no rows returned by the stored routine -- nothing further to do.", file=sys.stderr)
         return
 
-    # --- pooled (all-exposures) figures, unchanged from before ---
+    # --- pooled (all-exposures) figures ---
     make_chromosome_figures(df, fig_dir)
     gene_type_counts = make_gene_type_figure(df, out_dir, fig_dir)
     expression_mode = make_expression_figure(df, fig_dir)
@@ -599,7 +589,7 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
                           "Distribution of neuro plausibility score (unique genes)")
     chemicals_freq = make_chemicals_figure(df, out_dir, fig_dir)
 
-    # --- NEW: per-exposure figures ---
+    # --- per-exposure figures ---
     exposures = sorted(df["exposure"].dropna().unique().tolist())
     slug_dirs = run_per_exposure_figures(df, exposures, expression_mode, by_exposure_dir, fig_dir)
     print(f"Per-exposure figures generated for {len(slug_dirs)} exposures in: {by_exposure_dir}")
@@ -607,19 +597,20 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
     n_unique_genes = df["gene_symbol"].nunique()
     n_unique_variants = df["variant"].nunique()
     n_unique_exposures = df["exposure"].nunique()
+    n_rows_no_gene = int(df["gene_symbol"].isna().sum())
 
-    # --- Table 2b (top 10) ---
+    # --- Table 2b (same variants / order as Table 2) ---
+    top2b = select_rows_matching_table2(df)
+
     doc_top10 = Document()
     set_landscape(doc_top10, top=0.6, bottom=0.6)
-    doc_top10.add_heading("Table 2b. Gene annotations for significant variants (top 10)", level=1)
+    doc_top10.add_heading("Table 2b. Gene annotations for the variants in Table 2", level=1)
     doc_top10.add_paragraph(
-        "Table shows the top 10 rows from get_significant_results_table_2b. This dataset has no "
-        "p-value / coefficient columns, so no significance highlighting is applied here -- it "
-        "reports gene annotation content (gene type, tissue expression, CTD chemicals, "
-        "OpenTargets / neuro-plausibility scores) for the variant-gene-exposure combinations "
-        "returned by the routine."
+        "Gene annotation (gene type, tissue expression, CTD chemicals, ALS OpenTargets score and "
+        "neuro-plausibility score) for the variants listed in Table 2, in the same order. Rows "
+        "without a gene symbol correspond to variants that could not be mapped to a gene."
     )
-    add_table_to_doc(doc_top10, df, max_rows=10)
+    add_table_to_doc(doc_top10, top2b)
     top10_path = out_dir / "Table2b_top10.docx"
     doc_top10.save(top10_path)
 
@@ -629,10 +620,10 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
     doc_full.add_heading("Supplementary Table 2b: gene annotations, full results", level=1)
     doc_full.add_paragraph(
         f"Full results from get_significant_results_table_2b. {len(df)} rows covering "
-        f"{n_unique_variants} unique variants, {n_unique_genes} unique genes, and "
-        f"{n_unique_exposures} unique exposures. CTD chemical lists are truncated to "
-        f"{CTD_CHEMICALS_TRUNCATE_CHARS} characters in this table; the full text is in "
-        "table2b_raw_results.csv."
+        f"{n_unique_variants} unique variants, {n_unique_genes} unique genes "
+        f"({n_rows_no_gene} rows without a mapped gene), and {n_unique_exposures} unique exposures. "
+        f"CTD chemical lists are truncated to {CTD_CHEMICALS_TRUNCATE_CHARS} characters in this table; "
+        "the full text is in table2b_raw_results.csv."
     )
     add_table_to_doc(doc_full, df)
 
@@ -658,7 +649,6 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
                        f"Figure 7. Top {min(CTD_CHEMICALS_TOP_N, len(chemicals_freq))} most frequent "
                        "CTD chemicals across all rows (row-level occurrence count).", width_in=6.5)
 
-    # --- NEW: combined by-exposure grids, then one subsection per exposure ---
     if slug_dirs:
         doc_full.add_heading("Figures by exposure", level=1)
         add_figure_to_doc(doc_full, fig_dir / "gene_type_distribution_by_exposure.png",
