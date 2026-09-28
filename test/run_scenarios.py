@@ -56,6 +56,29 @@ should be measured with run_isolated_casual_test.py (1 single active
 variant per dataset), not here.
 ***
 
+*** MAIN-EFFECT-ONLY BATTERY (NEW, `--main-only`) ***
+The standard battery above contains NO variant with a main effect and a
+zero interaction, so its false-positive rate (null variants only) does not
+address the question "does permuting G give a calibrated test of the G×E
+term when G truly affects the phenotype (and may be correlated with E)?".
+The MAIN_ONLY_SCENARIOS battery answers exactly that:
+  - only main-effect-only variants (beta_inter = 0, beta_main != 0) + a few
+    null variants; NO G×E causal and NO pure-variance variants, so that the
+    only extra noise comes from the main effects themselves;
+  - two conditions: "baseline" and "stratified" (latent subpopulation with
+    shifted MAF, onset and exposure -> G correlated with Y and with E, PCs
+    uninformative = worst case for the permutation scheme);
+  - MAIN_ONLY_N_REPLICATES independent datasets (different rng_seed) per
+    condition, pooled at the end (see summarize_main_only);
+  - the vQTL part is skipped (there is nothing to recover there).
+Because build_recap already labels gxe_meanshift variants with
+true_beta_interaction == 0 as "main_only_control", every significant G×E
+call on them is counted as a false positive.
+Run it with:   python run_scenarios.py --main-only --workers 4
+Output: scenarios/recap_main_only/{main_only_fp_table.csv, .json,
+        main_only_pooled_detail.csv, main_only_fp_report.docx}
+***
+
 THIS FILE IS BOTH A LIBRARY AND A SCRIPT:
   - run_isolated_casual_test.py imports it (`import run_scenarios as rs`)
     to reuse _set_common_env / run_ge_interaction / run_vqtl_debug (per-
@@ -68,6 +91,7 @@ THIS FILE IS BOTH A LIBRARY AND A SCRIPT:
         python run_scenarios.py baseline small_sample     # sequential, only some
         python run_scenarios.py --workers 4               # parallel, 4 scenarios at once
         python run_scenarios.py --workers 4 baseline small_sample
+        python run_scenarios.py --main-only --workers 4   # main-effect-only FP battery
 
 Put this file in the repo ROOT folder, together with gen_fake_data.py,
 test_vqtl_pipeline.py, fake_vqtl_repository.py and report_utils.py.
@@ -167,6 +191,72 @@ SCENARIOS: dict[str, dict] = {
         "n_patients": 10000,
     },
 }
+
+# ============================================================
+# MAIN-EFFECT-ONLY battery (false-positive control for the G×E permutation
+# scheme when G has a real main effect). See the docstring at the top.
+#
+# Special keys in these dicts (prefixed with "_", consumed by run_scenario
+# and NOT passed to generate_dataset):
+#   _main_only_n : number of main-effect-only variants to simulate
+#   _skip_vqtl   : skip the vQTL debug + Step 3-7 (nothing to recover)
+# Every other key is a generate_dataset() kwarg (rng_seed, n_null_variants,
+# subpop_*, ...).
+#
+# Noise budget: with betas in MAIN_ONLY_BETAS the mean beta^2 is ~1.75, and a
+# carrier frequency of ~0.3-0.5 gives a variance contribution of ~0.4 per
+# variant -> 50 variants add ~20 to a baseline variance of ~72+ (about +25%,
+# i.e. ~+12% on the SD). Acceptable, and the same for every variant, so it
+# does not bias the false-positive rate; but do not push
+# MAIN_ONLY_N_VARIANTS much higher, add replicates instead.
+# ============================================================
+MAIN_ONLY_BETAS: list[float] = [-2.0, -1.0, -0.5, 0.5, 1.0, 2.0]
+MAIN_ONLY_N_VARIANTS = 50       # per dataset
+MAIN_ONLY_N_REPLICATES = 4      # datasets per condition (different rng_seed) -> 200 variants/condition
+MAIN_ONLY_N_NULL = 40           # extra null variants per dataset (also give a null FP rate)
+MAIN_ONLY_SEED_BASE = 20260
+
+
+def make_main_only_variants(n: int) -> dict[str, tuple[float, float]]:
+    """(beta_interaction, beta_main) = (0.0, beta_main): a main effect and NO
+    interaction. Chromosome 8 is used so labels never collide with the
+    causal (chr 1-5), pure-variance (chr 7) or null (chr 6+) variants."""
+    return {
+        f"8_{8000001 + i}_A_G": (0.0, MAIN_ONLY_BETAS[i % len(MAIN_ONLY_BETAS)])
+        for i in range(n)
+    }
+
+
+def _build_main_only_scenarios() -> dict[str, dict]:
+    scen: dict[str, dict] = {}
+    for rep in range(1, MAIN_ONLY_N_REPLICATES + 1):
+        common = {
+            "_main_only_n": MAIN_ONLY_N_VARIANTS,
+            "_skip_vqtl": True,
+            "n_null_variants": MAIN_ONLY_N_NULL,
+        }
+        scen[f"main_only_baseline_r{rep}"] = {
+            **common, "rng_seed": MAIN_ONLY_SEED_BASE + rep,
+        }
+        scen[f"main_only_stratified_r{rep}"] = {
+            **common, "rng_seed": MAIN_ONLY_SEED_BASE + 100 + rep,
+            # latent subpopulation, uncaptured by the (uninformative) PCs:
+            # G correlated with Y (onset shift + MAF shift) and with E
+            # (exposure shift) -> the situation the permutation scheme must survive
+            # (frac/maf/exposure shifts tuned so that mean |corr(G,E)| over the
+            # variants is ~0.08 vs ~0.03 at baseline, and G–onset ~0.06)
+            "subpop_frac": 0.40,
+            "subpop_onset_shift": 3.0,
+            "subpop_maf_shift": 0.30,
+            "subpop_exposure_shift": 0.30,
+        }
+    return scen
+
+
+MAIN_ONLY_SCENARIOS: dict[str, dict] = _build_main_only_scenarios()
+
+# Lookup used by the worker processes (standard + main-only battery).
+ALL_SCENARIOS: dict[str, dict] = {**SCENARIOS, **MAIN_ONLY_SCENARIOS}
 
 GENERATION = 1
 
@@ -549,20 +639,39 @@ def run_scenario(name: str, gen_params: dict, n_workers: int = 1, force: bool = 
     fake_dir = os.path.join(scenario_dir, "fake_data")
     os.makedirs(fake_dir, exist_ok=True)
 
-    result: dict = {"scenario": name, "params": gen_params, "status": "ok", "error": None}
+    # Work on a copy: the special "_"-prefixed keys are consumed here and
+    # must not reach generate_dataset() (nor mutate the module-level dicts).
+    gen_params = dict(gen_params)
+    n_main_only = int(gen_params.pop("_main_only_n", 0))
+    skip_vqtl = bool(gen_params.pop("_skip_vqtl", False))
+
+    result: dict = {"scenario": name, "params": {**gen_params, "_main_only_n": n_main_only,
+                                                  "_skip_vqtl": skip_vqtl},
+                     "status": "ok", "error": None}
 
     try:
         from gen_fake_data import generate_dataset
-        # FIXED, small set (see the explanation at the top of the file):
-        # NOT the large gen_fake_data.py defaults, so as not to contaminate
-        # the actual noise each test sees relative to the declared
-        # noise_sd -- here we want to isolate the effect of the SCENARIO
-        # PARAMETER (stratification, missingness, etc.), not mix it with
-        # the effect of having dozens of causal variants active together.
+
+        if n_main_only > 0:
+            # MAIN-EFFECT-ONLY scenario: only main-effect-only variants (+ the
+            # null ones the generator adds). No G×E causal, no pure-variance:
+            # the only extra noise is the main effects themselves.
+            causal = make_main_only_variants(n_main_only)
+            pure_var: dict = {}
+        else:
+            # FIXED, small set (see the explanation at the top of the file):
+            # NOT the large gen_fake_data.py defaults, so as not to contaminate
+            # the actual noise each test sees relative to the declared
+            # noise_sd -- here we want to isolate the effect of the SCENARIO
+            # PARAMETER (stratification, missingness, etc.), not mix it with
+            # the effect of having dozens of causal variants active together.
+            causal = SCENARIO_CAUSAL_VARIANTS
+            pure_var = SCENARIO_PURE_VARIANCE_VARIANTS
+
         gen_summary = generate_dataset(
             out_dir=fake_dir, verbose=True,
-            causal_variants=SCENARIO_CAUSAL_VARIANTS,
-            pure_variance_variants=SCENARIO_PURE_VARIANCE_VARIANTS,
+            causal_variants=causal,
+            pure_variance_variants=pure_var,
             **gen_params,
         )
         result["gen_summary"] = gen_summary
@@ -573,11 +682,14 @@ def run_scenario(name: str, gen_params: dict, n_workers: int = 1, force: bool = 
         section(f"[{name}] Gene-environment part")
         result["ge_interaction"] = run_ge_interaction(fake_dir, scenario_dir)
 
-        section(f"[{name}] vQTL part — debug (asymptotic vs bootstrap, subset)")
-        result["vqtl_debug"] = run_vqtl_debug(fake_dir, scenario_dir)
+        if skip_vqtl:
+            print(f"[{name}] vQTL part skipped (_skip_vqtl).")
+        else:
+            section(f"[{name}] vQTL part — debug (asymptotic vs bootstrap, subset)")
+            result["vqtl_debug"] = run_vqtl_debug(fake_dir, scenario_dir)
 
-        section(f"[{name}] vQTL part — full Step 3→7 pipeline (se_method=asymptotic)")
-        result["vqtl_asymptotic"] = run_vqtl_asymptotic(fake_dir, scenario_dir)
+            section(f"[{name}] vQTL part — full Step 3→7 pipeline (se_method=asymptotic)")
+            result["vqtl_asymptotic"] = run_vqtl_asymptotic(fake_dir, scenario_dir)
 
     except Exception as exc:  # a failed scenario must not block the others
         result["status"] = "FAILED"
@@ -597,7 +709,36 @@ def _run_scenario_worker(name: str, n_workers: int, force: bool = False) -> dict
     pickle the submitted function). Every call runs in a new Python
     process -> no sharing of os.environ / module state with the other
     scenarios in progress."""
-    return run_scenario(name, SCENARIOS[name], n_workers=n_workers, force=force)
+    return run_scenario(name, ALL_SCENARIOS[name], n_workers=n_workers, force=force)
+
+
+def _execute_scenarios(names: list[str], n_workers: int, force: bool) -> list[dict]:
+    """Runs the given scenario names (sequentially or in a process pool)
+    and returns the list of result dicts in the same order as `names`."""
+    n_workers = max(1, n_workers)
+    os.makedirs(SCENARIOS_ROOT, exist_ok=True)
+
+    if n_workers == 1:
+        return [run_scenario(name, ALL_SCENARIOS[name], n_workers=1, force=force) for name in names]
+
+    print(f"Running {len(names)} scenarios with {n_workers} parallel processes "
+          f"(each with at most {max(1, (os.cpu_count() or 2) // n_workers)} internal vQTL jobs)...")
+    results_by_name = {}
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_run_scenario_worker, name, n_workers, force): name for name in names}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                results_by_name[name] = fut.result()
+            except Exception as exc:  # error not caught inside run_scenario itself (rare)
+                results_by_name[name] = {
+                    "scenario": name, "status": "FAILED",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                print(f"\n*** SCENARIO '{name}' FAILED in the worker process: {exc} ***")
+            print(f"[{name}] completed ({results_by_name[name]['status']}).")
+    # reorder according to the requested order, for deterministic output
+    return [results_by_name[name] for name in names]
 
 
 def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1, force: bool = False) -> dict:
@@ -626,33 +767,8 @@ def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1, force:
     if unknown:
         raise SystemExit(f"Unknown scenarios: {sorted(unknown)}. Available: {list(SCENARIOS)}")
 
-    n_workers = max(1, n_workers)
-    os.makedirs(SCENARIOS_ROOT, exist_ok=True)
-    all_results = []
     t0 = time.time()
-
-    if n_workers == 1:
-        for name in names:
-            all_results.append(run_scenario(name, SCENARIOS[name], n_workers=1, force=force))
-    else:
-        print(f"Running {len(names)} scenarios with {n_workers} parallel processes "
-              f"(each with at most {max(1, (os.cpu_count() or 2) // n_workers)} internal vQTL jobs)...")
-        results_by_name = {}
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_run_scenario_worker, name, n_workers, force): name for name in names}
-            for fut in as_completed(futures):
-                name = futures[fut]
-                try:
-                    results_by_name[name] = fut.result()
-                except Exception as exc:  # error not caught inside run_scenario itself (rare)
-                    results_by_name[name] = {
-                        "scenario": name, "status": "FAILED",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                    print(f"\n*** SCENARIO '{name}' FAILED in the worker process: {exc} ***")
-                print(f"[{name}] completed ({results_by_name[name]['status']}).")
-        # reorder according to the requested order, for deterministic output
-        all_results = [results_by_name[name] for name in names]
+    all_results = _execute_scenarios(names, n_workers=n_workers, force=force)
 
     section("FINAL SUMMARY — all scenarios")
     rows = []
@@ -756,6 +872,162 @@ def run_all_scenarios(names: list[str] | None = None, n_workers: int = 1, force:
     }
 
 
+# ============================================================
+# MAIN-EFFECT-ONLY battery: run + pooled false-positive summary
+# ============================================================
+
+def _upper95(k: int, n: int) -> float | None:
+    """One-sided 97.5% upper confidence limit for a binomial proportion
+    (Clopper-Pearson, i.e. two-sided 95% CI upper bound). Falls back to the
+    Wilson upper bound if scipy is not available."""
+    if n <= 0:
+        return None
+    if k >= n:
+        return 1.0
+    try:
+        from scipy.stats import beta as _beta
+        return float(_beta.ppf(0.975, k + 1, n - k))
+    except ImportError:
+        z = 1.959964
+        p = k / n
+        denom = 1 + z * z / n
+        centre = p + z * z / (2 * n)
+        half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+        return float((centre + half) / denom)
+
+
+def _fmt_rate(k: int, n: int, ub: float | None) -> str:
+    if n <= 0:
+        return "n/a"
+    ub_txt = "n/a" if ub is None else f"{ub * 100:.1f}%"
+    return f"{k / n * 100:.1f}% ({k}/{n}); upper 95% CL {ub_txt}"
+
+
+def summarize_main_only(all_results: list[dict], alpha: float = 0.05,
+                         min_obs_coef: float = 2.0) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Pools the recap_detail.csv of every main-only scenario replicate and
+    computes, per condition (baseline / stratified) and per variant class
+    (main_only_control = main effect & NO interaction; null = nothing):
+
+      - tested          : variants for which the pipeline returned a result
+      - entered_perm    : tested variants with |obs_coef| >= min_obs_coef
+                          (the pre-filter used in the real analysis: the others
+                          get p = 1 and are never permuted)
+      - significant     : p_emp < alpha  (each one is a FALSE POSITIVE here)
+      - FP rate (all tested)        = significant / tested
+      - FP rate (entered permutation) = significant / entered_perm
+        -> this is the calibration of the permutation test itself: under a
+           correct test it should not exceed ~alpha.
+
+    Returns (table_df for the manuscript, pooled_detail_df, json-able dict).
+    """
+    parts = []
+    for r in all_results:
+        if r.get("status") != "ok":
+            continue
+        name = r["scenario"]
+        path = os.path.join(SCENARIOS_ROOT, name, "recap", "recap_detail.csv")
+        if not os.path.isfile(path):
+            print(f"[main-only] {name}: no recap_detail.csv, skipped")
+            continue
+        # keep_default_na=False + na_values=[""]: the category "null" must NOT
+        # be parsed as NaN by pandas.
+        det = pd.read_csv(path, keep_default_na=False, na_values=[""])
+        det["scenario"] = name
+        det["condition"] = "stratified" if "stratified" in name else "baseline"
+        parts.append(det)
+    if not parts:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+    pooled = pd.concat(parts, ignore_index=True)
+    pooled["p_emp"] = pd.to_numeric(pooled["p_emp"], errors="coerce")
+    pooled["obs_coef"] = pd.to_numeric(pooled["obs_coef"], errors="coerce")
+    pooled["tested"] = pooled["p_emp"].notna()
+    pooled["entered_perm"] = pooled["tested"] & (pooled["obs_coef"].abs() >= min_obs_coef)
+    pooled["significant"] = pooled["tested"] & (pooled["p_emp"] < alpha)
+
+    class_labels = {"main_only_control": "Main effect only (interaction = 0)",
+                    "null": "Null (no effect)"}
+    cond_labels = {"baseline": "Baseline", "stratified": "Latent stratification, G–E correlated"}
+
+    rows, summary = [], {}
+    for cond in ["baseline", "stratified"]:
+        for cat in ["main_only_control", "null"]:
+            sub = pooled[(pooled.condition == cond) & (pooled.category == cat)]
+            if sub.empty:
+                continue
+            n_sim, n_t = int(len(sub)), int(sub["tested"].sum())
+            n_p, n_s = int(sub["entered_perm"].sum()), int(sub["significant"].sum())
+            ub_all, ub_perm = _upper95(n_s, n_t), _upper95(n_s, n_p)
+            rows.append({
+                "Condition": cond_labels[cond],
+                "Variant class": class_labels[cat],
+                "Variants simulated": n_sim,
+                "Variants tested": n_t,
+                f"Entering permutation (|β3| ≥ {min_obs_coef:g})": n_p,
+                f"Significant (p_emp < {alpha})": n_s,
+                "FP rate, all tested": _fmt_rate(n_s, n_t, ub_all),
+                "FP rate, entered permutation": _fmt_rate(n_s, n_p, ub_perm),
+            })
+            summary[f"{cond}/{cat}"] = {
+                "n_simulated": n_sim, "n_tested": n_t, "n_entered_permutation": n_p,
+                "n_significant": n_s,
+                "fp_rate_all_tested": None if n_t == 0 else round(n_s / n_t, 4),
+                "fp_upper95_all_tested": None if ub_all is None else round(ub_all, 4),
+                "fp_rate_entered_permutation": None if n_p == 0 else round(n_s / n_p, 4),
+                "fp_upper95_entered_permutation": None if ub_perm is None else round(ub_perm, 4),
+            }
+    return pd.DataFrame(rows), pooled, summary
+
+
+def run_main_only_battery(n_workers: int = 1, force: bool = False) -> dict:
+    """Runs MAIN_ONLY_SCENARIOS and writes the pooled false-positive summary
+    to SCENARIOS_ROOT/recap_main_only/."""
+    names = list(MAIN_ONLY_SCENARIOS.keys())
+    t0 = time.time()
+    all_results = _execute_scenarios(names, n_workers=n_workers, force=force)
+
+    section("MAIN-EFFECT-ONLY BATTERY — pooled false-positive summary")
+    out_dir = os.path.join(SCENARIOS_ROOT, "recap_main_only")
+    os.makedirs(out_dir, exist_ok=True)
+
+    table_df, pooled, summary = summarize_main_only(all_results)
+    failed = [r["scenario"] for r in all_results if r["status"] == "FAILED"]
+
+    if table_df.empty:
+        print("No completed main-only scenario with a recap available: nothing to summarize.")
+    else:
+        print(table_df.to_string(index=False))
+        table_df.to_csv(os.path.join(out_dir, "main_only_fp_table.csv"), index=False)
+        pooled.to_csv(os.path.join(out_dir, "main_only_pooled_detail.csv"), index=False)
+        with open(os.path.join(out_dir, "main_only_fp_table.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+        write_manuscript_scenario_report(
+            table_df,
+            out_path=os.path.join(out_dir, "main_only_fp_report.docx"),
+            figure_path=None,
+            table_title="Supplementary Table — False-positive rate of the G×E test for variants with a main effect only",
+            table_caption=(
+                "Synthetic datasets with variants carrying a genuine main effect on age at onset "
+                "(beta between -2 and +2 years) and NO interaction with the exposure, pooled over "
+                f"{MAIN_ONLY_N_REPLICATES} independently simulated datasets per condition. Every "
+                "significant interaction call is a false positive. The stratified condition adds a "
+                "latent subpopulation with different allele frequency, baseline onset and exposure "
+                "that the principal components do not capture, so that genotype is correlated with "
+                "both phenotype and exposure. 'Entering permutation' = variants passing the "
+                "|β3| pre-filter (the others are assigned p = 1); the last column is the calibration "
+                "of the permutation test itself. Upper limits are Clopper–Pearson 95% bounds."
+            ),
+        )
+        print(f"[export] {out_dir}")
+    print(f"\nCompleted in {time.time() - t0:.0f}s.")
+    if failed:
+        print(f"\n*** FAILED SCENARIOS (exception): {failed} ***")
+
+    return {"all_results": all_results, "table": table_df, "summary": summary,
+            "failed": failed, "has_failures": bool(failed)}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Multi-scenario orchestrator")
     parser.add_argument("scenarios", nargs="*", help="Scenario names to run (default: all)")
@@ -766,6 +1038,10 @@ def main() -> None:
                               "scenario from scratch, even if it already completed successfully before.")
     parser.add_argument("--output-dir", default=None,
                          help="Folder where scenarios/ is written (default: this script's folder).")
+    parser.add_argument("--main-only", action="store_true",
+                         help="Run ONLY the main-effect-only false-positive battery (MAIN_ONLY_SCENARIOS) "
+                              "and write its pooled summary to scenarios/recap_main_only/. "
+                              "Does not touch the standard battery's outputs.")
     args = parser.parse_args()
 
     if args.output_dir:
@@ -773,7 +1049,12 @@ def main() -> None:
         SCENARIOS_ROOT = os.path.join(os.path.abspath(args.output_dir), "scenarios")
         print(f"[config] Output: {SCENARIOS_ROOT}")
 
-    result = run_all_scenarios(names=args.scenarios or None, n_workers=args.workers, force=args.force)
+    if args.main_only:
+        if args.scenarios:
+            raise SystemExit("--main-only runs its own fixed set of scenarios; do not pass scenario names.")
+        result = run_main_only_battery(n_workers=args.workers, force=args.force)
+    else:
+        result = run_all_scenarios(names=args.scenarios or None, n_workers=args.workers, force=args.force)
     if result["has_failures"]:
         sys.exit(1)
 

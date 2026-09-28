@@ -26,6 +26,16 @@ STRESS-TEST PARAMETERS (all disabled by default):
     (here, uninformative) PCs is not enough, exactly as can happen in
     production if the loaded PCs are not informative.
 
+  - subpop_exposure_shift: (NEW) lowers the probability of being
+    unexposed by this amount inside the latent subpopulation
+    (prop_unexposed_eff = prop_unexposed - shift * subpop). Together with
+    subpop_maf_shift this makes the genotype G correlated with the
+    exposure E (through the latent structure), which is the situation the
+    G×E permutation scheme must be robust to (main-effect-only variants
+    that are also correlated with E). With shift = 0 (default) the random
+    draws are IDENTICAL to the previous version of this file, so datasets
+    already generated/cached are reproduced exactly.
+
   - nonrandom_missing_carrier_rate: if different from None, the probability
     of missing genotype for CARRIERS uses this value instead of
     `missing_rate` (non-carriers stay at missing_rate) -- simulates
@@ -197,6 +207,7 @@ def generate_dataset(
     subpop_frac: float = 0.0,
     subpop_onset_shift: float = 0.0,
     subpop_maf_shift: float = 0.0,
+    subpop_exposure_shift: float = 0.0,
     verbose: bool = True,
 ) -> dict:
     """Generates env.csv, genetic.csv, pca_covariates_gen1.csv, ground_truth.csv
@@ -228,8 +239,12 @@ def generate_dataset(
         subpop_b = np.zeros(n)
 
     # ---- exposure ----
+    # p_unexposed is a per-patient array. With subpop_exposure_shift = 0 it
+    # is a constant array equal to prop_unexposed, so the comparison below
+    # gives exactly the same mask (same random draws) as the scalar version.
     rng_exposure = _stream(rng_seed, "exposure")
-    unexposed_mask = rng_exposure.random(n) < prop_unexposed
+    p_unexposed = np.clip(prop_unexposed - subpop_exposure_shift * subpop_b, 0.0, 1.0)
+    unexposed_mask = rng_exposure.random(n) < p_unexposed
     exposure = np.empty(n, dtype=float)
     exposure[unexposed_mask] = 0.0
     n_exposed = int((~unexposed_mask).sum())
