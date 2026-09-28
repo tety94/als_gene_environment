@@ -132,7 +132,21 @@ import numpy as np
 import pandas as pd
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = SCRIPT_DIR  # change this if this file is not in the repo root
+
+
+def _find_repo_root(start: str) -> str:
+    """Walks up from `start` (max 4 levels) to the first folder that contains
+    the `gene_environment` package, so this file works both in the repo root
+    and in a subfolder such as <repo>/test/."""
+    d = start
+    for _ in range(4):
+        if os.path.isdir(os.path.join(d, "gene_environment")):
+            return d
+        d = os.path.dirname(d)
+    return start
+
+
+REPO_ROOT = _find_repo_root(SCRIPT_DIR)
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, SCRIPT_DIR)
 
