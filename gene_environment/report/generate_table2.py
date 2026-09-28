@@ -17,7 +17,10 @@ CHANGES vs previous version
   manuscript ("p <= 0.05"). A warning is printed if the routine returns rows whose
   G1 p-value is above alpha.
 - Column labels "Muted / Not muted" -> "Carriers / Non-carriers".
-- Chromosome enrichment: added Bonferroni p (within each exposure, i.e. x number of
+- Chromosome enrichment: PRIMARY test is now the exact hypergeometric (one-sided Fisher)
+  test, with BH, Bonferroni and a max-statistic permutation (family-wise) p-value; the
+  earlier binomial columns are kept in the CSV.
+- Chromosome enrichment (earlier): added Bonferroni p (within each exposure, i.e. x number of
   chromosomes tested) as `binom_p_bonf`, and a global BH adjustment across ALL
   exposure x chromosome tests in the combined CSV (`binom_p_adj_global`).
 
@@ -96,7 +99,8 @@ from docx import Document
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.shared import Inches, Pt, RGBColor
-from scipy.stats import binomtest
+import numpy as np
+from scipy.stats import binomtest, hypergeom
 from statsmodels.stats.multitest import multipletests
 
 from gene_environment.report.db_utils import (
@@ -173,6 +177,8 @@ COL_WIDTHS_IN = {
 
 NUMERIC_PREFIXES = ("empirical_p", "obs_coef", "muted", "not_muted")
 SIG_ALPHA_DEFAULT = 0.05
+N_PERM_MAXT = 10000      # permutations for the max-statistic (family-wise) p-value
+PERM_SEED = 20260928
 
 # Table color scheme
 HEADER_FILL = "44546A"        # dark blue-grey
@@ -285,15 +291,16 @@ def add_pvalue_table_to_doc(
     Adjusted p-values <= `alpha` are highlighted.
     """
     cols = ["chromosome", "n_tested", "n_significant_observed", "expected",
-            "binom_p", "binom_p_adj", "binom_p_bonf"]
+            "hyper_p", "hyper_p_adj", "hyper_p_bonf", "hyper_p_maxT"]
     labels = {
         "chromosome": "Chromosome",
         "n_tested": "N tested",
         "n_significant_observed": "N significant (obs.)",
-        "expected": "Expected (n\u00b7p_rate)",
-        "binom_p": "Binomial p",
-        "binom_p_adj": "Binomial p (BH-adj.)",
-        "binom_p_bonf": "Binomial p (Bonferroni)",
+        "expected": "Expected (n\u00b7K/N)",
+        "hyper_p": "Hypergeometric p (Fisher)",
+        "hyper_p_adj": "p (BH-adj.)",
+        "hyper_p_bonf": "p (Bonferroni)",
+        "hyper_p_maxT": "p (max-statistic, family-wise)",
     }
 
     if title:
@@ -325,7 +332,7 @@ def add_pvalue_table_to_doc(
         shade = ZEBRA_FILL if ridx % 2 == 1 else "FFFFFF"
         for i, col in enumerate(cols):
             val = row[col]
-            if col in ("binom_p", "binom_p_adj", "binom_p_bonf", "expected"):
+            if col in ("hyper_p", "hyper_p_adj", "hyper_p_bonf", "hyper_p_maxT", "expected"):
                 text = "{:.3g}".format(float(val)) if pd.notna(val) else ""
             else:
                 text = str(val) if pd.notna(val) else ""
@@ -333,7 +340,7 @@ def add_pvalue_table_to_doc(
             para.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT if col != "chromosome" else WD_PARAGRAPH_ALIGNMENT.LEFT
             run = para.add_run(text)
             run.font.size = Pt(9)
-            if col in ("binom_p_adj", "binom_p_bonf") and _is_significant(val, alpha):
+            if col in ("hyper_p_adj", "hyper_p_bonf", "hyper_p_maxT") and _is_significant(val, alpha):
                 run.bold = True
                 run.font.color.rgb = SIG_FONT_COLOR
             cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
@@ -493,22 +500,26 @@ def _empty_placeholder_figure(path: Path, message: str) -> None:
 
 
 def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
-    """Add expected/binomial-p columns to a per-chromosome table with
+    """Add expected / enrichment-test columns to a per-chromosome table with
     n_tested / n_significant_observed columns.
 
-    Null model: proportional allocation. Given the table's own totals
-    (summed across all its chromosome rows -- e.g. all chromosomes within
-    one exposure, or all chromosomes pooled across exposures), the overall
-    significance rate is
-        p_rate = sum(n_significant_observed) / sum(n_tested)
-    Under H0 (no chromosome-level concentration of hits), each chromosome's
-    expected count of significant hits is proportional to how much of it was
-    tested:
-        expected  = n_tested * p_rate
-        binom_p   = P(X >= n_significant_observed | X ~ Binomial(n_tested, p_rate))
-    (one-sided "greater" exact binomial test).
-    binom_p_adj  = BH (fdr_bh) correction of binom_p across the rows of this table.
-    binom_p_bonf = Bonferroni correction (binom_p x number of rows, capped at 1).
+    Null model: proportional allocation. With N = total variants tested, K = total
+    significant (replicated) variants in this table, and n = variants tested on a
+    chromosome, the expected number of hits is  expected = n * K / N.
+
+    Tests (one-sided, "greater"):
+      * hyper_p        exact hypergeometric test = one-sided Fisher exact test on the
+                       2x2 table (chromosome vs rest) x (significant vs not).  PRIMARY test:
+                       conditional on the total number of hits K.
+      * hyper_p_adj    Benjamini-Hochberg across the chromosomes of this table
+      * hyper_p_bonf   Bonferroni across the chromosomes of this table
+      * hyper_p_maxT   family-wise p-value by max-statistic permutation: K hits are
+                       re-drawn at random from the N tested variants (multivariate
+                       hypergeometric), the smallest hyper_p over chromosomes is recorded,
+                       and hyper_p_maxT = P(null smallest p <= observed p). It accounts
+                       for having looked at all chromosomes.
+      * binom_p, binom_p_adj, binom_p_bonf   earlier binomial version (kept for continuity;
+                       binomial approximation of the hypergeometric).
     """
     merged = merged.copy()
     total_tested = int(merged["n_tested"].sum())
@@ -516,14 +527,15 @@ def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
 
     if total_tested == 0 or total_sig == 0:
         merged["expected"] = 0.0
-        merged["binom_p"] = 1.0
-        merged["binom_p_adj"] = 1.0
-        merged["binom_p_bonf"] = 1.0
+        for c in ("binom_p", "binom_p_adj", "binom_p_bonf",
+                  "hyper_p", "hyper_p_adj", "hyper_p_bonf", "hyper_p_maxT"):
+            merged[c] = 1.0
         return merged
 
     p_rate = total_sig / total_tested
     merged["expected"] = merged["n_tested"] * p_rate
 
+    # --- binomial (kept for continuity) ---
     binom_pvals = []
     for _, row in merged.iterrows():
         n, k = int(row["n_tested"]), int(row["n_significant_observed"])
@@ -541,8 +553,28 @@ def _add_binomial_enrichment_stats(merged: pd.DataFrame) -> pd.DataFrame:
         merged["binom_p_adj"] = p_adj
     except ValueError:
         merged["binom_p_adj"] = merged["binom_p"]
-
     merged["binom_p_bonf"] = (merged["binom_p"] * len(merged)).clip(upper=1.0)
+
+    # --- hypergeometric / Fisher (primary) ---
+    n_arr = merged["n_tested"].values.astype(int)
+    k_arr = merged["n_significant_observed"].values.astype(int)
+    hp = hypergeom.sf(k_arr - 1, total_tested, total_sig, n_arr)
+    merged["hyper_p"] = hp
+    try:
+        merged["hyper_p_adj"] = multipletests(hp, method="fdr_bh")[1]
+    except ValueError:
+        merged["hyper_p_adj"] = hp
+    merged["hyper_p_bonf"] = np.clip(hp * len(merged), 0.0, 1.0)
+
+    # --- max-statistic permutation (family-wise across chromosomes) ---
+    try:
+        rng = np.random.default_rng(PERM_SEED)
+        draws = rng.multivariate_hypergeometric(n_arr, total_sig, size=N_PERM_MAXT)
+        null_min = hypergeom.sf(draws - 1, total_tested, total_sig, n_arr[None, :]).min(axis=1)
+        merged["hyper_p_maxT"] = [(float(np.sum(null_min <= p)) + 1.0) / (N_PERM_MAXT + 1.0) for p in hp]
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[warn] max-statistic permutation failed: {exc}", file=sys.stderr)
+        merged["hyper_p_maxT"] = np.nan
     return merged
 
 
@@ -583,7 +615,8 @@ def compute_chromosome_enrichment_global(
         print("[warn] no tested-variant counts -- skipping chromosome enrichment stats.", file=sys.stderr)
         _empty_placeholder_figure(fig_path, "No tested-variant counts available")
         empty = pd.DataFrame(columns=["chromosome", "n_tested", "n_significant_observed",
-                                       "expected", "binom_p", "binom_p_adj", "binom_p_bonf", "sig_variants"])
+                                       "expected", "hyper_p", "hyper_p_adj", "hyper_p_bonf", "hyper_p_maxT",
+                                       "binom_p", "binom_p_adj", "binom_p_bonf", "sig_variants"])
         empty.to_csv(stats_path, index=False)
         return empty, {"total_tested": 0, "total_significant": 0, "overall_rate": None,
                         "per_chromosome_csv": str(stats_path), "figure": str(fig_path)}
@@ -658,6 +691,7 @@ def compute_chromosome_enrichment_by_exposure(
     stats_path = out_dir / "table2_chromosome_enrichment_by_exposure_stats.csv"
 
     empty_cols = ["exposure", "chromosome", "n_tested", "n_significant_observed", "expected",
+                  "hyper_p", "hyper_p_adj", "hyper_p_bonf", "hyper_p_maxT", "hyper_p_adj_global",
                   "binom_p", "binom_p_adj", "binom_p_bonf", "binom_p_adj_global", "sig_variants"]
 
     if tested_df.empty:
@@ -709,9 +743,12 @@ def compute_chromosome_enrichment_by_exposure(
 
     # Global BH across ALL exposure x chromosome tests (sensitivity analysis).
     try:
+        combined["hyper_p_adj_global"] = multipletests(
+            combined["hyper_p"].fillna(1.0).values, method="fdr_bh")[1]
         combined["binom_p_adj_global"] = multipletests(
             combined["binom_p"].fillna(1.0).values, method="fdr_bh")[1]
     except ValueError:
+        combined["hyper_p_adj_global"] = combined["hyper_p"]
         combined["binom_p_adj_global"] = combined["binom_p"]
 
     combined.to_csv(stats_path, index=False)
@@ -733,6 +770,7 @@ def compute_chromosome_enrichment_by_exposure(
         individual_paths.append(indiv_path)
 
         csv_cols = ["chromosome", "n_tested", "n_significant_observed", "expected",
+                    "hyper_p", "hyper_p_adj", "hyper_p_bonf", "hyper_p_maxT",
                     "binom_p", "binom_p_adj", "binom_p_bonf"]
         indiv_csv_path = by_exposure_dir / f"pvalues_{slug}.csv"
         merged[csv_cols].to_csv(indiv_csv_path, index=False)
@@ -861,10 +899,11 @@ def run_table2(generation: int = 2, alpha: float = SIG_ALPHA_DEFAULT, out_dir: P
             f"For each exposure and chromosome: n_tested variants (COUNT(*) FROM variant_results "
             f"WHERE exposure=... AND generation={generation} GROUP BY chromosome), the number "
             f"found significant (empirical_p_g1 <= {alpha}), the expected count under a "
-            "proportional-allocation null (n_tested \u00d7 the exposure's own overall significance "
-            "rate), and a one-sided binomial p-value testing chromosome-level concentration of hits, "
-            "with Benjamini-Hochberg and Bonferroni adjustment across the chromosomes of each "
-            f"exposure. Adjusted p-values <= {alpha} are highlighted."
+            "proportional-allocation null (n_tested \u00d7 K/N), and a one-sided exact hypergeometric "
+            "(Fisher) p-value testing chromosome-level concentration of hits, with Benjamini-Hochberg "
+            "and Bonferroni adjustment across the chromosomes of each exposure, plus a family-wise "
+            f"max-statistic permutation p-value ({N_PERM_MAXT} permutations). Adjusted p-values <= {alpha} "
+            "are highlighted."
         )
         for exposure, merged in per_exposure_tables.items():
             label = translate_exposure_value(exposure)
