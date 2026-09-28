@@ -3,18 +3,16 @@
 Generate Table 2b Word files and figures by calling the stored routine
 get_significant_results_table_2b via the project's MySQL connection helpers.
 
-Usage (from project root; run generate_table2 FIRST):
-    python3 -m gene_environment.report.generate_table2
+Usage (from project root):
     python3 -m gene_environment.report.generate_table2b
 
 Requirements:
     pip install pandas python-docx matplotlib seaborn mysql-connector-python
 
 CHANGES vs previous version
-- Table2b_top10.docx now contains the annotations of EXACTLY the variants shown in
-  Table 2 (same rows, same order), read from output/table2/top10_keys.csv written
-  by generate_table2.py. If that file is missing, a warning is printed and the
-  first 10 rows of the routine are used (old behaviour).
+- No ordering / filtering is applied in Python: Table2b_top10.docx shows the first
+  10 rows returned by the stored routine, in the order defined by the routine itself
+  (ordering by neuro-plausibility score lives in the stored procedure).
 - Gene-level summaries (gene-type counts, expression, score histograms) now ignore
   rows without a mapped gene_symbol (intergenic variants), so they no longer count
   a spurious "Unknown" gene.
@@ -88,9 +86,6 @@ OUT_DIR = Path("output/table2b")
 FIG_DIR = OUT_DIR / "figures"
 BY_EXPOSURE_DIR = FIG_DIR / "by_exposure"
 
-# Written by generate_table2.py (same rows / order as Table 2).
-TABLE2_KEYS_PATH = Path("output/table2/top10_keys.csv")
-
 ASTORE_NAME = "get_significant_results_table_2b"
 
 TABLE_COLUMNS = [
@@ -157,29 +152,6 @@ _FALSE_TOKENS = {"0", "0.0", "false", "f", "no", "n"}
 def _genes_only(df: pd.DataFrame) -> pd.DataFrame:
     """Unique genes: drop rows without a mapped gene_symbol, dedupe by symbol."""
     return df.dropna(subset=["gene_symbol"]).drop_duplicates(subset=["gene_symbol"])
-
-
-def select_rows_matching_table2(df: pd.DataFrame, keys_path: Path = TABLE2_KEYS_PATH) -> pd.DataFrame:
-    """Rows of Table 2b for exactly the (exposure, variant) pairs of Table 2,
-    in the same order. Falls back to the first 10 rows if the keys file is missing."""
-    keys_path = Path(keys_path)
-    if not keys_path.exists():
-        print(f"[warn] {keys_path} not found -- run generate_table2 first. "
-              "Falling back to the first 10 rows of the routine (NOT matched to Table 2).",
-              file=sys.stderr)
-        return df.head(10)
-
-    keys = pd.read_csv(keys_path)
-    keys["_order"] = range(len(keys))
-    merged = keys.merge(df, on=["exposure", "variant"], how="left")
-
-    missing = merged[merged["gene_symbol"].isna() & merged["gene_id"].isna()]
-    if not missing.empty:
-        print("[warn] Table 2 variants with no annotation row in Table 2b (intergenic or not returned): "
-              + ", ".join(missing["variant"].astype(str).tolist()), file=sys.stderr)
-
-    merged = merged.sort_values("_order", kind="stable").drop(columns=["_order"])
-    return merged
 
 
 def _format_bool_like(val) -> str:
@@ -599,18 +571,18 @@ def run_table2b(out_dir: Path = OUT_DIR) -> None:
     n_unique_exposures = df["exposure"].nunique()
     n_rows_no_gene = int(df["gene_symbol"].isna().sum())
 
-    # --- Table 2b (same variants / order as Table 2) ---
-    top2b = select_rows_matching_table2(df)
-
+    # --- Table 2b (first 10 rows, in the order returned by the stored routine) ---
     doc_top10 = Document()
     set_landscape(doc_top10, top=0.6, bottom=0.6)
-    doc_top10.add_heading("Table 2b. Gene annotations for the variants in Table 2", level=1)
+    doc_top10.add_heading("Table 2b. Gene annotations for significant variants (top 10)", level=1)
     doc_top10.add_paragraph(
-        "Gene annotation (gene type, tissue expression, CTD chemicals, ALS OpenTargets score and "
-        "neuro-plausibility score) for the variants listed in Table 2, in the same order. Rows "
-        "without a gene symbol correspond to variants that could not be mapped to a gene."
+        "Table shows the top 10 rows returned by get_significant_results_table_2b, in the order "
+        "defined by the stored routine (ranked by neuro-plausibility score). It reports gene annotation "
+        "content (gene type, tissue expression, CTD chemicals, ALS OpenTargets / neuro-plausibility "
+        "scores) for the variant-gene-exposure combinations. Rows without a gene symbol correspond to "
+        "variants that could not be mapped to a named gene."
     )
-    add_table_to_doc(doc_top10, top2b)
+    add_table_to_doc(doc_top10, df, max_rows=10)
     top10_path = out_dir / "Table2b_top10.docx"
     doc_top10.save(top10_path)
 
