@@ -135,7 +135,7 @@ def match_control_units_indices(
     kth_dist = np.take_along_axis(D, idx_part, axis=1).max(axis=1)
     selected_other = np.unique(np.where(D <= kth_dist[:, None] + 1e-9)[1])
 
-    return base, selected_other
+    return base, other[selected_other]
 
 
 def check_balance(matched_df: pd.DataFrame | None, variant_col: str, covariates_for_matching: list[str]) -> dict:

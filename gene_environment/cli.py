@@ -93,6 +93,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("pipeline-order", help="Prints the recommended step order")
     sub.add_parser("run-gxe-genetlib", help="Chromosome-by-chromosome G x E analysis with GENetLib")
 
+    p_keller = sub.add_parser(
+        "keller-sensitivity",
+        help="Diagnostica dei fit + sensitivity Keller (C x E) per una lista di varianti/esposizioni, entrambe le generazioni",
+    )
+    p_keller.add_argument("variants_csv", help="CSV con colonne variant ed exposure")
+    p_keller.add_argument("--out-dir", default=None, help="Default: config.keller_sensitivity_dir")
+    p_keller.add_argument("--generations", type=int, nargs="+", default=[1, 2])
+    p_keller.add_argument("--perm", type=int, default=0, metavar="B", help="Controlla la salute delle prime B permutazioni per variante (0=salta)")
+    p_keller.add_argument("--with-gxc", action="store_true", help="Aggiunge il modello con G x C")
+
     p_final = sub.add_parser(
         "recalculate-final",
         help="High-precision recalculation (10000 perms by default) of the significant variants in both cohorts, with all betas saved to JSON",
@@ -170,6 +180,12 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "run-gxe-genetlib":
         from gene_environment.analysis.gxe_genetlib import run_gxe_genetlib_pipeline
         run_gxe_genetlib_pipeline()
+
+    elif args.command == "keller-sensitivity":
+        from gene_environment.analysis.keller_sensitivity import run as run_keller_sensitivity
+        run_keller_sensitivity(
+            args.variants_csv, args.out_dir, tuple(args.generations), args.with_gxc, args.perm,
+        )
 
     elif args.command == "recalculate-final":
         from gene_environment.analysis.run_final_recalc import run_final_recalculation

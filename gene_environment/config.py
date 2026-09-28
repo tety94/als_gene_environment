@@ -167,6 +167,7 @@ class Config:
     significant_matrix_dir: str = field(default_factory=lambda: _env("SIGNIFICANT_MATRIX_DIR", "./output/significant_variant_matrices"))
     significant_export_dir: str = field(default_factory=lambda: _env("SIGNIFICANT_EXPORT_DIR", "./output/significant_export"))
     onset_age_out_dir: str = field(default_factory=lambda: _env("ONSET_AGE_OUT_DIR", "./output/onset_age_analysis"))
+    keller_sensitivity_dir: str = field(default_factory=lambda: _env("KELLER_SENSITIVITY_DIR", "./output/keller_sensitivity"))
     log_dir: str = field(default_factory=lambda: _env("LOG_DIR", "./logs"))
 
     db: DBConfig = field(default_factory=DBConfig)
