@@ -418,7 +418,10 @@ def format_value_for_word(col: str, val) -> str:
         return ""
     try:
         if col.startswith("empirical_p"):
-            return "{:.3g}".format(float(val))
+            v = float(val)
+            # An empirical p of exactly 0 only means "no permutation exceeded the observed
+            # value" (resolution 1/1000): report it as "<0.001", not as 0.
+            return "<0.001" if v == 0 else "{:.3g}".format(v)
         if col.startswith("obs_coef"):
             return "{:.2f}".format(float(val))
     except (TypeError, ValueError):
