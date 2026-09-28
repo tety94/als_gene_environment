@@ -88,7 +88,7 @@ def precompute_scaled_covariates(df: pd.DataFrame, covariates_for_matching: list
 
     The covariates (Ecols) never change between permutations -- only the
     treated/control label changes (_match_variant). Calling this function
-    once per variant and passing the result to `match_control_units_indices`
+    once per variant and passing the result to `precompute_full_distance_matrix`
     avoids re-fitting the scaler on every single permutation.
 
     Note: `_prepare_matching_matrix` scales on `df_matching` (base+other,
@@ -99,21 +99,42 @@ def precompute_scaled_covariates(df: pd.DataFrame, covariates_for_matching: list
     return _prepare_matching_matrix(df, covariates_for_matching).values
 
 
+def precompute_full_distance_matrix(X_scaled: np.ndarray) -> np.ndarray:
+    """Pairwise euclidean distance between ALL units, computed once.
+
+    X_scaled never changes between permutations (see
+    `precompute_scaled_covariates`), so the full pairwise distance matrix
+    is invariant too: the only thing that changes at every permutation is
+    which rows are 'base' and which are 'other'. Precomputing the full
+    n x n matrix once reduces the work inside the permutation loop to pure
+    slicing (fancy indexing), eliminating the repeated
+    O(n_base * n_other * d) `cdist` call on every single permutation.
+
+    Memory note: this is O(n^2) instead of O(n). Fine for n in the
+    hundreds/thousands (typical for this kind of cohort); for very large n
+    (tens of thousands+) this can become expensive in memory and it may be
+    preferable to fall back to computing `cdist` per permutation instead.
+    """
+    return cdist(X_scaled, X_scaled)
+
+
 def match_control_units_indices(
-    labels: np.ndarray, X_scaled: np.ndarray, k: int = 2
+    labels: np.ndarray, D_full: np.ndarray, k: int = 2
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Fast equivalent of `match_control_units`, used in the permutation
     loop: instead of re-fitting `NearestNeighbors` (building a tree on
-    every call) it uses `cdist` + `argpartition` on an ALREADY scaled
-    covariate matrix (see `precompute_scaled_covariates`).
+    every call) or recomputing `cdist` on every call, it slices into an
+    ALREADY computed full pairwise distance matrix (see
+    `precompute_full_distance_matrix`).
 
     Handles ties like `match_control_units` (see the comment there): if
     multiple "other" points are at the same distance as the k-th neighbor,
     all of them are included, not just the first k found by argpartition.
 
     Returns (matched_base_idx, matched_other_idx): arrays of integer
-    POSITIONS in `X_scaled`/`labels` (not pandas indices), or None if a
-    group is empty or no neighbors are available.
+    POSITIONS in `labels` / in the array that `D_full` was built from (not
+    pandas indices), or None if a group is empty or no neighbors are
+    available.
     """
     group1 = np.where(labels == 1)[0]
     group0 = np.where(labels == 0)[0]
@@ -130,11 +151,17 @@ def match_control_units_indices(
     if k_used == 0:
         return None
 
-    D = cdist(X_scaled[base], X_scaled[other])
+    # np.ix_ builds a proper outer (rows x cols) submatrix selection here.
+    # D_full[base, other] would instead do elementwise pairing (and raise
+    # on mismatched lengths, or silently return the wrong diagonal-like
+    # vector if lengths happen to match) -- not what we want.
+    D = D_full[np.ix_(base, other)]
     idx_part = np.argpartition(D, k_used - 1, axis=1)[:, :k_used]
     kth_dist = np.take_along_axis(D, idx_part, axis=1).max(axis=1)
     selected_other = np.unique(np.where(D <= kth_dist[:, None] + 1e-9)[1])
 
+    # selected_other are positions relative to `other` (columns of D);
+    # remap them back to absolute positions in labels/X_scaled/D_full.
     return base, other[selected_other]
 
 

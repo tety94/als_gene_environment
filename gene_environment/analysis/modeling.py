@@ -23,6 +23,16 @@ with the same RANDOM_STATE could still produce slightly different
 permutations (and empirical p-values) on every pipeline run, which is a
 reproducibility problem for a statistical analysis.
 
+Matching in the permutation loop: `match_control_units_indices` no longer
+takes the scaled covariate matrix directly -- it takes a precomputed full
+pairwise distance matrix (`D_full`, from
+`matching.precompute_full_distance_matrix`). The covariates (Ecols +
+covariate_cols) never change across permutations, only which rows are
+treated/control does, so `D_full` is computed ONCE per variant (right
+after `X_scaled`) and then only sliced inside the permutation loop,
+instead of re-running `cdist` on every single permutation. See
+matching.py for details.
+
 Other notes:
   - tqdm inside ProcessPoolExecutor workers produces garbled output (dozens
     of processes writing progress bars to the same terminal), so periodic
@@ -64,6 +74,7 @@ from gene_environment.analysis.matching import (
     check_balance,
     match_control_units,
     match_control_units_indices,
+    precompute_full_distance_matrix,
     precompute_scaled_covariates,
 )
 from gene_environment.analysis.onset_age_stats import compute_onset_age_result
@@ -112,7 +123,7 @@ from gene_environment.analysis.fast_ols import (
 )
 
 def _run_permutation_batch(
-    df_model, variant_col, X_scaled, Ecols, covariate_cols, cfg, rng, n_perm, log_prefix,
+    df_model, variant_col, D_full, Ecols, covariate_cols, cfg, rng, n_perm, log_prefix,
     full_beta: bool = False,
 ):
     variant_values = df_model[variant_col].values
@@ -130,7 +141,7 @@ def _run_permutation_batch(
         perm_variant = rng.permutation(variant_values)
         perm_labels = (perm_variant > 0).astype(int)
 
-        matched = match_control_units_indices(perm_labels, X_scaled, k=cfg.match_k)
+        matched = match_control_units_indices(perm_labels, D_full, k=cfg.match_k)
         if matched is None:
             continue
         base_idx, other_idx = matched
@@ -252,11 +263,18 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
         col_names = design_column_names(variant_col, Ecols, covariate_cols)
         obs_vec = np.array([mod.params.get(name, np.nan) for name in col_names])
 
+        # Scaler + full pairwise distance matrix on the MATCHING covariates
+        # (Ecols + covariate_cols), both computed ONCE per variant. Neither
+        # changes across permutations -- only which rows are
+        # treated/control does -- so D_full is sliced (not recomputed)
+        # inside every call to match_control_units_indices in the
+        # permutation loop below. See matching.py.
         X_scaled = precompute_scaled_covariates(df_model, Ecols + covariate_cols)
         assert_numeric_covariates(df_model[Ecols + covariate_cols])
+        D_full = precompute_full_distance_matrix(X_scaled)
 
         perm_matrix = _run_permutation_batch(
-            df_model, variant_col, X_scaled, Ecols, covariate_cols, cfg,
+            df_model, variant_col, D_full, Ecols, covariate_cols, cfg,
             np.random.RandomState(_stable_seed(cfg.random_state, variant_col)),
             cfg.n_perm, log_prefix=f"[{variant_col}] FULL", full_beta=True,
         )
@@ -309,16 +327,17 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
 
     rng = np.random.RandomState(_stable_seed(cfg.random_state, variant_col))
 
-    # Scaler on the MATCHING covariates (Ecols + covariate_cols, i.e.
-    # exposure + sex + PCs together) fitted ONCE per variant (not on every
-    # permutation, see fast_ols.py/matching.py). Must use the SAME set of
-    # columns used for the observed matching above, otherwise the scaled
-    # matrix here wouldn't be comparable to the one used to get
-    # matched_obs. Computed only here, after the min_obs_coef filter, to
-    # avoid wasted work on variants that won't reach the permutation phase
-    # anyway.
+    # Scaler + full pairwise distance matrix on the MATCHING covariates
+    # (Ecols + covariate_cols, i.e. exposure + sex + PCs together), both
+    # fitted/computed ONCE per variant (not on every permutation, see
+    # fast_ols.py/matching.py). Must use the SAME set of columns used for
+    # the observed matching above, otherwise D_full here wouldn't be
+    # comparable to the matrix used to get matched_obs. Computed only
+    # here, after the min_obs_coef filter, to avoid wasted work on
+    # variants that won't reach the permutation phase anyway.
     assert_numeric_covariates(df_model[Ecols + covariate_cols])
     X_scaled = precompute_scaled_covariates(df_model, Ecols + covariate_cols)
+    D_full = precompute_full_distance_matrix(X_scaled)
 
     # ======================================================
     # LIGHT permutations, with adaptive futility check:
@@ -334,7 +353,7 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     for start in range(0, cfg.n_perm, check_every):
         n_batch = min(check_every, cfg.n_perm - start)
         batch = _run_permutation_batch(
-            df_model, variant_col, X_scaled, Ecols, covariate_cols, cfg, rng, n_batch,
+            df_model, variant_col, D_full, Ecols, covariate_cols, cfg, rng, n_batch,
             log_prefix=f"[{variant_col}] LIGHT",
         )
         perm_betas_light.extend(batch.tolist())
@@ -362,7 +381,7 @@ def process_single_variant(variant_col: str, variant_original: str, Ecols: list[
     if not stopped_early and p_emp_light is not None and p_emp_light <= cfg.pvalue_threshold:
         n_additional = cfg.n_perm_high - cfg.n_perm
         perm_betas_additional = _run_permutation_batch(
-            df_model, variant_col, X_scaled, Ecols, covariate_cols, cfg, rng, n_additional,
+            df_model, variant_col, D_full, Ecols, covariate_cols, cfg, rng, n_additional,
             log_prefix=f"[{variant_col}] HIGH",
         )
         perm_betas_final = np.concatenate([perm_betas_light, perm_betas_additional])
