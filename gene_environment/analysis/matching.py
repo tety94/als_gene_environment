@@ -158,7 +158,8 @@ def match_control_units_indices(
     D = D_full[np.ix_(base, other)]
     idx_part = np.argpartition(D, k_used - 1, axis=1)[:, :k_used]
     kth_dist = np.take_along_axis(D, idx_part, axis=1).max(axis=1)
-    selected_other = np.unique(np.where(D <= kth_dist[:, None] + 1e-9)[1])
+    # selected_other = np.unique(np.where(D <= kth_dist[:, None] + 1e-9)[1])
+    selected_other = other[np.unique(np.where(D <= kth_dist[:, None] + 1e-9)[1])]
 
     # selected_other are positions relative to `other` (columns of D);
     # remap them back to absolute positions in labels/X_scaled/D_full.
