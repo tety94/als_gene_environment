@@ -182,10 +182,53 @@ def delete_variants(conn, variant_list: list[str]) -> None:
         cur.execute(f"DELETE FROM variant_results WHERE variant IN ({fmt})", tuple(variant_list))
 
 
+def _variants_already_inserted(exposure: str, generation: int, test: str) -> bool:
+    """True if AT LEAST ONE row already exists in variant_results for this
+    (exposure, generation, test). Used by insert_new_variants as a cheap
+    bulk short-circuit: the insert for this combination is done in one
+    shot (all-or-nothing per run), so finding even a single existing row
+    means a previous run already inserted the whole batch -- no need to
+    check every variant individually, and no reliance on INSERT IGNORE
+    silently no-op'ing duplicates (see module notes on variant_results not
+    necessarily having a UNIQUE key on this tuple)."""
+    with get_connection() as conn:
+        with cursor_scope(conn) as cur:
+            cur.execute(
+                "SELECT 1 FROM variant_results WHERE exposure=%s AND generation=%s AND test=%s LIMIT 1",
+                (exposure, generation, test),
+            )
+            return cur.fetchone() is not None
+
+
 def insert_new_variants(variants: list[dict], exposure: str, generation: int, test: str, chunk_size: int = 5000) -> int:
     """Insert new variants into variant_results, chunked to avoid packets
-    that are too large for MySQL (max_allowed_packet)."""
+    that are too large for MySQL (max_allowed_packet).
+
+    Bulk-idempotent on rerun: before inserting, checks whether ANY row
+    already exists for this (exposure, generation, test). If so, the whole
+    batch is assumed already inserted by a previous run and nothing is
+    done. This avoids relying on INSERT IGNORE to deduplicate on every
+    restart -- INSERT IGNORE only skips a row when it violates a UNIQUE/
+    PRIMARY KEY that actually exists in the schema; without one on
+    (variant, exposure, generation, test) it happily re-inserts everything
+    every time, silently duplicating rows.
+
+    NB: this assumes insert_new_variants is always called with the full
+    variant list for a given (exposure, generation, test) -- i.e. it's an
+    all-or-nothing batch, never a partial/incremental one. If that
+    assumption doesn't hold for some caller, this short-circuit would
+    wrongly skip a legitimately smaller/different batch; check the actual
+    variant list against what's already in variant_results instead in
+    that case.
+    """
     if not variants:
+        return 0
+
+    if _variants_already_inserted(exposure, generation, test):
+        log.info(
+            "insert_new_variants: rows already present for exposure=%s, generation=%s, test=%s -- skipping insert",
+            exposure, generation, test,
+        )
         return 0
 
     sql = """
