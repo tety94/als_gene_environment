@@ -16,6 +16,7 @@ Examples:
     python -m gene_environment.cli generate-reports --only table2 table2b
     python -m gene_environment.cli run-c9-check               # restricted genotype/env/C9orf72 merge (see report/c9_check.py)
     python -m gene_environment.cli generate-c9-stats          # per-exposure close-vs-far + C9ORF72 stats (needs run-c9-check first)
+    python -m gene_environment.cli keller-sensitivity varianti.csv
     python -m gene_environment.cli pipeline-order    # print the recommended order
 """
 from __future__ import annotations

@@ -1,41 +1,41 @@
-"""Sensitivity alla Keller (2014, PMID 24135711) + diagnostica numerica dei fit.
+"""Keller (2014, PMID 24135711) sensitivity analysis + numerical fit diagnostics.
 
-INPUT  varianti.csv con colonne `variant` (CHROM_POS_MUTATION) ed `exposure`
-       (nome della colonna nel file ambientale). Una riga = una coppia
-       variante x esposizione; i duplicati vengono eliminati. Se manca la
-       colonna `exposure` si usa cfg.exposure (con un warning).
+INPUT  variants.csv with columns `variant` (CHROM_POS_MUTATION) and `exposure`
+       (column name in the environmental file). One row = one variant x exposure
+       pair; duplicates are dropped. If `exposure` is missing, cfg.exposure is
+       used (with a warning).
 
-Il file genetico viene letto UNA volta sola; per ogni (generazione, esposizione)
-si ricostruisce il blocco ambientale + PC esattamente come fa la pipeline
-(standardizzazione dell'esposizione sulla coorte, PC della generazione).
+The genetic file is read once. For each (generation, exposure) the environmental
+block + PCs are rebuilt exactly as the pipeline does (exposure standardized on
+the cohort, PCs of the generation).
 
-Per ogni (generazione, esposizione, variante), sullo STESSO campione matchato
-della pipeline, si stimano:
-    nocov   : onset ~ G*E                 (nessuna covariata)
-    base    : onset ~ G*E + C             (modello della pipeline; C = sex + PC)
-    cxe     : onset ~ G*E + C + C:E       (quanto chiesto da Keller)
-    [opz.] cxe_gxc : cxe + G:C            (--with-gxc; instabile con varianti rare)
+For each (generation, exposure, variant), on the SAME matched sample as the
+pipeline, the following models are fitted:
+    nocov   : onset ~ G*E                 (no covariates)
+    base    : onset ~ G*E + C             (pipeline model; C = sex + PCs)
+    cxe     : onset ~ G*E + C + C:E       (Keller's request)
+    [opt.] cxe_gxc : cxe + G:C            (--with-gxc; unstable with rare variants)
 
-Le regressioni sono OLS in forma chiusa: non esiste "convergenza" nel senso
-iterativo. Quello che si controlla e' se il fit e' ben posto:
-  * rango vs numero di colonne, condizionamento (colonne standardizzate),
-    leva massima, SE HC3 finito  -> colonna `ok_<modello>`
-  * concordanza tra smf.ols (percorso osservato della pipeline), fast path
-    (build_design_and_solve, quello delle permutazioni) e il design di questo
-    script, sullo stesso campione. NB: la concordanza NON rileva il rango
-    deficiente (lstsq e pinv danno entrambi la stessa soluzione a norma
-    minima): per quello servono rango e condizionamento.
-  * con --perm B: salute delle prime B permutazioni (stesso seed della
-    pipeline): frazione valide, con rango deficiente, errore Monte Carlo.
+The regressions are closed-form OLS, so there is no iterative convergence to
+check. What is checked is whether each fit is well posed:
+  * rank vs number of columns, condition number (standardized columns),
+    maximum leverage, finite HC3 SE  -> column `ok_<model>`
+  * agreement between smf.ols (pipeline observed path), the fast path
+    (build_design_and_solve, used by the permutations) and this script's design,
+    on the same sample. NOTE: agreement does NOT detect rank deficiency (lstsq
+    and pinv both return the same minimum-norm solution); rank and condition
+    number are needed for that.
+  * with --perm B: health of the first B permutations (same seed as the
+    pipeline): valid fraction, rank-deficient fraction, Monte Carlo error.
 
 OUTPUT (default ./output/keller_sensitivity, cfg.keller_sensitivity_dir):
     results_all.csv, results_gen<N>.csv, summary_by_gen_exposure.csv,
     keller_sensitivity_report.docx, figures/*.png, run_info.json
 
-Uso:
-    python -m gene_environment.analysis.keller_sensitivity varianti.csv
-    python -m gene_environment.analysis.keller_sensitivity varianti.csv --perm 500
-    python -m gene_environment.analysis.keller_sensitivity varianti.csv --generations 1 2 \
+Usage:
+    python -m gene_environment.analysis.keller_sensitivity variants.csv
+    python -m gene_environment.analysis.keller_sensitivity variants.csv --perm 500
+    python -m gene_environment.analysis.keller_sensitivity variants.csv --generations 1 2 \
         --out-dir output/keller_sensitivity --with-gxc
 """
 from __future__ import annotations
@@ -56,21 +56,22 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-# ---- soglie (modificabili) -------------------------------------------------
-COND_MAX = 1e6            # oltre questo (colonne standardizzate) il fit e' inaffidabile
-LEV_WARN = 0.5            # leva massima: una sola osservazione domina il fit
-CONC_RTOL = 1e-6          # tolleranza relativa per la concordanza tra percorsi di calcolo
+COND_MAX = 1e6            # condition number above which a fit is unreliable (standardized columns)
+LEV_WARN = 0.5            # max leverage above which a single observation dominates the fit
+CONC_RTOL = 1e-6          # relative tolerance for agreement between computation paths
 CONC_ATOL = 1e-8
-SHIFT_WARN = 0.5          # |shift relativo| del beta (nocov->base o base->cxe) da segnalare
-PERM_VALID_WARN = 0.95    # frazione di permutazioni valide sotto cui si segnala
+SHIFT_WARN = 0.5          # |relative shift| of beta (nocov->base or base->cxe) to flag
+PERM_VALID_WARN = 0.95    # valid-permutation fraction below which to warn
 PERM_VALID_FAIL = 0.50
-PERM_RANKDEF_WARN = 0.05  # frazione di permutazioni a rango deficiente
+PERM_RANKDEF_WARN = 0.05  # rank-deficient permutation fraction above which to warn
 
 MODEL_TAGS = ("nocov", "base", "cxe", "cxe_gxc")
 
+_BOOL_COLS_PREFIX = ("ok_", "same_sign_")
+
 
 # ============================================================================
-# Fit e diagnostica numerica
+# Fits and numerical diagnostics
 # ============================================================================
 def _design(df, variant_col, Ecols, Ccols, cxe: bool, gxc: bool):
     v = df[variant_col].to_numpy(float)
@@ -95,7 +96,7 @@ def _design(df, variant_col, Ecols, Ccols, cxe: bool, gxc: bool):
 
 
 def _max_leverage(X: np.ndarray) -> float:
-    """Leva massima via SVD (corretta anche con rango deficiente)."""
+    """Maximum leverage via SVD (correct also for rank-deficient X)."""
     U, s, _ = np.linalg.svd(X, full_matrices=False)
     tol = s.max() * max(X.shape) * np.finfo(float).eps if s.size else 0.0
     keep = s > tol
@@ -112,7 +113,7 @@ def _fit(df, target, variant_col, Ecols, Ccols, cxe, gxc):
     cond = float(np.linalg.cond(Zs)) if (sd > 0).all() else np.inf
     lev = _max_leverage(X)
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # i fit singolari vengono marcati da ok_*
+        warnings.simplefilter("ignore")  # singular fits are flagged through ok_*
         res = sm.OLS(y, X).fit(cov_type="HC3")
     i = names.index(f"G:{Ecols[0]}")
     se = float(res.bse[i])
@@ -142,7 +143,7 @@ def fit_models(df, target, variant_col, Ecols, Ccols, with_gxc=False) -> dict:
 
 
 def _product_smd(df, treat_col, Ecols, Ccols) -> float:
-    """SMD massimo sui PRODOTTI C x E: il matching bilancia i main effect, non i prodotti."""
+    """Max SMD on the C x E PRODUCTS: matching balances main effects, not products."""
     worst, t = 0.0, df[treat_col] == 1
     for c in Ccols:
         for e in Ecols:
@@ -154,7 +155,7 @@ def _product_smd(df, treat_col, Ecols, Ccols) -> float:
 
 
 def _carrier_support(m, treat_col, Ecols) -> dict:
-    """Quanta informazione c'e' sui portatori per identificare G:E."""
+    """How much information the carriers provide to identify G:E."""
     e = m[Ecols[0]]
     car = m[treat_col] == 1
     out = {
@@ -172,13 +173,15 @@ def _carrier_support(m, treat_col, Ecols) -> dict:
 
 
 def _concordance(d, m, target, col, Ecols, Ccols, cfg) -> dict:
-    """smf.ols (percorso osservato) vs fast path (percorso permutazioni)."""
+    """smf.ols (observed path) vs fast path (permutation path)."""
     import statsmodels.formula.api as smf
     from gene_environment.analysis.fast_ols import build_design_and_solve, interaction_column_index
-    from gene_environment.analysis.matching import match_control_units_indices, precompute_scaled_covariates
+    from gene_environment.analysis.matching import (
+        match_control_units_indices, precompute_full_distance_matrix, precompute_scaled_covariates,
+    )
     from gene_environment.analysis.modeling import _find_interaction_term, build_formula
 
-    out = {"beta_smf": np.nan, "beta_fast": np.nan, "same_matched_set": False}
+    out = {"beta_smf": np.nan, "beta_fast": np.nan, "same_matched_set": False, "conc_error": ""}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         mod = smf.ols(build_formula(target, col, Ecols, Ccols, m), data=m).fit()
@@ -186,26 +189,32 @@ def _concordance(d, m, target, col, Ecols, Ccols, cfg) -> dict:
     if name is not None:
         out["beta_smf"] = float(mod.params[name])
 
-    Xs = precompute_scaled_covariates(d, Ecols + Ccols)
-    mi = match_control_units_indices(d["_match_variant"].to_numpy(), Xs, k=cfg.match_k)
-    if mi is not None:
-        idx = np.concatenate(mi)
-        y = d[target].to_numpy(float)
-        C = d[Ccols].to_numpy(float)[idx] if Ccols else None
-        b = build_design_and_solve(d[col].to_numpy(float)[idx], d[Ecols].to_numpy(float)[idx], y[idx], C)
-        if b is not None:
-            out["beta_fast"] = float(b[interaction_column_index(len(Ecols))])
-        out["same_matched_set"] = bool(
-            len(idx) == len(m) and np.allclose(np.sort(y[idx]), np.sort(m[target].to_numpy(float)))
-        )
+    try:
+        Xs = precompute_scaled_covariates(d, Ecols + Ccols)
+        D_full = precompute_full_distance_matrix(Xs)
+        mi = match_control_units_indices(d["_match_variant"].to_numpy(), D_full, k=cfg.match_k)
+        if mi is not None:
+            idx = np.concatenate(mi)
+            y = d[target].to_numpy(float)
+            C = d[Ccols].to_numpy(float)[idx] if Ccols else None
+            b = build_design_and_solve(d[col].to_numpy(float)[idx], d[Ecols].to_numpy(float)[idx], y[idx], C)
+            if b is not None:
+                out["beta_fast"] = float(b[interaction_column_index(len(Ecols))])
+            out["same_matched_set"] = bool(
+                len(idx) == len(m) and np.allclose(np.sort(y[idx]), np.sort(m[target].to_numpy(float)))
+            )
+    except Exception as exc:  # a fast-path bug must not kill the pair: it is reported instead
+        out["conc_error"] = f"{type(exc).__name__}: {exc}"
     return out
 
 
 def _perm_health(d, obs_coef, col, Ecols, Ccols, cfg, B) -> dict:
-    """Prime B permutazioni con lo stesso seed e la stessa logica della pipeline
-    (modeling._run_permutation_batch), ma contando cosa va storto."""
+    """First B permutations with the pipeline's seed and logic
+    (modeling._run_permutation_batch), counting what goes wrong."""
     from gene_environment.analysis.fast_ols import build_design_and_solve, interaction_column_index
-    from gene_environment.analysis.matching import match_control_units_indices, precompute_scaled_covariates
+    from gene_environment.analysis.matching import (
+        match_control_units_indices, precompute_full_distance_matrix, precompute_scaled_covariates,
+    )
     from gene_environment.analysis.modeling import _stable_seed
 
     vv = d[col].to_numpy()
@@ -213,6 +222,7 @@ def _perm_health(d, obs_coef, col, Ecols, Ccols, cfg, B) -> dict:
     E = d[Ecols].to_numpy(float)
     C = d[Ccols].to_numpy(float) if Ccols else None
     Xs = precompute_scaled_covariates(d, Ecols + Ccols)
+    D_full = precompute_full_distance_matrix(Xs)
     inter = interaction_column_index(E.shape[1])
     q = 0 if C is None else C.shape[1]
     n_cols = 2 + 2 * E.shape[1] + q
@@ -222,7 +232,7 @@ def _perm_health(d, obs_coef, col, Ecols, Ccols, cfg, B) -> dict:
     betas, rankdef = [], []
     for _ in range(B):
         pv = rng.permutation(vv)
-        mi = match_control_units_indices((pv > 0).astype(int), Xs, k=cfg.match_k)
+        mi = match_control_units_indices((pv > 0).astype(int), D_full, k=cfg.match_k)
         if mi is None:
             cnt["matching"] += 1
             continue
@@ -264,51 +274,53 @@ def _perm_health(d, obs_coef, col, Ecols, Ccols, cfg, B) -> dict:
 
 
 # ============================================================================
-# Classificazione OK / WARN / FAIL
+# OK / WARN / FAIL classification
 # ============================================================================
 def classify(r: dict, has_perm: bool, with_gxc: bool) -> tuple[str, str]:
     fail, warn = [], []
     if not r.get("ok_base", False):
-        fail.append("fit base non affidabile (rango/condizionamento/SE)")
-    if r.get("concordant") is False:
-        fail.append("smf.ols e fast path non concordano")
-    if r.get("same_matched_set") is False:
-        fail.append("matching osservato != matching fast path")
+        fail.append("base fit unreliable (rank/conditioning/SE)")
+    if r.get("conc_error"):
+        fail.append(f"fast path could not be computed ({r['conc_error']})")
+    elif r.get("concordant") is False:
+        fail.append("smf.ols and fast path disagree")
+    if not r.get("conc_error") and r.get("same_matched_set") is False:
+        fail.append("observed matching != fast-path matching")
     if r.get("ok_base", False):
         if not r.get("ok_nocov", True):
-            warn.append("fit senza covariate non affidabile")
+            warn.append("no-covariate fit unreliable")
         if not r.get("ok_cxe", True):
-            warn.append("fit con C x E non affidabile")
+            warn.append("C x E fit unreliable")
         if with_gxc and not r.get("ok_cxe_gxc", True):
-            warn.append("fit con G x C non affidabile")
+            warn.append("G x C fit unreliable")
     if r.get("max_lev_base", 0) > LEV_WARN:
-        warn.append(f"leva massima {r['max_lev_base']:.2f} > {LEV_WARN}")
+        warn.append(f"max leverage {r['max_lev_base']:.2f} > {LEV_WARN}")
     if r.get("max_smd_main", 0) > r.get("cfg_max_smd", np.inf):
-        fail.append("SMD > MAX_SMD: la pipeline scarterebbe questa variante (nessun risultato in DB)")
+        fail.append("SMD > MAX_SMD: the pipeline would discard this variant (no result in DB)")
     if r.get("ok_nocov", False) and r.get("ok_base", False):
         if not r.get("same_sign_cov", True):
-            warn.append("segno del beta cambia aggiungendo le covariate")
+            warn.append("beta changes sign when covariates are added")
         elif abs(r.get("rel_shift_cov", 0) or 0) > SHIFT_WARN:
-            warn.append(f"beta cambia >{SHIFT_WARN:.0%} aggiungendo le covariate")
+            warn.append(f"beta changes >{SHIFT_WARN:.0%} when covariates are added")
     if r.get("ok_base", False) and r.get("ok_cxe", False):
         if not r.get("same_sign_cxe", True):
-            warn.append("segno del beta cambia con C x E")
+            warn.append("beta changes sign with C x E")
         elif abs(r.get("rel_shift_cxe", 0) or 0) > SHIFT_WARN:
-            warn.append(f"beta cambia >{SHIFT_WARN:.0%} con C x E")
+            warn.append(f"beta changes >{SHIFT_WARN:.0%} with C x E")
     if has_perm and "perm_valid_frac" in r:
         vf = r["perm_valid_frac"]
         if vf < PERM_VALID_FAIL:
-            fail.append(f"solo {vf:.0%} di permutazioni valide")
+            fail.append(f"only {vf:.0%} of permutations valid")
         elif vf < PERM_VALID_WARN:
-            warn.append(f"{vf:.0%} di permutazioni valide")
+            warn.append(f"{vf:.0%} of permutations valid")
         if (r.get("perm_rankdef_frac") or 0) > PERM_RANKDEF_WARN:
-            warn.append(f"{r['perm_rankdef_frac']:.0%} di permutazioni a rango deficiente")
+            warn.append(f"{r['perm_rankdef_frac']:.0%} of permutations rank-deficient")
     status = "FAIL" if fail else ("WARN" if warn else "OK")
     return status, "; ".join(fail + warn)
 
 
 # ============================================================================
-# Una coppia (variante, esposizione) su una generazione
+# One (variant, exposure) pair on one generation
 # ============================================================================
 def analyze_one(df, col, label, exposure, generation, Ecols, Ccols, cfg, with_gxc, perm_B) -> dict:
     from gene_environment.analysis.matching import check_balance, match_control_units
@@ -320,14 +332,14 @@ def analyze_one(df, col, label, exposure, generation, Ecols, Ccols, cfg, with_gx
     n_t, n_c = int(d["_match_variant"].sum()), int((d["_match_variant"] == 0).sum())
     row.update(n_carriers_all=n_t, n_noncarriers_all=n_c)
     if n_t < cfg.min_treated or n_c < cfg.min_treated:
-        return {**row, "status": "SKIP", "reasons": "sotto MIN_TREATED: la pipeline non lo testa"}
+        return {**row, "status": "SKIP", "reasons": "below MIN_TREATED: the pipeline does not test it"}
 
     d = d[[cfg.target_col, col, "_match_variant"] + Ecols + Ccols].dropna()
     if d.shape[0] < cfg.min_sample_size:
-        return {**row, "status": "SKIP", "reasons": "campione sotto MIN_SAMPLE_SIZE dopo dropna"}
+        return {**row, "status": "SKIP", "reasons": "sample below MIN_SAMPLE_SIZE after dropna"}
     m = match_control_units(d, "_match_variant", k=cfg.match_k, covariates_for_matching=Ecols + Ccols)
     if m is None or m.shape[0] < cfg.min_sample_size:
-        return {**row, "status": "SKIP", "reasons": "matching fallito"}
+        return {**row, "status": "SKIP", "reasons": "matching failed"}
 
     row["n_matched"] = int(m.shape[0])
     row.update(_carrier_support(m, "_match_variant", Ecols))
@@ -355,10 +367,10 @@ def analyze_one(df, col, label, exposure, generation, Ecols, Ccols, cfg, with_gx
 
 
 # ============================================================================
-# Caricamento dati (genetica una volta sola)
+# Data loading
 # ============================================================================
 def _quiet(fn, *a, **k):
-    """La pipeline stampa DEBUG/df.columns su stdout: qui li silenzio."""
+    """Silence the pipeline's DEBUG/df.columns prints on stdout."""
     with contextlib.redirect_stdout(io.StringIO()):
         return fn(*a, **k)
 
@@ -368,11 +380,11 @@ def _read_input(path: str, cfg) -> pd.DataFrame:
     log = get_logger(__name__)
     raw = pd.read_csv(path)
     if "variant" not in raw.columns:
-        raise ValueError(f"{path}: manca la colonna 'variant' (colonne: {list(raw.columns)})")
+        raise ValueError(f"{path}: missing 'variant' column (columns: {list(raw.columns)})")
     if "exposure" not in raw.columns:
         if not cfg.exposure:
-            raise ValueError(f"{path}: manca la colonna 'exposure' e EXPOSURE non e' configurata")
-        log.warning("Colonna 'exposure' assente: uso cfg.exposure=%s per tutte le varianti", cfg.exposure)
+            raise ValueError(f"{path}: missing 'exposure' column and EXPOSURE is not configured")
+        log.warning("'exposure' column missing: using cfg.exposure=%s for all variants", cfg.exposure)
         raw["exposure"] = cfg.exposure
     raw["variant"] = raw["variant"].astype(str).str.strip()
     raw["exposure"] = raw["exposure"].astype(str).str.strip()
@@ -381,12 +393,23 @@ def _read_input(path: str, cfg) -> pd.DataFrame:
 
 
 # ============================================================================
-# Riepilogo, figure, report Word
+# Summary, figures, Word report
 # ============================================================================
+def _fitted(res: pd.DataFrame) -> pd.DataFrame:
+    """Rows with real fit results (excludes SKIP and error rows without fit columns)."""
+    if "ok_base" not in res.columns:
+        return res.iloc[0:0].copy()
+    fit = res[(res["status"] != "SKIP") & res["ok_base"].notna()].copy()
+    for c in fit.columns:
+        if c.startswith(_BOOL_COLS_PREFIX) or c == "concordant":
+            fit[c] = fit[c].fillna(False).astype(bool)
+    return fit
+
+
 def summarize(res: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (g, e), s in res.groupby(["generation", "exposure"], sort=True):
-        fit = s[s["status"] != "SKIP"]
+        fit = _fitted(s)
         r = {"generation": g, "exposure": e, "n_pairs": len(s), "n_skip": int((s["status"] == "SKIP").sum()),
              "n_ok": int((s["status"] == "OK").sum()), "n_warn": int((s["status"] == "WARN").sum()),
              "n_fail": int((s["status"] == "FAIL").sum())}
@@ -405,9 +428,10 @@ def summarize(res: pd.DataFrame) -> pd.DataFrame:
             sig = good[good["p_base"] < 0.05]
             r["n_sig_base"] = len(sig)
             r["n_sig_kept_cxe"] = int((sig["p_cxe"] < 0.05).sum())
-            if "perm_valid_frac" in fit:
+            if "perm_valid_frac" in fit.columns:
                 r["median_perm_valid_frac"] = float(fit["perm_valid_frac"].median())
-                r["max_perm_rankdef_frac"] = float(fit["perm_rankdef_frac"].max())
+                if "perm_rankdef_frac" in fit.columns:
+                    r["max_perm_rankdef_frac"] = float(fit["perm_rankdef_frac"].max())
         rows.append(r)
     return pd.DataFrame(rows)
 
@@ -420,24 +444,25 @@ def make_figures(res: pd.DataFrame, fig_dir: Path, has_perm: bool) -> dict[str, 
     fig_dir.mkdir(parents=True, exist_ok=True)
     colors = {"OK": "#2a9d8f", "WARN": "#e9c46a", "FAIL": "#e63946", "SKIP": "#999999"}
     gens = sorted(res["generation"].unique())
-    fit = res[res["status"] != "SKIP"]
+    fit = _fitted(res)
     out: dict[str, Path] = {}
 
-    # 1) stati per generazione x esposizione
     fig, ax = plt.subplots(figsize=(max(5, 1.3 * res.groupby(["generation", "exposure"]).ngroups), 4))
     tab = res.groupby(["generation", "exposure", "status"]).size().unstack(fill_value=0)
     tab = tab.reindex(columns=[c for c in colors if c in tab.columns])
     tab.plot(kind="bar", stacked=True, ax=ax, color=[colors[c] for c in tab.columns], width=0.75)
-    ax.set_xlabel("(generazione, esposizione)"); ax.set_ylabel("n. varianti")
+    ax.set_xlabel("(generation, exposure)"); ax.set_ylabel("no. of variants")
     ax.set_xticklabels([f"g{a}\n{b}" for a, b in tab.index], rotation=0, fontsize=8)
-    ax.legend(title="stato", frameon=False); fig.tight_layout()
+    ax.legend(title="status", frameon=False); fig.tight_layout()
     out["status"] = fig_dir / "status_counts.png"; fig.savefig(out["status"], dpi=150); plt.close(fig)
 
-    # 2) beta con/senza covariate e con C x E
+    if fit.empty:
+        return out
+
     fig, axes = plt.subplots(len(gens), 2, figsize=(9, 4 * len(gens)), squeeze=False)
     for i, g in enumerate(gens):
         s = fit[(fit["generation"] == g) & fit["ok_base"] & fit["ok_nocov"] & fit["ok_cxe"]]
-        for j, (xc, lab) in enumerate((("beta_nocov", "senza covariate"), ("beta_cxe", "con C x E"))):
+        for j, (xc, lab) in enumerate((("beta_nocov", "no covariates"), ("beta_cxe", "with C x E"))):
             ax = axes[i, j]
             if len(s):
                 for st, c in colors.items():
@@ -447,24 +472,22 @@ def make_figures(res: pd.DataFrame, fig_dir: Path, has_perm: bool) -> dict[str, 
                 ax.plot([lo, hi], [lo, hi], color="k", lw=0.8, ls="--")
                 ax.legend(frameon=False, fontsize=7)
             else:
-                ax.text(0.5, 0.5, "nessun fit affidabile", ha="center", va="center", transform=ax.transAxes)
-            ax.set_xlabel(f"beta G:E {lab}"); ax.set_ylabel("beta G:E modello base")
-            ax.set_title(f"generazione {g}", fontsize=10)
+                ax.text(0.5, 0.5, "no reliable fit", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xlabel(f"G:E beta {lab}"); ax.set_ylabel("G:E beta base model")
+            ax.set_title(f"generation {g}", fontsize=10)
     fig.tight_layout()
     out["beta_scatter"] = fig_dir / "beta_base_vs_alternatives.png"; fig.savefig(out["beta_scatter"], dpi=150); plt.close(fig)
 
-    # 3) condizionamento
     fig, ax = plt.subplots(figsize=(6, 4))
     for g in gens:
         c = fit.loc[fit["generation"] == g, "cond_base"].replace(np.inf, np.nan).dropna()
         if len(c):
             ax.hist(np.log10(c), bins=20, histtype="step", lw=1.6, label=f"gen {g}")
     ax.axvline(np.log10(COND_MAX), color="r", ls="--", lw=1)
-    ax.set_xlabel("log10 numero di condizionamento (modello base)"); ax.set_ylabel("n. varianti")
+    ax.set_xlabel("log10 condition number (base model)"); ax.set_ylabel("no. of variants")
     ax.legend(frameon=False); fig.tight_layout()
     out["cond"] = fig_dir / "condition_number.png"; fig.savefig(out["cond"], dpi=150); plt.close(fig)
 
-    # 4) forest della scala di modelli (peggiori 40 per shift) per generazione
     for g in gens:
         s = fit[(fit["generation"] == g) & fit["ok_base"] & fit["ok_nocov"] & fit["ok_cxe"]].copy()
         if s.empty:
@@ -477,19 +500,19 @@ def make_figures(res: pd.DataFrame, fig_dir: Path, has_perm: bool) -> dict[str, 
             ax.errorbar(s[f"beta_{tag}"], y + off, xerr=1.96 * s[f"se_{tag}"], fmt=mk, ms=4, lw=0.8, color=c, label=tag)
         ax.axvline(0, color="k", lw=0.6)
         ax.set_yticks(y); ax.set_yticklabels([f"{v} | {e}" for v, e in zip(s["variant"], s["exposure"])], fontsize=6)
-        ax.set_xlabel("beta G:E (IC95% HC3)"); ax.set_title(f"generazione {g} - varianti con shift maggiore", fontsize=10)
+        ax.set_xlabel("G:E beta (95% CI, HC3)"); ax.set_title(f"generation {g} - variants with largest shift", fontsize=10)
         ax.legend(frameon=False, fontsize=7); fig.tight_layout()
         out[f"forest_g{g}"] = fig_dir / f"beta_ladder_gen{g}.png"; fig.savefig(out[f"forest_g{g}"], dpi=150); plt.close(fig)
 
-    # 5) permutazioni
-    if has_perm and "perm_valid_frac" in fit and fit["perm_valid_frac"].notna().any():
+    if has_perm and "perm_valid_frac" in fit.columns and fit["perm_valid_frac"].notna().any():
         fig, axes = plt.subplots(1, 2, figsize=(9, 4))
         axes[0].hist(fit["perm_valid_frac"].dropna(), bins=20, color="#264653")
         axes[0].axvline(PERM_VALID_WARN, color="r", ls="--", lw=1)
-        axes[0].set_xlabel("frazione di permutazioni valide"); axes[0].set_ylabel("n. varianti")
-        axes[1].hist(fit["perm_rankdef_frac"].dropna(), bins=20, color="#e76f51")
+        axes[0].set_xlabel("fraction of valid permutations"); axes[0].set_ylabel("no. of variants")
+        if "perm_rankdef_frac" in fit.columns:
+            axes[1].hist(fit["perm_rankdef_frac"].dropna(), bins=20, color="#e76f51")
         axes[1].axvline(PERM_RANKDEF_WARN, color="r", ls="--", lw=1)
-        axes[1].set_xlabel("frazione di permutazioni a rango deficiente")
+        axes[1].set_xlabel("fraction of rank-deficient permutations")
         fig.tight_layout()
         out["perm"] = fig_dir / "permutation_health.png"; fig.savefig(out["perm"], dpi=150); plt.close(fig)
     return out
@@ -505,33 +528,33 @@ def build_docx(res, summ, figs, path: Path, info: dict) -> None:
     doc = Document()
     set_landscape(doc)
     doc.styles["Normal"].font.size = Pt(10)
-    doc.add_heading("Sensitivity Keller e diagnostica dei fit", level=0)
+    doc.add_heading("Keller sensitivity and fit diagnostics", level=0)
     doc.add_paragraph(
-        f"Generato il {info['timestamp']}. Generazioni: {', '.join(map(str, info['generations']))}. "
-        f"Coppie variante x esposizione: {info['n_pairs']}. Permutazioni diagnostiche: "
-        f"{info['perm_B'] if info['perm_B'] else 'non eseguite'}."
+        f"Generated on {info['timestamp']}. Generations: {', '.join(map(str, info['generations']))}. "
+        f"Variant x exposure pairs: {info['n_pairs']}. Diagnostic permutations: "
+        f"{info['perm_B'] if info['perm_B'] else 'not run'}."
     )
 
-    doc.add_heading("Cosa si controlla", level=1)
+    doc.add_heading("What is checked", level=1)
     for t in (
-        "Le regressioni sono OLS in forma chiusa: non ci sono iterazioni che possano non convergere. "
-        "Si verifica invece che ogni fit sia ben posto: rango pieno, condizionamento sotto "
-        f"{COND_MAX:.0e}, SE HC3 finito, leva massima sotto {LEV_WARN}.",
-        "Concordanza tra smf.ols (percorso osservato della pipeline), fast path (percorso delle permutazioni) "
-        "e il design usato qui, sullo stesso campione matchato. La concordanza non rileva il rango deficiente "
-        "(lstsq e pinv restituiscono la stessa soluzione a norma minima): per quello contano rango e condizionamento.",
-        "Scala di modelli sullo stesso campione: senza covariate, base (pipeline), con C x E (richiesta Keller).",
-        "Stato per riga: FAIL = fit base non affidabile o percorsi discordanti; WARN = problemi nei modelli "
-        "alternativi, leva alta, SMD sopra soglia, shift del beta oltre "
-        f"{SHIFT_WARN:.0%} o cambio di segno; SKIP = la pipeline non testerebbe la variante.",
+        "The regressions are closed-form OLS: there are no iterations that could fail to converge. "
+        "Instead, each fit is checked to be well posed: full rank, condition number below "
+        f"{COND_MAX:.0e}, finite HC3 SE, maximum leverage below {LEV_WARN}.",
+        "Agreement between smf.ols (pipeline observed path), the fast path (permutation path) and the "
+        "design used here, on the same matched sample. Agreement does not detect rank deficiency "
+        "(lstsq and pinv return the same minimum-norm solution): rank and condition number are needed for that.",
+        "Model ladder on the same sample: no covariates, base (pipeline), with C x E (Keller's request).",
+        "Row status: FAIL = base fit unreliable or paths disagree; WARN = problems in the alternative "
+        f"models, high leverage, SMD above threshold, beta shift above {SHIFT_WARN:.0%} or sign change; "
+        "SKIP = the pipeline would not test the variant.",
     ):
         doc.add_paragraph(t, style="List Bullet")
 
-    doc.add_heading("Riepilogo per generazione ed esposizione", level=1)
-    cols = [("generation", "gen"), ("exposure", "esposizione"), ("n_pairs", "coppie"), ("n_ok", "OK"),
-            ("n_warn", "WARN"), ("n_fail", "FAIL"), ("n_skip", "SKIP"), ("frac_concordant", "concordanti"),
-            ("median_cond_base", "cond. mediano"), ("sign_kept_cov", "segno = (cov)"),
-            ("median_abs_shift_cov", "|shift| cov"), ("sign_kept_cxe", "segno = (CxE)"),
+    doc.add_heading("Summary by generation and exposure", level=1)
+    cols = [("generation", "gen"), ("exposure", "exposure"), ("n_pairs", "pairs"), ("n_ok", "OK"),
+            ("n_warn", "WARN"), ("n_fail", "FAIL"), ("n_skip", "SKIP"), ("frac_concordant", "concordant"),
+            ("median_cond_base", "median cond."), ("sign_kept_cov", "sign kept (cov)"),
+            ("median_abs_shift_cov", "|shift| cov"), ("sign_kept_cxe", "sign kept (CxE)"),
             ("median_abs_shift_cxe", "|shift| CxE"), ("median_se_ratio_cxe_base", "SE CxE/base")]
     cols = [c for c in cols if c[0] in summ.columns]
 
@@ -546,7 +569,7 @@ def build_docx(res, summ, figs, path: Path, info: dict) -> None:
             return f"{v:.2f}"
         return str(int(v)) if isinstance(v, (int, np.integer, float, np.floating)) and float(v).is_integer() else str(v)
 
-    def table(df_, columns, widths_pt=8):
+    def table(df_, columns, font_pt=8):
         t = doc.add_table(rows=1, cols=len(columns))
         set_table_borders(t)
         for i, (_, h) in enumerate(columns):
@@ -560,49 +583,49 @@ def build_docx(res, summ, figs, path: Path, info: dict) -> None:
             for c in row.cells:
                 for p in c.paragraphs:
                     for run in p.runs:
-                        run.font.size = Pt(widths_pt)
+                        run.font.size = Pt(font_pt)
         return t
 
     table(summ, cols)
 
-    doc.add_heading("Figure", level=1)
-    caps = {"status": "Stato dei fit per generazione ed esposizione.",
-            "beta_scatter": "Beta G:E del modello base contro senza covariate (sinistra) e con C x E (destra); solo fit affidabili.",
-            "cond": "Numero di condizionamento del modello base; linea rossa = soglia.",
-            "perm": "Salute delle permutazioni diagnostiche."}
+    doc.add_heading("Figures", level=1)
+    caps = {"status": "Fit status by generation and exposure.",
+            "beta_scatter": "Base-model G:E beta vs no covariates (left) and with C x E (right); reliable fits only.",
+            "cond": "Condition number of the base model; red line = threshold.",
+            "perm": "Health of the diagnostic permutations."}
     for k in ("status", "beta_scatter", "cond", "perm"):
         if k in figs:
             add_figure_to_doc(doc, figs[k], caps[k], width_in=6.5)
     for k, p in figs.items():
         if k.startswith("forest_g"):
-            add_figure_to_doc(doc, p, f"Scala di modelli, generazione {k[8:]}: varianti con shift maggiore.", width_in=7.0)
+            add_figure_to_doc(doc, p, f"Model ladder, generation {k[8:]}: variants with largest shift.", width_in=7.0)
 
     prob = res[res["status"].isin(["FAIL", "WARN", "SKIP"])].copy()
-    doc.add_heading("Righe da guardare (FAIL, WARN, SKIP)", level=1)
+    doc.add_heading("Rows to review (FAIL, WARN, SKIP)", level=1)
     if prob.empty:
-        doc.add_paragraph("Nessuna.")
+        doc.add_paragraph("None.")
     else:
         order = {"FAIL": 0, "WARN": 1, "SKIP": 2}
         prob = prob.sort_values(["status", "generation", "exposure"], key=lambda s: s.map(order) if s.name == "status" else s)
         cut = prob.head(80)
-        table(cut, [("generation", "gen"), ("exposure", "esposizione"), ("variant", "variante"),
-                    ("status", "stato"), ("reasons", "motivi")])
+        table(cut, [("generation", "gen"), ("exposure", "exposure"), ("variant", "variant"),
+                    ("status", "status"), ("reasons", "reasons")])
         if len(prob) > len(cut):
-            doc.add_paragraph(f"Mostrate {len(cut)} righe su {len(prob)}: elenco completo in results_all.csv.")
+            doc.add_paragraph(f"Showing {len(cut)} of {len(prob)} rows: full list in results_all.csv.")
 
-    doc.add_heading("Note", level=1)
+    doc.add_heading("Notes", level=1)
     for t in (
-        "Il campione e' quello matchato con la stessa procedura e gli stessi parametri della pipeline "
-        "(MATCH_K, matching su esposizione + sesso + PC); l'esposizione e' standardizzata sulla coorte della generazione.",
-        "Le prime B permutazioni usano lo stesso seed della pipeline, quindi coincidono con le prime B permutazioni reali.",
-        "Le soglie sono costanti in cima a keller_sensitivity.py.",
+        "The sample is matched with the same procedure and parameters as the pipeline "
+        "(MATCH_K, matching on exposure + sex + PCs); the exposure is standardized on the generation's cohort.",
+        "The first B permutations use the same seed as the pipeline, so they coincide with the first B real permutations.",
+        "Thresholds are constants at the top of keller_sensitivity.py.",
     ):
         doc.add_paragraph(t, style="List Bullet")
     doc.save(str(path))
 
 
 # ============================================================================
-# Orchestrazione
+# Orchestration
 # ============================================================================
 def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_gxc: bool = False,
         perm_B: int = 0) -> pd.DataFrame:
@@ -616,7 +639,7 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
     out = Path(out_dir or getattr(cfg, "keller_sensitivity_dir", "./output/keller_sensitivity"))
     (out / "figures").mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    log.info("Input: %d coppie variante x esposizione, %d esposizioni, generazioni %s",
+    log.info("Input: %d variant x exposure pairs, %d exposures, generations %s",
              len(pairs), pairs["exposure"].nunique(), list(generations))
 
     df_gen, _, mapping, _ = _load_genetic_data(cfg)
@@ -629,28 +652,28 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
     rows = []
     for g in generations:
         for exposure, sub in pairs.groupby("exposure", sort=False):
-            log.info("Generazione %s, esposizione %s: %d varianti", g, exposure, len(sub))
+            log.info("Generation %s, exposure %s: %d variants", g, exposure, len(sub))
             cfg_ge = dataclasses.replace(cfg, generation=g, exposure=exposure)
             try:
                 cov, Ecols, Ccols = _quiet(_build_narrow_covariates, cfg_ge, df_small["id"])
                 df = pd.merge(cov, df_small, on="id", how="inner")
-            except Exception as exc:  # esposizione assente, PC mancanti, ecc.
-                log.error("g%s %s: dataset non costruibile: %s", g, exposure, exc)
+            except Exception as exc:  # missing exposure, missing PCs, etc.
+                log.error("g%s %s: dataset could not be built: %s", g, exposure, exc)
                 rows += [{"generation": g, "exposure": exposure, "variant": v, "status": "SKIP",
-                          "reasons": f"dataset non costruibile: {exc}"} for v in sub["variant"]]
+                          "reasons": f"dataset could not be built: {exc}"} for v in sub["variant"]]
                 continue
             for k, lab in enumerate(sub["variant"], 1):
                 col = orig_to_safe.get(lab)
                 if col is None:
                     rows.append({"generation": g, "exposure": exposure, "variant": lab, "status": "SKIP",
-                                 "reasons": "variante non presente nel file genetico"})
+                                 "reasons": "variant not found in the genetic file"})
                     continue
                 try:
                     rows.append(analyze_one(df, col, lab, exposure, g, Ecols, Ccols, cfg_ge, with_gxc, perm_B))
                 except Exception as exc:
-                    log.exception("g%s %s %s: errore", g, exposure, lab)
+                    log.exception("g%s %s %s: error", g, exposure, lab)
                     rows.append({"generation": g, "exposure": exposure, "variant": lab, "status": "FAIL",
-                                 "reasons": f"errore: {type(exc).__name__}: {exc}"})
+                                 "reasons": f"error: {type(exc).__name__}: {exc}"})
                 if k % 25 == 0:
                     log.info("  %d/%d", k, len(sub))
             del df, cov
@@ -687,13 +710,13 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Sensitivity Keller + diagnostica dei fit")
-    ap.add_argument("variants_csv", help="CSV con colonne variant ed exposure")
+    ap = argparse.ArgumentParser(description="Keller sensitivity + fit diagnostics")
+    ap.add_argument("variants_csv", help="CSV with columns variant and exposure")
     ap.add_argument("--out-dir", default=None, help="default: cfg.keller_sensitivity_dir (./output/keller_sensitivity)")
     ap.add_argument("--generations", type=int, nargs="+", default=[1, 2])
     ap.add_argument("--perm", type=int, default=0, metavar="B",
-                    help="controlla la salute delle prime B permutazioni per variante (0 = salta; es. 500)")
-    ap.add_argument("--with-gxc", action="store_true", help="aggiunge il modello con G x C (instabile con varianti rare)")
+                    help="check the health of the first B permutations per variant (0 = skip; e.g. 500)")
+    ap.add_argument("--with-gxc", action="store_true", help="add the G x C model (unstable with rare variants)")
     a = ap.parse_args(argv)
     run(a.variants_csv, a.out_dir, tuple(a.generations), a.with_gxc, a.perm)
     return 0
