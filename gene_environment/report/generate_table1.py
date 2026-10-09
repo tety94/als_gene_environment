@@ -2,35 +2,27 @@
 """
 generate_table1.py
 
-Generates Table 1 for the paper (descriptive statistics for k >= 2 cohorts,
-designed for the 3 generations G1/G2/G3) from:
-  - a CSV containing clinical/environmental patient data (one row per id)
-  - a CSV mapping id -> generation/cohort, produced by build_cohort_mapping.py
-    by reading VCF headers (avoids loading gen.parquet, too heavy/unstable)
+Generates Table 1 (descriptive statistics for k >= 2 cohorts, e.g. G1/G2/G3).
+
+Input modes (no concatenation of the cohorts is ever performed):
+  A) COHORT_CSVS = {"gen1": path, ...}  -> one CSV per cohort
+  B) COHORT_CSVS = None                 -> CSV_PATH + id->generation mapping CSV
+                                           (split per cohort with groupby)
+
+Each cohort is kept as its own DataFrame in a dict {cohort: df}. Only the columns
+needed for Table 1 are read from disk (important for the huge *_variants.csv files).
 
 Statistical tests
-  Numeric variables
+  Numeric
     k = 2 : Welch t-test (normal) / Mann-Whitney U (non-normal)
-    k > 2 : one-way ANOVA (all groups normal AND Levene p > ALPHA)
-            otherwise Kruskal-Wallis
-            post-hoc (only if overall p < ALPHA): pairwise Welch t-test (after ANOVA)
-            or pairwise Mann-Whitney U (after Kruskal-Wallis), Bonferroni-adjusted
-  Categorical variables
-    2x2 with expected count < 5          : Fisher exact
-    r x c with sparse expected counts    : Monte Carlo chi-square (permutation)
-    otherwise                            : Chi-square
+    k > 2 : one-way ANOVA (all normal AND Levene p > ALPHA) else Kruskal-Wallis
+            post-hoc (only if overall p < ALPHA): pairwise Welch / Mann-Whitney, Bonferroni
+  Categorical
+    2x2 with expected < 5            : Fisher exact
+    r x c with sparse expected       : Monte Carlo chi-square (permutation)
+    otherwise                        : Chi-square
 
-Output (in OUTPUT_DIR):
-  - table1_stats.csv        -> raw statistics table, reusable
-  - table1_posthoc.csv      -> pairwise post-hoc comparisons (k > 2)
-  - Table1.docx             -> Word table ready for the paper (landscape)
-  - figures/*.png           -> boxplots/barplots comparing the cohorts
-
-Usage:
-    python -m gene_environment.report.build_cohort_mapping   # generates id -> generation mapping
-    python -m gene_environment.report.generate_table1        # generates Table 1
-
-Modify only the CONFIG section below to adapt paths/column names.
+Output (OUTPUT_DIR): table1_stats.csv, table1_posthoc.csv, Table1.docx, figures/*.png
 """
 
 from __future__ import annotations
@@ -43,7 +35,6 @@ from pathlib import Path
 import matplotlib
 import numpy as np
 import pandas as pd
-import seaborn as sns
 from docx import Document
 from docx.enum.section import WD_ORIENT
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -52,7 +43,7 @@ from docx.shared import Cm, Pt
 from scipy import stats
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402  (must come after matplotlib.use)
+import matplotlib.pyplot as plt  # noqa: E402
 
 from gene_environment.report.word_utils import set_cell_bg
 
@@ -62,53 +53,35 @@ warnings.filterwarnings("ignore")
 # CONFIG — edit here
 # ============================================================
 
+# Mode B (used only if COHORT_CSVS is None)
 CSV_PATH = "/srv/python-projects/gene_environment_v2/data/componenti_ambientali_full.csv"
-
 COHORT_MAPPING_CSV = "output/table1/id_generation_mapping.csv"
+ID_COL_CSV = "id"
+ID_COL_MAPPING = "id"
+COHORT_COL = "generation"
 
-# One CSV per cohort (same columns in each). If set, CSV_PATH and the id->generation
-# mapping are ignored: the cohort is taken from the dict key, in this order.
-# None = use CSV_PATH + COHORT_MAPPING_CSV.
-# COHORT_CSVS = None
-
+# Mode A: one CSV per cohort (dict order = table order). None -> mode B.
 COHORT_CSVS = {
     "gen1": "/mnt/cresla_prod/genome_datasets/merged_csv/full_chr_gen1_test1.csv",
     "gen2": "/mnt/cresla_prod/genome_datasets/merged_csv/gen2_variants.csv",
     "gen3": "/mnt/cresla_prod/genome_datasets/merged_csv/gen3_variants.csv",
 }
-# Example:
-# COHORT_CSVS = {
-#     "gen1": "/srv/python-projects/gene_environment_v2/data/gen1.csv",
-#     "gen2": "/srv/python-projects/gene_environment_v2/data/gen2.csv",
-#     "gen3": "/srv/python-projects/gene_environment_v2/data/gen3.csv",
-# }
+
+# If the cohort files have several rows per patient (e.g. one row per variant),
+# keep one row per patient using this column. None = no deduplication.
+DEDUP_ID_COL = "id"
 
 OUTPUT_DIR = Path("output/table1")
 
-ID_COL_CSV = "id"
-ID_COL_MAPPING = "id"
-
-COHORT_COL = "generation"
-
-# Which cohorts to compare, in the order they appear in the table.
-# None = auto-detect all distinct values (>= 2), sorted.
-# Example: COHORT_VALUES = ["gen1", "gen2", "gen3"]
+# None = all cohorts found. Example: ["gen1", "gen2", "gen3"]
 COHORT_VALUES = None
-
-# Human-readable labels
 COHORT_LABELS = None  # e.g. {"gen1": "G1 (PARALS)", "gen2": "G2", "gen3": "G3"}
 
 CATEGORICAL_VARS = ["sex", "onset_site"]
 NUMERIC_VARS = [
-    "diagnostic_delay",
-    "onset_age",
-    "survival",
-    "seminativi_1500",
-    "vigneti_1500",
-    "risaie_1500",
-    "seminativi_1000",
-    "vigneti_1000",
-    "risaie_1000",
+    "diagnostic_delay", "onset_age", "survival",
+    "seminativi_1500", "vigneti_1500", "risaie_1500",
+    "seminativi_1000", "vigneti_1000", "risaie_1000",
 ]
 
 VAR_LABELS = {
@@ -126,151 +99,145 @@ VAR_LABELS = {
 }
 
 ALPHA = 0.05
-N_PERM = 10000      # permutations for the Monte Carlo chi-square
+N_PERM = 10000
 RANDOM_SEED = 42
+SHAPIRO_MAX_N = 5000  # shapiro is unreliable/slow above this; subsample
+
+ALL_VARS = CATEGORICAL_VARS + NUMERIC_VARS
+
 
 # ============================================================
-# DATA LOADING
+# DATA LOADING (no concat)
 # ============================================================
 
-def load_data(csv_path: str, cohort_mapping_csv: str) -> pd.DataFrame:
+def _usecols(extra: list[str]):
+    wanted = set(ALL_VARS) | set(extra)
+    return lambda c: c in wanted
+
+
+def _prepare(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    if DEDUP_ID_COL and DEDUP_ID_COL in df.columns:
+        n0 = len(df)
+        df = df.drop_duplicates(subset=DEDUP_ID_COL)
+        if len(df) < n0:
+            print(f"  '{name}': {n0 - len(df)} duplicate rows removed (by '{DEDUP_ID_COL}')")
+    return df.reset_index(drop=True)
+
+
+def load_cohorts() -> dict[str, pd.DataFrame]:
+    """Return {cohort: DataFrame}, one DataFrame per cohort."""
+    extra = [c for c in (DEDUP_ID_COL,) if c]
+
     if COHORT_CSVS:
-        parts = []
+        data = {}
         for cohort, path in COHORT_CSVS.items():
             if not Path(path).exists():
                 sys.exit(f"ERROR: file for cohort '{cohort}' not found: {path}")
-            part = pd.read_csv(path)
-            part[COHORT_COL] = cohort
-            print(f"Loaded cohort '{cohort}': {len(part)} rows from {path}")
-            parts.append(part)
-        return pd.concat(parts, ignore_index=True)
+            df = pd.read_csv(path, usecols=_usecols(extra))
+            data[cohort] = _prepare(df, cohort)
+            print(f"Loaded cohort '{cohort}': {len(data[cohort])} patients from {path}")
+        return data
 
-    print(f"Loading CSV: {csv_path}")
-    df = pd.read_csv(csv_path)
-    if ID_COL_CSV not in df.columns:
-        sys.exit(f"ERROR: id column '{ID_COL_CSV}' not found in CSV. Columns: {list(df.columns)}")
-
-    print(f"Loading cohort mapping from CSV: {cohort_mapping_csv}")
-    if not Path(cohort_mapping_csv).exists():
+    if not Path(COHORT_MAPPING_CSV).exists():
         sys.exit(
-            f"ERROR: {cohort_mapping_csv} not found.\n"
-            f"Generate the mapping first with: python -m gene_environment.report.build_cohort_mapping"
+            f"ERROR: {COHORT_MAPPING_CSV} not found.\n"
+            "Generate it with: python -m gene_environment.report.build_cohort_mapping"
         )
-    gen = pd.read_csv(cohort_mapping_csv)
+    df = pd.read_csv(CSV_PATH, usecols=_usecols([ID_COL_CSV] + extra))
+    gen = pd.read_csv(COHORT_MAPPING_CSV, usecols=[ID_COL_MAPPING, COHORT_COL]).drop_duplicates()
 
-    if ID_COL_MAPPING not in gen.columns:
-        sys.exit(f"ERROR: id column '{ID_COL_MAPPING}' not found in mapping CSV. Columns: {list(gen.columns)}")
-    if COHORT_COL not in gen.columns:
-        sys.exit(f"ERROR: cohort column '{COHORT_COL}' not found in mapping CSV. Columns: {list(gen.columns)}")
-
-    gen = gen[[ID_COL_MAPPING, COHORT_COL]].drop_duplicates()
-
-    merged = df.merge(gen, left_on=ID_COL_CSV, right_on=ID_COL_MAPPING, how="inner")
-    n_lost = len(df) - len(merged)
-    if n_lost > 0:
+    ids_df = df[ID_COL_CSV].drop_duplicates()
+    n_lost = (~ids_df.isin(gen[ID_COL_MAPPING])).sum()
+    if n_lost:
         print(f"WARNING: {n_lost} patients in CSV not found in cohort mapping (excluded).")
 
-    return merged
+    cohort_of = gen.set_index(ID_COL_MAPPING)[COHORT_COL]
+    df[COHORT_COL] = df[ID_COL_CSV].map(cohort_of)
+    df = df.dropna(subset=[COHORT_COL])
+    data = {str(c): _prepare(g.drop(columns=COHORT_COL), str(c)) for c, g in df.groupby(COHORT_COL)}
+    for c, g in data.items():
+        print(f"Cohort '{c}': {len(g)} patients")
+    return data
 
 
-def resolve_cohorts(merged: pd.DataFrame):
-    values = sorted(merged[COHORT_COL].dropna().unique().tolist())
-
+def resolve_cohorts(data: dict[str, pd.DataFrame]):
+    found = list(data)
     if COHORT_VALUES is not None:
         chosen = list(COHORT_VALUES)
-        missing = [v for v in chosen if v not in values]
+        missing = [v for v in chosen if v not in data]
         if missing:
-            sys.exit(f"ERROR: COHORT_VALUES {missing} not present in '{COHORT_COL}'. Found: {values}")
-    elif COHORT_CSVS:
-        chosen = [c for c in COHORT_CSVS if c in values]
+            sys.exit(f"ERROR: COHORT_VALUES {missing} not present. Found: {found}")
     else:
-        chosen = values
+        chosen = found if COHORT_CSVS else sorted(found)
 
     if len(chosen) < 2:
         sys.exit(f"ERROR: need at least 2 cohorts, found {len(chosen)}: {chosen}")
 
-    labels = dict(COHORT_LABELS) if COHORT_LABELS else {}
-    for v in chosen:
-        labels.setdefault(v, str(v))
-
-    sub = merged[merged[COHORT_COL].isin(chosen)].copy()
-    counts = sub[COHORT_COL].value_counts().reindex(chosen).to_dict()
-    print(f"Selected cohorts: {chosen} -> N = {counts}")
-    return sub, chosen, labels
+    labels = {v: str(v) for v in chosen} | (COHORT_LABELS or {})
+    data = {g: data[g] for g in chosen}
+    print(f"Selected cohorts: {chosen} -> N = { {g: len(d) for g, d in data.items()} }")
+    return data, chosen, labels
 
 
 # ============================================================
 # STATISTICS HELPERS
 # ============================================================
 
-def is_normal(series: pd.Series, alpha: float = 0.05) -> bool:
+def is_normal(series: pd.Series, alpha: float = ALPHA) -> bool:
     series = series.dropna()
     if len(series) < 8:
         return True
     if series.nunique() < 2:
         return False
-    _, p = stats.shapiro(series)
-    return p > alpha
+    if len(series) > SHAPIRO_MAX_N:
+        series = series.sample(SHAPIRO_MAX_N, random_state=RANDOM_SEED)
+    return stats.shapiro(series)[1] > alpha
 
 
 def fmt_p(p) -> str:
     if p is None or pd.isna(p):
         return "-"
-    if p < 0.001:
-        return "<0.001"
-    return f"{p:.3f}"
+    return "<0.001" if p < 0.001 else f"{p:.3f}"
 
 
 def pairwise_posthoc(data: dict, groups, labels, parametric: bool, var_label: str) -> list[dict]:
-    """Pairwise comparisons with Bonferroni adjustment."""
     pairs = list(combinations(groups, 2))
-    n_pairs = len(pairs)
     rows = []
     for a, b in pairs:
         x, y = data[a], data[b]
         if len(x) < 2 or len(y) < 2:
             p_raw, test = np.nan, "n/a"
         elif parametric:
-            _, p_raw = stats.ttest_ind(x, y, equal_var=False)
-            test = "Welch t-test"
+            p_raw, test = stats.ttest_ind(x, y, equal_var=False)[1], "Welch t-test"
         else:
-            _, p_raw = stats.mannwhitneyu(x, y, alternative="two-sided")
-            test = "Mann\u2013Whitney U"
-        p_adj = min(1.0, p_raw * n_pairs) if not pd.isna(p_raw) else np.nan
-        rows.append(
-            {
-                "variable": var_label,
-                "group_a": labels[a],
-                "group_b": labels[b],
-                "test": test,
-                "p_raw": p_raw,
-                "p_bonferroni": p_adj,
-                "p_bonferroni_fmt": fmt_p(p_adj),
-            }
-        )
+            p_raw, test = stats.mannwhitneyu(x, y, alternative="two-sided")[1], "Mann\u2013Whitney U"
+        p_adj = min(1.0, p_raw * len(pairs)) if not pd.isna(p_raw) else np.nan
+        rows.append({
+            "variable": var_label, "group_a": labels[a], "group_b": labels[b], "test": test,
+            "p_raw": p_raw, "p_bonferroni": p_adj, "p_bonferroni_fmt": fmt_p(p_adj),
+        })
     return rows
 
 
-def monte_carlo_chi2(x: pd.Series, y: pd.Series, n_perm: int = N_PERM, seed: int = RANDOM_SEED) -> float:
-    """Permutation p-value for the chi-square statistic (for sparse r x c tables)."""
-    xi, x_levels = pd.factorize(x)
-    yi, y_levels = pd.factorize(y)
-    nx, ny = len(x_levels), len(y_levels)
+def monte_carlo_chi2(ct: pd.DataFrame, n_perm: int = N_PERM, seed: int = RANDOM_SEED) -> float:
+    """Permutation p-value for chi-square, built directly from the contingency table."""
+    obs = ct.values
+    nx, ny = obs.shape
+    # rebuild the two label vectors from the table (no raw data needed)
+    xi = np.repeat(np.repeat(np.arange(nx), ny), obs.ravel())
+    yi = np.repeat(np.tile(np.arange(ny), nx), obs.ravel())
 
-    def table(yy):
-        return np.bincount(xi * ny + yy, minlength=nx * ny).reshape(nx, ny)
-
-    obs = table(yi)
-    expected = np.outer(obs.sum(1), obs.sum(0)) / obs.sum()  # marginals invariant under permutation
+    expected = np.outer(obs.sum(1), obs.sum(0)) / obs.sum()
     mask = expected > 0
-    stat_obs = (((obs - expected) ** 2)[mask] / expected[mask]).sum()
+    e = expected[mask]
+    stat_obs = (((obs - expected) ** 2)[mask] / e).sum()
 
     rng = np.random.default_rng(seed)
+    idx = xi * ny
     hits = 0
     for _ in range(n_perm):
-        t = table(rng.permutation(yi))
-        s = (((t - expected) ** 2)[mask] / expected[mask]).sum()
-        if s >= stat_obs - 1e-12:
+        t = np.bincount(idx + rng.permutation(yi), minlength=nx * ny).reshape(nx, ny)
+        if (((t - expected) ** 2)[mask] / e).sum() >= stat_obs - 1e-12:
             hits += 1
     return (hits + 1) / (n_perm + 1)
 
@@ -279,186 +246,166 @@ def monte_carlo_chi2(x: pd.Series, y: pd.Series, n_perm: int = N_PERM, seed: int
 # SUMMARIES
 # ============================================================
 
-def _empty_row_fields(groups, labels) -> dict:
-    return {f"n__{labels[g]}": 0 for g in groups} | {f"stat__{labels[g]}": "" for g in groups}
-
-
-def summarize_numeric(sub: pd.DataFrame, var: str, cohort_col: str, groups, labels):
+def summarize_numeric(data: dict, var: str, groups, labels):
     var_label = VAR_LABELS.get(var, var)
-    data = {g: sub.loc[sub[cohort_col] == g, var].dropna() for g in groups}
+    vals = {g: data[g][var].dropna() for g in groups}
     k = len(groups)
 
-    all_present = all(len(s) > 0 for s in data.values())
-    normal = all(is_normal(s) for s in data.values() if len(s) > 0)
+    all_present = all(len(s) > 0 for s in vals.values())
+    normal = all(is_normal(s) for s in vals.values() if len(s) > 0)
 
-    p, stat_name, posthoc_rows = np.nan, "n/a", []
-    parametric = False
+    p, stat_name, posthoc_rows, parametric = np.nan, "n/a", [], False
 
     if all_present and k == 2:
-        a, b = (data[g] for g in groups)
+        a, b = (vals[g] for g in groups)
         if normal:
-            _, p = stats.ttest_ind(a, b, equal_var=False, nan_policy="omit")
-            stat_name, parametric = "Welch t-test", True
+            p, stat_name, parametric = stats.ttest_ind(a, b, equal_var=False)[1], "Welch t-test", True
         else:
-            _, p = stats.mannwhitneyu(a, b, alternative="two-sided")
-            stat_name = "Mann\u2013Whitney U"
+            p, stat_name = stats.mannwhitneyu(a, b, alternative="two-sided")[1], "Mann\u2013Whitney U"
     elif all_present and k > 2:
-        arrays = [data[g] for g in groups]
+        arrays = [vals[g] for g in groups]
         equal_var = False
         if normal:
             try:
-                _, p_lev = stats.levene(*arrays, center="median")
-                equal_var = p_lev > ALPHA
+                equal_var = stats.levene(*arrays, center="median")[1] > ALPHA
             except ValueError:
-                equal_var = False
+                pass
         if normal and equal_var:
-            _, p = stats.f_oneway(*arrays)
-            stat_name, parametric = "One-way ANOVA", True
+            p, stat_name, parametric = stats.f_oneway(*arrays)[1], "One-way ANOVA", True
         else:
             try:
-                _, p = stats.kruskal(*arrays)
+                p = stats.kruskal(*arrays)[1]
             except ValueError:  # all values identical
                 p = np.nan
             stat_name = "Kruskal\u2013Wallis"
         if not pd.isna(p) and p < ALPHA:
-            posthoc_rows = pairwise_posthoc(data, groups, labels, parametric, var_label)
+            posthoc_rows = pairwise_posthoc(vals, groups, labels, parametric, var_label)
 
-    # descriptive stats: mean ± SD only if the chosen test is parametric
     row = {
-        "variable": var_label,
-        "type": "numeric",
-        "test": stat_name,
-        "p_value": p,
-        "p_value_fmt": fmt_p(p),
+        "var": var, "variable": var_label, "type": "numeric",
+        "test": stat_name, "p_value": p, "p_value_fmt": fmt_p(p),
     }
+    use_mean = parametric or (stat_name == "n/a" and normal)
     for g in groups:
-        s = data[g]
+        s = vals[g]
         row[f"n__{labels[g]}"] = len(s)
         if len(s) == 0:
             row[f"stat__{labels[g]}"] = "-"
-        elif parametric or (stat_name in ("n/a",) and normal):
+        elif use_mean:
             row[f"stat__{labels[g]}"] = f"{s.mean():.2f} \u00b1 {s.std():.2f}"
         else:
-            row[f"stat__{labels[g]}"] = (
-                f"{s.median():.2f} [{s.quantile(.25):.2f}-{s.quantile(.75):.2f}]"
-            )
+            q1, med, q3 = s.quantile([.25, .5, .75])
+            row[f"stat__{labels[g]}"] = f"{med:.2f} [{q1:.2f}-{q3:.2f}]"
 
-    sig_pairs = [
+    row["posthoc"] = "; ".join(
         f"{r['group_a']} vs {r['group_b']} (p={r['p_bonferroni_fmt']})"
         for r in posthoc_rows
         if not pd.isna(r["p_bonferroni"]) and r["p_bonferroni"] < ALPHA
-    ]
-    row["posthoc"] = "; ".join(sig_pairs)
+    )
     return [row], posthoc_rows
 
 
-def summarize_categorical(sub: pd.DataFrame, var: str, cohort_col: str, groups, labels):
+def contingency(data: dict, var: str, groups) -> pd.DataFrame:
+    """Levels x cohorts count table, built per cohort (no concat of raw data)."""
+    cols = {g: data[g][var].value_counts() for g in groups}
+    return pd.DataFrame(cols).reindex(columns=groups).fillna(0).astype(int)
+
+
+def summarize_categorical(data: dict, var: str, groups, labels):
     var_label = VAR_LABELS.get(var, var)
-    valid = sub[[var, cohort_col]].dropna()
-    ct = pd.crosstab(valid[var], valid[cohort_col]).reindex(columns=groups, fill_value=0)
+    ct = contingency(data, var, groups)
 
     p, test_used = np.nan, "n/a"
     if ct.shape[0] >= 2 and (ct.sum(axis=0) > 0).all():
         expected = stats.contingency.expected_freq(ct.values)
         if ct.shape == (2, 2) and (expected < 5).any():
-            _, p = stats.fisher_exact(ct.values)
-            test_used = "Fisher exact"
+            p, test_used = stats.fisher_exact(ct.values)[1], "Fisher exact"
         elif (expected < 1).any() or (expected < 5).mean() > 0.2:
-            p = monte_carlo_chi2(valid[var], valid[cohort_col])
-            test_used = "Chi-square (Monte Carlo)"
+            p, test_used = monte_carlo_chi2(ct), "Chi-square (Monte Carlo)"
         else:
-            _, p, _, _ = stats.chi2_contingency(ct.values)
-            test_used = "Chi-square"
+            p, test_used = stats.chi2_contingency(ct.values)[1], "Chi-square"
 
     tots = ct.sum(axis=0)
-    rows, first = [], True
-    for level in ct.index:
+    rows = []
+    for i, level in enumerate(ct.index):
+        first = i == 0
         row = {
-            "variable": var_label if first else f"{var_label} - {level}",
-            "type": "categorical",
+            "var": var, "variable": f"{var_label} - {level}", "type": "categorical",
             "test": test_used if first else "",
             "p_value": p if first else np.nan,
             "p_value_fmt": fmt_p(p) if first else "",
             "posthoc": "",
         }
-        # first level row: keep the variable name, but add the level so it is readable
-        if first:
-            row["variable"] = f"{var_label} - {level}"
         for g in groups:
-            n = int(ct.loc[level, g])
-            tot = int(tots[g])
-            pct = 100 * n / tot if tot else 0
+            n, tot = int(ct.loc[level, g]), int(tots[g])
             row[f"n__{labels[g]}"] = tot
-            row[f"stat__{labels[g]}"] = f"{n} ({pct:.1f}%)"
+            row[f"stat__{labels[g]}"] = f"{n} ({100 * n / tot if tot else 0:.1f}%)"
         rows.append(row)
-        first = False
     return rows
 
 
-def build_stats_table(sub: pd.DataFrame, cohort_col: str, groups, labels):
+def build_stats_table(data: dict, groups, labels):
     all_rows, posthoc = [], []
     for var in CATEGORICAL_VARS:
-        if var not in sub.columns:
-            print(f"WARNING: categorical variable '{var}' not found, skipped.")
+        if not all(var in data[g].columns for g in groups):
+            print(f"WARNING: categorical variable '{var}' missing in some cohort, skipped.")
             continue
-        all_rows.extend(summarize_categorical(sub, var, cohort_col, groups, labels))
+        all_rows.extend(summarize_categorical(data, var, groups, labels))
     for var in NUMERIC_VARS:
-        if var not in sub.columns:
-            print(f"WARNING: numeric variable '{var}' not found, skipped.")
+        if not all(var in data[g].columns for g in groups):
+            print(f"WARNING: numeric variable '{var}' missing in some cohort, skipped.")
             continue
-        rows, ph = summarize_numeric(sub, var, cohort_col, groups, labels)
+        rows, ph = summarize_numeric(data, var, groups, labels)
         all_rows.extend(rows)
         posthoc.extend(ph)
     return pd.DataFrame(all_rows), pd.DataFrame(posthoc)
 
 
 # ============================================================
-# FIGURES
+# FIGURES (matplotlib on per-cohort arrays, no merged DataFrame)
 # ============================================================
 
-def make_figures(sub: pd.DataFrame, cohort_col: str, groups, labels, stats_df: pd.DataFrame,
-                 fig_dir: Path) -> None:
+def make_figures(data: dict, groups, labels, stats_df: pd.DataFrame, fig_dir: Path) -> None:
     fig_dir.mkdir(parents=True, exist_ok=True)
-    sns.set_style("whitegrid")
-
     order = [labels[g] for g in groups]
-    colors = sns.color_palette("deep", len(groups))
-    palette = dict(zip(order, colors))
-
-    plot_df = sub.copy()
-    plot_df["Cohort"] = plot_df[cohort_col].map(labels)
+    colors = plt.get_cmap("tab10").colors[: len(groups)]
+    rng = np.random.default_rng(RANDOM_SEED)
 
     def title_for(var):
         base = VAR_LABELS.get(var, var)
-        match = stats_df[stats_df["variable"].str.startswith(base)]
-        if match.empty:
+        m = stats_df[stats_df["var"] == var] if "var" in stats_df else stats_df.iloc[0:0]
+        if m.empty:
             return base
-        r = match.iloc[0]
+        r = m.iloc[0]
         return f"{base}\n{r['test']}, p={r['p_value_fmt']}"
 
     for var in NUMERIC_VARS:
-        if var not in plot_df.columns:
+        if not all(var in data[g].columns for g in groups):
             continue
+        vals = [data[g][var].dropna().values for g in groups]
         fig, ax = plt.subplots(figsize=(1.8 * len(groups) + 2, 4.2))
-        sns.boxplot(data=plot_df, x="Cohort", y=var, hue="Cohort", order=order, hue_order=order,
-                    palette=palette, legend=False, ax=ax, showfliers=False)
-        sns.stripplot(data=plot_df, x="Cohort", y=var, order=order, ax=ax,
-                      color="black", alpha=0.3, size=3, jitter=True)
+        bp = ax.boxplot(vals, tick_labels=order, patch_artist=True, showfliers=False)
+        for patch, c in zip(bp["boxes"], colors):
+            patch.set_facecolor(c)
+            patch.set_alpha(0.8)
+        for i, v in enumerate(vals, start=1):
+            ax.scatter(i + rng.uniform(-0.15, 0.15, len(v)), v, s=9, c="black", alpha=0.3)
         ax.set_title(title_for(var), fontsize=10)
-        ax.set_xlabel("")
         ax.set_ylabel(VAR_LABELS.get(var, var))
+        ax.grid(axis="y", alpha=0.3)
         fig.tight_layout()
         fig.savefig(fig_dir / f"boxplot_{var}.png", dpi=200)
         plt.close(fig)
 
     for var in CATEGORICAL_VARS:
-        if var not in plot_df.columns:
+        if not all(var in data[g].columns for g in groups):
             continue
+        ct = contingency(data, var, groups)
+        pct = (ct / ct.sum(axis=0) * 100).T  # cohorts x levels
+        pct.index = order
         fig, ax = plt.subplots(figsize=(1.8 * len(groups) + 3, 4.2))
-        ct = pd.crosstab(plot_df["Cohort"], plot_df[var], normalize="index").reindex(order) * 100
-        ct.plot(kind="bar", stacked=True, ax=ax, colormap="tab10", rot=0)
+        pct.plot(kind="bar", stacked=True, ax=ax, colormap="tab10", rot=0)
         ax.set_ylabel("%")
-        ax.set_xlabel("")
         ax.set_title(title_for(var), fontsize=10)
         ax.legend(title=var, bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
         fig.tight_layout()
@@ -477,29 +424,23 @@ def make_docx_table(stats_df: pd.DataFrame, groups, labels, n_total, output_path
     k = len(groups)
     show_posthoc = k > 2
 
-    # landscape A4 (3+ cohorts need the width)
     section = doc.sections[0]
     section.orientation = WD_ORIENT.LANDSCAPE
-    section.page_width = Cm(29.7)
-    section.page_height = Cm(21.0)
+    section.page_width, section.page_height = Cm(29.7), Cm(21.0)
     for side in ("left_margin", "right_margin", "top_margin", "bottom_margin"):
         setattr(section, side, Cm(1.5))
 
-    title = doc.add_paragraph()
-    run = title.add_run(
+    run = doc.add_paragraph().add_run(
         f"Table 1. Clinical and environmental characteristics of the {k} cohorts"
     )
     run.bold = True
     run.font.size = Pt(12)
 
-    col_headers = ["Variable"]
-    for g in groups:
-        col_headers.append(f"{labels[g]} (n={n_total.get(g, 0)})")
-    col_headers += ["Test", "p"]
+    col_headers = ["Variable"] + [f"{labels[g]} (n={n_total.get(g, 0)})" for g in groups] + ["Test", "p"]
     if show_posthoc:
         col_headers.append("Post-hoc (Bonferroni)")
 
-    usable = 26.7  # cm
+    usable = 26.7
     w_var, w_test, w_p, w_post = 5.5, 3.4, 1.6, (4.5 if show_posthoc else 0.0)
     w_group = (usable - w_var - w_test - w_p - w_post) / k
     widths = [Cm(w_var)] + [Cm(w_group)] * k + [Cm(w_test), Cm(w_p)]
@@ -512,22 +453,22 @@ def make_docx_table(stats_df: pd.DataFrame, groups, labels, n_total, output_path
     for i, w in enumerate(widths):
         table.columns[i].width = w
 
-    hdr_cells = table.rows[0].cells
     for i, htext in enumerate(col_headers):
-        hdr_cells[i].text = htext
-        hdr_cells[i].width = widths[i]
-        for p in hdr_cells[i].paragraphs:
+        cell = table.rows[0].cells[i]
+        cell.text = htext
+        cell.width = widths[i]
+        for p in cell.paragraphs:
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             for r in p.runs:
                 r.bold = True
                 r.font.size = Pt(10)
-        set_cell_bg(hdr_cells[i], "D9D9D9")
+        set_cell_bg(cell, "D9D9D9")
 
-    p_col = 1 + k + 1  # index of the "p" column
+    p_col = 1 + k + 1
+    last = len(col_headers) - 1
     for _, row in stats_df.iterrows():
         cells = table.add_row().cells
-        values = [row["variable"]]
-        values += [row[f"stat__{labels[g]}"] for g in groups]
+        values = [row["variable"]] + [row[f"stat__{labels[g]}"] for g in groups]
         values += [row["test"], row["p_value_fmt"]]
         if show_posthoc:
             values.append(row.get("posthoc", ""))
@@ -538,7 +479,7 @@ def make_docx_table(stats_df: pd.DataFrame, groups, labels, n_total, output_path
             for p in cells[i].paragraphs:
                 p.alignment = WD_ALIGN_PARAGRAPH.LEFT if i == 0 else WD_ALIGN_PARAGRAPH.CENTER
                 for r in p.runs:
-                    r.font.size = Pt(9 if show_posthoc and i == len(values) - 1 else 10)
+                    r.font.size = Pt(9 if show_posthoc and i == last else 10)
                     if i == p_col and sig:
                         r.bold = True
 
@@ -546,17 +487,16 @@ def make_docx_table(stats_df: pd.DataFrame, groups, labels, n_total, output_path
         "Numeric variables: mean \u00b1 SD if normally distributed, otherwise median [IQR]. "
         + (
             "Overall test: one-way ANOVA (normal distribution and homogeneous variances), "
-            "otherwise Kruskal\u2013Wallis; "
-            "post-hoc pairwise Welch t-test (after ANOVA) or Mann\u2013Whitney U (after Kruskal\u2013Wallis), "
-            "Bonferroni-adjusted, reported only for significant overall tests. "
+            "otherwise Kruskal\u2013Wallis; post-hoc pairwise Welch t-test (after ANOVA) or "
+            "Mann\u2013Whitney U (after Kruskal\u2013Wallis), Bonferroni-adjusted, reported only "
+            "for significant overall tests. "
             if show_posthoc
             else "Welch t-test (normal) or Mann\u2013Whitney U. "
         )
         + "Categorical variables: n (%), Chi-square test (Fisher exact for 2x2 tables, "
         "Monte Carlo Chi-square for sparse tables with expected counts <5)."
     )
-    note = doc.add_paragraph()
-    note_run = note.add_run(note_text)
+    note_run = doc.add_paragraph().add_run(note_text)
     note_run.italic = True
     note_run.font.size = Pt(8)
 
@@ -565,35 +505,28 @@ def make_docx_table(stats_df: pd.DataFrame, groups, labels, n_total, output_path
 
 
 # ============================================================
-# MAIN (callable, reusable from the report runner and the CLI)
+# MAIN
 # ============================================================
 
-def run_table1(csv_path: str = CSV_PATH, cohort_mapping_csv: str = COHORT_MAPPING_CSV,
-               output_dir: Path = OUTPUT_DIR) -> None:
+def run_table1(output_dir: Path = OUTPUT_DIR) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig_dir = output_dir / "figures"
 
-    merged = load_data(csv_path, cohort_mapping_csv)
-    sub, groups, labels = resolve_cohorts(merged)
+    data, groups, labels = resolve_cohorts(load_cohorts())
+    n_total = {g: len(d) for g, d in data.items()}
 
-    n_total = sub[COHORT_COL].value_counts().to_dict()
+    stats_df, posthoc_df = build_stats_table(data, groups, labels)
 
-    stats_df, posthoc_df = build_stats_table(sub, COHORT_COL, groups, labels)
-
-    csv_out = output_dir / "table1_stats.csv"
-    stats_df.to_csv(csv_out, index=False)
-    print(f"Statistics CSV saved in: {csv_out}")
+    out_cols = [c for c in stats_df.columns if c != "var"]
+    stats_df[out_cols].to_csv(output_dir / "table1_stats.csv", index=False)
+    print(f"Statistics CSV saved in: {output_dir / 'table1_stats.csv'}")
 
     if not posthoc_df.empty:
-        ph_out = output_dir / "table1_posthoc.csv"
-        posthoc_df.to_csv(ph_out, index=False)
-        print(f"Post-hoc CSV saved in: {ph_out}")
+        posthoc_df.to_csv(output_dir / "table1_posthoc.csv", index=False)
+        print(f"Post-hoc CSV saved in: {output_dir / 'table1_posthoc.csv'}")
 
-    make_figures(sub, COHORT_COL, groups, labels, stats_df, fig_dir)
-
-    docx_out = output_dir / "Table1.docx"
-    make_docx_table(stats_df, groups, labels, n_total, docx_out)
+    make_figures(data, groups, labels, stats_df, output_dir / "figures")
+    make_docx_table(stats_df, groups, labels, n_total, output_dir / "Table1.docx")
 
     print("\nDone. Output in:", output_dir.resolve())
 
