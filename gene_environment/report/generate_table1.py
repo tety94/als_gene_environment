@@ -66,6 +66,17 @@ CSV_PATH = "/srv/python-projects/gene_environment_v2/data/componenti_ambientali_
 
 COHORT_MAPPING_CSV = "output/table1/id_generation_mapping.csv"
 
+# One CSV per cohort (same columns in each). If set, CSV_PATH and the id->generation
+# mapping are ignored: the cohort is taken from the dict key, in this order.
+# None = use CSV_PATH + COHORT_MAPPING_CSV.
+COHORT_CSVS = None
+# Example:
+# COHORT_CSVS = {
+#     "gen1": "/srv/python-projects/gene_environment_v2/data/gen1.csv",
+#     "gen2": "/srv/python-projects/gene_environment_v2/data/gen2.csv",
+#     "gen3": "/srv/python-projects/gene_environment_v2/data/gen3.csv",
+# }
+
 OUTPUT_DIR = Path("output/table1")
 
 ID_COL_CSV = "id"
@@ -117,6 +128,17 @@ RANDOM_SEED = 42
 # ============================================================
 
 def load_data(csv_path: str, cohort_mapping_csv: str) -> pd.DataFrame:
+    if COHORT_CSVS:
+        parts = []
+        for cohort, path in COHORT_CSVS.items():
+            if not Path(path).exists():
+                sys.exit(f"ERROR: file for cohort '{cohort}' not found: {path}")
+            part = pd.read_csv(path)
+            part[COHORT_COL] = cohort
+            print(f"Loaded cohort '{cohort}': {len(part)} rows from {path}")
+            parts.append(part)
+        return pd.concat(parts, ignore_index=True)
+
     print(f"Loading CSV: {csv_path}")
     df = pd.read_csv(csv_path)
     if ID_COL_CSV not in df.columns:
@@ -153,6 +175,8 @@ def resolve_cohorts(merged: pd.DataFrame):
         missing = [v for v in chosen if v not in values]
         if missing:
             sys.exit(f"ERROR: COHORT_VALUES {missing} not present in '{COHORT_COL}'. Found: {values}")
+    elif COHORT_CSVS:
+        chosen = [c for c in COHORT_CSVS if c in values]
     else:
         chosen = values
 
