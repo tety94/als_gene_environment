@@ -69,7 +69,13 @@ COHORT_MAPPING_CSV = "output/table1/id_generation_mapping.csv"
 # One CSV per cohort (same columns in each). If set, CSV_PATH and the id->generation
 # mapping are ignored: the cohort is taken from the dict key, in this order.
 # None = use CSV_PATH + COHORT_MAPPING_CSV.
-COHORT_CSVS = None
+# COHORT_CSVS = None
+
+COHORT_CSVS = {
+    "gen1": "/mnt/cresla_prod/genome_datasets/merged_csv/gen1.csv",
+    "gen2": "/mnt/cresla_prod/genome_datasets/merged_csv/gen2.csv",
+    "gen3": "/mnt/cresla_prod/genome_datasets/merged_csv/gen3.csv",
+}
 # Example:
 # COHORT_CSVS = {
 #     "gen1": "/srv/python-projects/gene_environment_v2/data/gen1.csv",
