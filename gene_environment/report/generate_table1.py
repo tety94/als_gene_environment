@@ -72,9 +72,9 @@ COHORT_MAPPING_CSV = "output/table1/id_generation_mapping.csv"
 # COHORT_CSVS = None
 
 COHORT_CSVS = {
-    "gen1": "/mnt/cresla_prod/genome_datasets/merged_csv/gen1.csv",
-    "gen2": "/mnt/cresla_prod/genome_datasets/merged_csv/gen2.csv",
-    "gen3": "/mnt/cresla_prod/genome_datasets/merged_csv/gen3.csv",
+    "gen1": "/mnt/cresla_prod/genome_datasets/merged_csv/full_chr_gen1_test1.csv",
+    "gen2": "/mnt/cresla_prod/genome_datasets/merged_csv/gen2_variants.csv",
+    "gen3": "/mnt/cresla_prod/genome_datasets/merged_csv/gen3_variants.csv",
 }
 # Example:
 # COHORT_CSVS = {
