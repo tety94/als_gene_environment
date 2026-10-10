@@ -142,12 +142,36 @@ MAP_STYLE = {
     (0, "gen3"): ("D", "#A8DADC", "#1D3557"),
 }
 
+DEBUG = True  # print example rows / ids to understand what does not match
+
 ALPHA = 0.05
 N_PERM = 10000
 RANDOM_SEED = 42
 SHAPIRO_MAX_N = 5000  # shapiro is unreliable/slow above this; subsample
 
 ALL_VARS = CATEGORICAL_VARS + NUMERIC_VARS
+
+
+# ============================================================
+# DEBUG HELPERS
+# ============================================================
+
+def dbg(title: str, obj=None, n: int = 5) -> None:
+    """Print a titled example (DataFrame head, list/set sample, or plain text)."""
+    if not DEBUG:
+        return
+    print(f"\n[DEBUG] {title}")
+    if obj is None:
+        return
+    if isinstance(obj, pd.DataFrame):
+        with pd.option_context("display.max_columns", 30, "display.width", 200):
+            print(obj.head(n).to_string())
+    elif isinstance(obj, (set, frozenset)):
+        print("   ", sorted(obj, key=str)[:n])
+    elif isinstance(obj, (list, tuple)):
+        print("   ", list(obj)[:n])
+    else:
+        print("   ", obj)
 
 
 # ============================================================
@@ -167,6 +191,7 @@ def load_light_genetic(cohort: str, path: str) -> pd.DataFrame:
         cached = pd.read_csv(lp, dtype={ID_COL: str})
         if set(wanted) <= set(cached.columns):
             print(f"  '{cohort}': using cached light file {lp} ({len(cached)} patients)")
+            dbg(f"light genetic '{cohort}' (first rows)", cached)
             return cached
         print(f"  '{cohort}': cache lacks required columns, rebuilding")
 
@@ -190,6 +215,7 @@ def load_light_genetic(cohort: str, path: str) -> pd.DataFrame:
     LIGHT_DIR.mkdir(parents=True, exist_ok=True)
     light.to_csv(lp, index=False)
     print(f"  '{cohort}': light file saved in {lp} ({len(light)} patients)")
+    dbg(f"light genetic '{cohort}' (first rows)", light)
     return light
 
 
@@ -212,6 +238,10 @@ def load_cohorts() -> dict[str, pd.DataFrame]:
     clin[ID_COL] = clin[ID_COL].str.strip()
     clin = clin.drop_duplicates(subset=ID_COL)
     print(f"Clinical file: {len(clin)} patients, columns: {cols}")
+    dbg(f"clinical file: all columns in header ({len(header)})", list(header), n=60)
+    dbg("clinical file (first rows)", clin)
+    dbg("clinical ids (examples)", clin[ID_COL].tolist())
+    dbg("clinical: non-null count per column", clin.notna().sum().to_dict(), n=60)
 
     data, all_ids = {}, {}
     for cohort, path in GENETIC_CSVS.items():
@@ -221,6 +251,9 @@ def load_cohorts() -> dict[str, pd.DataFrame]:
         if GENETIC_COLS:
             sub = sub.merge(light[[ID_COL] + GENETIC_COLS], on=ID_COL, how="left")
         n_lost = len(ids) - len(sub)
+        dbg(f"cohort '{cohort}': genetic ids (examples)", sorted(ids)[:5])
+        dbg(f"cohort '{cohort}': genetic ids NOT in clinical file (examples)", sorted(ids - set(clin[ID_COL])))
+        dbg(f"cohort '{cohort}': after join with clinical (first rows)", sub)
         print(f"Cohort '{cohort}': {len(sub)} patients with clinical data"
               + (f" ({n_lost} genetic ids not found in clinical file)" if n_lost else ""))
         data[cohort] = sub.reset_index(drop=True)
@@ -657,6 +690,12 @@ def load_mutation_csv(path: Path) -> dict[str, dict]:
                 continue
             data[sid] = {"cohort": row["cohort"].strip(), "mutated": int(row["mutated"])}
     print(f"[*] Samples loaded from {path}: {len(data)}")
+    dbg("mutation CSV: first rows (sample_id -> cohort, mutated)",
+        [(k, v["cohort"], v["mutated"]) for k, v in list(data.items())[:5]])
+    cnt = defaultdict(int)
+    for v in data.values():
+        cnt[(v["cohort"], v["mutated"])] += 1
+    dbg("mutation CSV: counts per (cohort, mutated)", dict(sorted(cnt.items())), n=20)
     if duplicates:
         print(f"[!] Duplicate sample_id rows merged: {duplicates}")
     return data
@@ -704,6 +743,9 @@ def fetch_coordinates(sample_ids: list[str]) -> dict[str, dict]:
             if key is not None:
                 coords[str(key)] = {"lat": lat, "lng": lng}
     print(f"[*] Identifiers with coordinates found: {len(coords)}")
+    dbg("db: sample_ids searched (examples)", db_ids)
+    dbg("db: identifiers returned with coordinates (examples)", list(coords.items()))
+    dbg("db: searched ids WITHOUT coordinates (examples)", sorted(set(db_ids) - set(coords)), n=10)
     return coords
 
 
@@ -868,6 +910,12 @@ def run_table1(output_dir: Path = OUTPUT_DIR) -> None:
 
     data, groups, labels = resolve_cohorts(load_cohorts())
     n_total = {g: len(d) for g, d in data.items()}
+    for g in groups:
+        dbg(f"cohort '{g}': non-null count per Table 1 variable (N={len(data[g])})",
+            {v: int(data[g][v].notna().sum()) for v in ALL_VARS if v in data[g].columns}, n=60)
+        missing_v = [v for v in ALL_VARS if v not in data[g].columns]
+        if missing_v:
+            dbg(f"cohort '{g}': variables NOT in dataframe", missing_v, n=60)
 
     stats_df, posthoc_df = build_stats_table(data, groups, labels)
 
