@@ -4,13 +4,13 @@ generate_table1.py
 
 Generates Table 1 (descriptive statistics for k >= 2 cohorts, e.g. G1/G2/G3).
 
-Input modes (no concatenation of the cohorts is ever performed):
-  A) COHORT_CSVS = {"gen1": path, ...}  -> one CSV per cohort
-  B) COHORT_CSVS = None                 -> CSV_PATH + id->generation mapping CSV
-                                           (split per cohort with groupby)
-
-Each cohort is kept as its own DataFrame in a dict {cohort: df}. Only the columns
-needed for Table 1 are read from disk (important for the huge *_variants.csv files).
+Data flow (no concatenation of the cohorts is ever performed):
+  1) From each heavy genetic CSV only the id column (plus optional GENETIC_COLS)
+     is read, in chunks, and saved as a light CSV per cohort in LIGHT_DIR.
+     If the light CSV already exists, the heavy genetic file is NOT read again.
+  2) Clinical/environmental data are read once from CLINICAL_CSV and filtered
+     by the ids of each cohort.
+  3) All statistics are computed on those per-cohort DataFrames.
 
 Statistical tests
   Numeric
@@ -53,23 +53,25 @@ warnings.filterwarnings("ignore")
 # CONFIG — edit here
 # ============================================================
 
-# Mode B (used only if COHORT_CSVS is None)
-CSV_PATH = "/srv/python-projects/gene_environment_v2/data/componenti_ambientali_full.csv"
-COHORT_MAPPING_CSV = "output/table1/id_generation_mapping.csv"
-ID_COL_CSV = "id"
-ID_COL_MAPPING = "id"
-COHORT_COL = "generation"
+# Clinical + environmental data (one row per patient, all cohorts)
+CLINICAL_CSV = "/srv/python-projects/gene_environment_v2/data/componenti_ambientali_full.csv"
+ID_COL = "id"
 
-# Mode A: one CSV per cohort (dict order = table order). None -> mode B.
-COHORT_CSVS = {
+# Heavy genetic files (dict order = table order)
+GENETIC_CSVS = {
     "gen1": "/mnt/cresla_prod/genome_datasets/merged_csv/full_chr_gen1_test1.csv",
     "gen2": "/mnt/cresla_prod/genome_datasets/merged_csv/gen2_variants.csv",
     "gen3": "/mnt/cresla_prod/genome_datasets/merged_csv/gen3_variants.csv",
 }
 
-# If the cohort files have several rows per patient (e.g. one row per variant),
-# keep one row per patient using this column. None = no deduplication.
-DEDUP_ID_COL = "id"
+# Extra columns taken from the genetic files besides ID_COL (only if needed in the table).
+# If a patient has several rows, the first one is kept.
+# If you use them as table variables, also add them to CATEGORICAL_VARS / NUMERIC_VARS.
+GENETIC_COLS: list[str] = []
+
+LIGHT_DIR = Path("output/table1/genetic_light")
+FORCE_REBUILD_LIGHT = False  # True = regenerate light CSVs even if they exist
+CHUNKSIZE = 500_000
 
 OUTPUT_DIR = Path("output/table1")
 
@@ -107,56 +109,85 @@ ALL_VARS = CATEGORICAL_VARS + NUMERIC_VARS
 
 
 # ============================================================
-# DATA LOADING (no concat)
+# DATA LOADING (no concat of cohorts)
 # ============================================================
 
-def _usecols(extra: list[str]):
-    wanted = set(ALL_VARS) | set(extra)
-    return lambda c: c in wanted
+def _light_path(cohort: str) -> Path:
+    return LIGHT_DIR / f"{cohort}_light.csv"
 
 
-def _prepare(df: pd.DataFrame, name: str) -> pd.DataFrame:
-    if DEDUP_ID_COL and DEDUP_ID_COL in df.columns:
-        n0 = len(df)
-        df = df.drop_duplicates(subset=DEDUP_ID_COL)
-        if len(df) < n0:
-            print(f"  '{name}': {n0 - len(df)} duplicate rows removed (by '{DEDUP_ID_COL}')")
-    return df.reset_index(drop=True)
+def load_light_genetic(cohort: str, path: str) -> pd.DataFrame:
+    """Light CSV per cohort: use the cache if it exists, otherwise build it in chunks."""
+    wanted = [ID_COL] + [c for c in GENETIC_COLS if c != ID_COL]
+    lp = _light_path(cohort)
+
+    if lp.exists() and not FORCE_REBUILD_LIGHT:
+        cached = pd.read_csv(lp, dtype={ID_COL: str})
+        if set(wanted) <= set(cached.columns):
+            print(f"  '{cohort}': using cached light file {lp} ({len(cached)} patients)")
+            return cached
+        print(f"  '{cohort}': cache lacks required columns, rebuilding")
+
+    if not Path(path).exists():
+        sys.exit(f"ERROR: genetic file for cohort '{cohort}' not found: {path}")
+    header = pd.read_csv(path, nrows=0).columns
+    missing = [c for c in wanted if c not in header]
+    if missing:
+        sys.exit(f"ERROR: columns {missing} not found in {path}")
+
+    print(f"  '{cohort}': reading heavy file {path} (columns: {wanted}) ...")
+    parts, seen = [], set()
+    for chunk in pd.read_csv(path, usecols=wanted, dtype={ID_COL: str}, chunksize=CHUNKSIZE):
+        chunk[ID_COL] = chunk[ID_COL].str.strip()
+        chunk = chunk.drop_duplicates(subset=ID_COL)
+        chunk = chunk[~chunk[ID_COL].isin(seen)]
+        seen.update(chunk[ID_COL])
+        parts.append(chunk)
+    light = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=wanted)
+
+    LIGHT_DIR.mkdir(parents=True, exist_ok=True)
+    light.to_csv(lp, index=False)
+    print(f"  '{cohort}': light file saved in {lp} ({len(light)} patients)")
+    return light
 
 
 def load_cohorts() -> dict[str, pd.DataFrame]:
-    """Return {cohort: DataFrame}, one DataFrame per cohort."""
-    extra = [c for c in (DEDUP_ID_COL,) if c]
+    """Return {cohort: DataFrame} with clinical/environmental data, one DataFrame per cohort."""
+    if not Path(CLINICAL_CSV).exists():
+        sys.exit(f"ERROR: clinical file not found: {CLINICAL_CSV}")
+    header = pd.read_csv(CLINICAL_CSV, nrows=0).columns
+    if ID_COL not in header:
+        sys.exit(f"ERROR: '{ID_COL}' not in {CLINICAL_CSV}")
 
-    if COHORT_CSVS:
-        data = {}
-        for cohort, path in COHORT_CSVS.items():
-            if not Path(path).exists():
-                sys.exit(f"ERROR: file for cohort '{cohort}' not found: {path}")
-            df = pd.read_csv(path, usecols=_usecols(extra))
-            data[cohort] = _prepare(df, cohort)
-            print(f"Loaded cohort '{cohort}': {len(data[cohort])} patients from {path}")
-        return data
+    # variables coming from the genetic files are not requested from the clinical file
+    clin_vars = [v for v in ALL_VARS if v not in GENETIC_COLS]
+    missing = [v for v in clin_vars if v not in header]
+    if missing:
+        print(f"WARNING: variables not in clinical file (will be skipped): {missing}")
+    cols = [ID_COL] + [v for v in clin_vars if v in header]
 
-    if not Path(COHORT_MAPPING_CSV).exists():
-        sys.exit(
-            f"ERROR: {COHORT_MAPPING_CSV} not found.\n"
-            "Generate it with: python -m gene_environment.report.build_cohort_mapping"
-        )
-    df = pd.read_csv(CSV_PATH, usecols=_usecols([ID_COL_CSV] + extra))
-    gen = pd.read_csv(COHORT_MAPPING_CSV, usecols=[ID_COL_MAPPING, COHORT_COL]).drop_duplicates()
+    clin = pd.read_csv(CLINICAL_CSV, usecols=cols, dtype={ID_COL: str})
+    clin[ID_COL] = clin[ID_COL].str.strip()
+    clin = clin.drop_duplicates(subset=ID_COL)
+    print(f"Clinical file: {len(clin)} patients, columns: {cols}")
 
-    ids_df = df[ID_COL_CSV].drop_duplicates()
-    n_lost = (~ids_df.isin(gen[ID_COL_MAPPING])).sum()
-    if n_lost:
-        print(f"WARNING: {n_lost} patients in CSV not found in cohort mapping (excluded).")
+    data, all_ids = {}, {}
+    for cohort, path in GENETIC_CSVS.items():
+        light = load_light_genetic(cohort, path)
+        ids = set(light[ID_COL])
+        sub = clin[clin[ID_COL].isin(ids)]
+        if GENETIC_COLS:
+            sub = sub.merge(light[[ID_COL] + GENETIC_COLS], on=ID_COL, how="left")
+        n_lost = len(ids) - len(sub)
+        print(f"Cohort '{cohort}': {len(sub)} patients with clinical data"
+              + (f" ({n_lost} genetic ids not found in clinical file)" if n_lost else ""))
+        data[cohort] = sub.reset_index(drop=True)
+        all_ids[cohort] = ids
 
-    cohort_of = gen.set_index(ID_COL_MAPPING)[COHORT_COL]
-    df[COHORT_COL] = df[ID_COL_CSV].map(cohort_of)
-    df = df.dropna(subset=[COHORT_COL])
-    data = {str(c): _prepare(g.drop(columns=COHORT_COL), str(c)) for c, g in df.groupby(COHORT_COL)}
-    for c, g in data.items():
-        print(f"Cohort '{c}': {len(g)} patients")
+    for a, b in combinations(all_ids, 2):
+        overlap = len(all_ids[a] & all_ids[b])
+        if overlap:
+            print(f"WARNING: {overlap} ids present in both '{a}' and '{b}'")
     return data
 
 
@@ -168,7 +199,7 @@ def resolve_cohorts(data: dict[str, pd.DataFrame]):
         if missing:
             sys.exit(f"ERROR: COHORT_VALUES {missing} not present. Found: {found}")
     else:
-        chosen = found if COHORT_CSVS else sorted(found)
+        chosen = found
 
     if len(chosen) < 2:
         sys.exit(f"ERROR: need at least 2 cohorts, found {len(chosen)}: {chosen}")
@@ -358,6 +389,10 @@ def build_stats_table(data: dict, groups, labels):
         rows, ph = summarize_numeric(data, var, groups, labels)
         all_rows.extend(rows)
         posthoc.extend(ph)
+
+    if not all_rows:
+        sys.exit("ERROR: no variable available in all cohorts -> empty table. "
+                 "Check column names in CLINICAL_CSV vs NUMERIC_VARS/CATEGORICAL_VARS.")
     return pd.DataFrame(all_rows), pd.DataFrame(posthoc)
 
 
