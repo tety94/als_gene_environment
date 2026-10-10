@@ -22,13 +22,23 @@ Statistical tests
     r x c with sparse expected       : Monte Carlo chi-square (permutation)
     otherwise                        : Chi-square
 
-Output (OUTPUT_DIR): table1_stats.csv, table1_posthoc.csv, Table1.docx, figures/*.png
+Mutation maps (optional, MAKE_MUTATION_MAP)
+  Reads MUTATION_CSV (columns: sample_id, raw_sample_id, cohort, mutated), matches
+  sample_id with the MySQL db (historicals -> lat/lng) and draws three maps of
+  Piemonte: all patients, carriers only, wild-type only.
+
+Output (OUTPUT_DIR): table1_stats.csv, table1_posthoc.csv, Table1.docx, figures/*.png,
+                     maps/mutation_map_{all,mutated,wildtype}.{png,svg}
 """
 
 from __future__ import annotations
 
+import csv
+import json
 import sys
+import urllib.request
 import warnings
+from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
 
@@ -43,7 +53,10 @@ from docx.shared import Cm, Pt
 from scipy import stats
 
 matplotlib.use("Agg")
+import matplotlib.patches as mpatches  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.patches import PathPatch  # noqa: E402
+from matplotlib.path import Path as MplPath  # noqa: E402  (not pathlib.Path)
 
 from gene_environment.report.word_utils import set_cell_bg
 
@@ -98,6 +111,35 @@ VAR_LABELS = {
     "seminativi_1000": "Arable land within 1000 m (%)",
     "vigneti_1000": "Vineyards within 1000 m (%)",
     "risaie_1000": "Rice fields within 1000 m (%)",
+}
+
+# --- Mutation maps -------------------------------------------------------
+MAKE_MUTATION_MAP = True
+MUTATION_CSV = Path("mutation_16_73748810_A_G.csv")  # sample_id, raw_sample_id, cohort, mutated
+MAP_DIR = OUTPUT_DIR / "maps"
+MAP_BASE_TITLE = "Variant 16:73748810 A>G \u2014 Cohorts gen1 \u00b7 gen2 \u00b7 gen3"
+
+DB_CONFIG = {
+    "host":     "localhost",
+    "user":     "root",
+    "password": "root",
+    "database": "cresla_definitivo",
+}
+
+REGIONS_GEOJSON_URL = (
+    "https://raw.githubusercontent.com/openpolis/geojson-italy/"
+    "master/geojson/limits_IT_regions.geojson"
+)
+REGION_NAME = "Piemonte"
+
+# Style per mutation status x cohort: (marker, facecolor, edgecolor)
+MAP_STYLE = {
+    (1, "gen1"): ("o", "#E63946", "#8B0000"),
+    (1, "gen2"): ("s", "#FF6B35", "#8B3000"),
+    (1, "gen3"): ("D", "#C77DFF", "#5A009B"),
+    (0, "gen1"): ("o", "#457B9D", "#1D3557"),
+    (0, "gen2"): ("s", "#2EC4B6", "#0A7C75"),
+    (0, "gen3"): ("D", "#A8DADC", "#1D3557"),
 }
 
 ALPHA = 0.05
@@ -540,6 +582,283 @@ def make_docx_table(stats_df: pd.DataFrame, groups, labels, n_total, output_path
 
 
 # ============================================================
+# MUTATION MAPS (carriers / wild-type on Piemonte)
+# ============================================================
+
+def fetch_geojson(url: str) -> dict:
+    print(f"[*] Downloading regional boundaries from:\n    {url}")
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def extract_region_polygons(geojson: dict, region_name: str) -> list[list[tuple]]:
+    """(lng, lat) rings of all polygons of a region."""
+    rings = []
+    for feature in geojson.get("features", []):
+        props = feature.get("properties", {})
+        name = (props.get("reg_name") or props.get("NOME_REG")
+                or props.get("name") or props.get("NAME_1") or "")
+        if region_name.lower() not in name.lower():
+            continue
+        geom = feature.get("geometry", {})
+        gtype, coords = geom.get("type", ""), geom.get("coordinates", [])
+        if gtype == "Polygon":
+            for ring in coords:
+                rings.append([(x, y) for x, y in ring])
+        elif gtype == "MultiPolygon":
+            for poly in coords:
+                for ring in poly:
+                    rings.append([(x, y) for x, y in ring])
+    return rings
+
+
+def rings_to_patch(rings: list[list[tuple]], **kwargs) -> PathPatch:
+    verts, codes = [], []
+    for ring in rings:
+        if not ring:
+            continue
+        verts += ring + [ring[0]]
+        codes += [MplPath.MOVETO] + [MplPath.LINETO] * (len(ring) - 1) + [MplPath.CLOSEPOLY]
+    return PathPatch(MplPath(verts, codes), **kwargs)
+
+
+def point_in_polygon(x: float, y: float, ring: list[tuple]) -> bool:
+    """Ray casting."""
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def point_in_region(lng: float, lat: float, rings: list[list[tuple]]) -> bool:
+    return any(point_in_polygon(lng, lat, ring) for ring in rings)
+
+
+def load_mutation_csv(path: Path) -> dict[str, dict]:
+    """{sample_id: {cohort, mutated}}; sample_id is the code that matches the db."""
+    data, duplicates = {}, 0
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        missing = {"sample_id", "cohort", "mutated"} - set(reader.fieldnames or [])
+        if missing:
+            raise RuntimeError(f"columns missing in {path}: {sorted(missing)}")
+        for row in reader:
+            sid = row["sample_id"].strip()
+            if not sid:
+                continue
+            if sid in data:
+                duplicates += 1
+                data[sid]["mutated"] = max(data[sid]["mutated"], int(row["mutated"]))
+                continue
+            data[sid] = {"cohort": row["cohort"].strip(), "mutated": int(row["mutated"])}
+    print(f"[*] Samples loaded from {path}: {len(data)}")
+    if duplicates:
+        print(f"[!] Duplicate sample_id rows merged: {duplicates}")
+    return data
+
+
+def fetch_coordinates(sample_ids: list[str]) -> dict[str, dict]:
+    """Query MySQL -> {identifier: {lat, lng}}."""
+    import mysql.connector  # lazy: Table 1 works even without the MySQL driver
+
+    print(f"[*] Connecting to MySQL ({DB_CONFIG['database']})...")
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor(dictionary=True)
+
+    db_ids = list(set(sample_ids))
+    if not db_ids:
+        cursor.close(); conn.close()
+        return {}
+    ph = ", ".join(["%s"] * len(db_ids))
+
+    query = f"""
+        SELECT h.parals_codals, h.lat, h.lng, cg.dna AS codice_genoma
+        FROM registro_codici_mutaz cg
+        INNER JOIN historicals h ON h.parals_codals = cg.parals_codals
+        INNER JOIN zxhf3 z       ON z.sample = cg.dna
+        WHERE cg.dna IN ({ph})
+          AND h.lat IS NOT NULL AND h.lng IS NOT NULL
+
+        UNION
+
+        SELECT h.parals_codals, h.lat, h.lng, cg.codice_genoma
+        FROM codici_genoma cg
+        INNER JOIN historicals h ON h.parals_codals = cg.parals_codals
+        INNER JOIN zxhf3 z       ON z.sample = cg.codice_genoma
+        WHERE cg.codice_genoma IN ({ph})
+          AND h.lat IS NOT NULL AND h.lng IS NOT NULL
+    """
+    cursor.execute(query, db_ids + db_ids)
+    rows = cursor.fetchall()
+    cursor.close(); conn.close()
+
+    coords = {}
+    for row in rows:
+        lat, lng = float(row["lat"]), float(row["lng"])
+        for key in (row["codice_genoma"], row["parals_codals"]):
+            if key is not None:
+                coords[str(key)] = {"lat": lat, "lng": lng}
+    print(f"[*] Identifiers with coordinates found: {len(coords)}")
+    return coords
+
+
+def build_plot_data(mutation_data: dict, coordinates: dict, region_rings=None) -> list[dict]:
+    points, missing, outside = [], 0, 0
+    for sample_id, info in mutation_data.items():
+        if sample_id not in coordinates:
+            missing += 1
+            continue
+        lat, lng = coordinates[sample_id]["lat"], coordinates[sample_id]["lng"]
+        if region_rings and not point_in_region(lng, lat, region_rings):
+            outside += 1
+            continue
+        points.append({"sample_id": sample_id, "cohort": info["cohort"],
+                       "mutated": info["mutated"], "lat": lat, "lng": lng})
+    if missing:
+        print(f"[!] Samples without coordinates (excluded): {missing}")
+    if outside:
+        print(f"[!] Samples outside the region (excluded): {outside}")
+    print(f"[*] Points to plot: {len(points)}")
+    return points
+
+
+def _setup_axes(fig, region_rings, use_cartopy):
+    if region_rings:
+        all_x = [x for ring in region_rings for x, _ in ring]
+        all_y = [y for ring in region_rings for _, y in ring]
+        pad = 0.15
+        x_min, x_max = min(all_x) - pad, max(all_x) + pad
+        y_min, y_max = min(all_y) - pad, max(all_y) + pad
+    else:
+        x_min, x_max, y_min, y_max = 6.6, 9.2, 43.8, 46.5
+
+    if use_cartopy:
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+        proj = ccrs.PlateCarree()
+        ax = fig.add_subplot(1, 1, 1, projection=proj)
+        ax.set_extent([x_min, x_max, y_min, y_max], crs=proj)
+        ax.add_feature(cfeature.LAND,      facecolor="#F0EDE8", zorder=0)
+        ax.add_feature(cfeature.OCEAN,     facecolor="#D6E8F7", zorder=0)
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor="#999", zorder=1)
+        ax.add_feature(cfeature.BORDERS,   linewidth=0.5, edgecolor="#BBB", zorder=1)
+        ax.add_feature(cfeature.RIVERS,    linewidth=0.3, edgecolor="#9EC8E0", zorder=1)
+        ax.add_feature(
+            cfeature.NaturalEarthFeature("cultural", "admin_1_states_provinces_lines", "10m"),
+            linewidth=0.3, edgecolor="#CCC", facecolor="none", zorder=1,
+        )
+        transform = ccrs.PlateCarree()
+    else:
+        ax = fig.add_subplot(1, 1, 1)
+        ax.set_facecolor("#EEF2F5")
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.grid(True, linewidth=0.4, color="#DDD", zorder=0)
+        ax.set_xlabel("Longitude", fontsize=10)
+        ax.set_ylabel("Latitude", fontsize=10)
+        transform = None
+
+    if region_rings:
+        ax.add_patch(rings_to_patch(region_rings, facecolor="#FFFDE7", edgecolor="#E65100",
+                                    linewidth=1.6, zorder=2, alpha=0.55))
+        ax.add_patch(rings_to_patch(region_rings, facecolor="none", edgecolor="#E65100",
+                                    linewidth=1.6, zorder=3))
+    return ax, transform
+
+
+def render_mutation_map(points, region_rings, out_png: Path, out_svg: Path, title: str) -> None:
+    try:
+        import cartopy.crs  # noqa: F401
+        use_cartopy = True
+    except ImportError:
+        use_cartopy = False
+        print("[!] cartopy not found - map rendered without geographic background.")
+
+    fig = plt.figure(figsize=(14, 12), dpi=150)
+    ax, transform = _setup_axes(fig, region_rings, use_cartopy)
+
+    groups = defaultdict(list)
+    for p in points:
+        groups[(p["mutated"], p["cohort"])].append(p)
+
+    legend_handles, labels_seen = [], set()
+    for (mutated, cohort), pts in sorted(groups.items()):
+        marker, fc, ec = MAP_STYLE.get((mutated, cohort), ("o", "#888", "#333"))
+        kw = dict(marker=marker, s=70 if mutated else 40, c=fc, edgecolors=ec,
+                  linewidths=0.8, alpha=0.88, zorder=7)
+        xs, ys = [p["lng"] for p in pts], [p["lat"] for p in pts]
+        if use_cartopy:
+            ax.scatter(xs, ys, transform=transform, **kw)
+        else:
+            ax.scatter(xs, ys, **kw)
+        label = f"{'Carrier' if mutated else 'Wild-type'} \u2014 {cohort}"
+        if label not in labels_seen:
+            labels_seen.add(label)
+            legend_handles.append(mpatches.Patch(facecolor=fc, edgecolor=ec, label=label))
+
+    if region_rings:
+        legend_handles.append(mpatches.Patch(facecolor="#FFFDE7", edgecolor="#E65100",
+                                             linewidth=1.5, label=f"{REGION_NAME} boundary"))
+
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=14)
+    ax.legend(handles=legend_handles, loc="lower left", fontsize=9, framealpha=0.92,
+              edgecolor="#CCC", title="Legend", title_fontsize=9)
+
+    n_mut = sum(1 for p in points if p["mutated"] == 1)
+    fig.text(0.98, 0.02,
+             f"n={len(points)}  |  Carriers: {n_mut}  |  Wild-type: {len(points) - n_mut}",
+             ha="right", va="bottom", fontsize=8, color="#666")
+
+    plt.tight_layout()
+    fig.savefig(out_png, dpi=150, bbox_inches="tight")
+    print(f"[+] PNG saved: {out_png}")
+    fig.savefig(out_svg, format="svg", bbox_inches="tight")
+    print(f"[+] SVG saved: {out_svg}")
+    plt.close(fig)
+
+
+def run_mutation_maps(map_dir: Path = MAP_DIR) -> None:
+    map_dir = Path(map_dir)
+    map_dir.mkdir(parents=True, exist_ok=True)
+
+    mutation_data = load_mutation_csv(MUTATION_CSV)
+    coordinates = fetch_coordinates(list(mutation_data))
+
+    region_rings = []
+    try:
+        region_rings = extract_region_polygons(fetch_geojson(REGIONS_GEOJSON_URL), REGION_NAME)
+        if region_rings:
+            print(f"[+] {REGION_NAME} boundary loaded ({len(region_rings)} polygons)")
+        else:
+            print(f"[!] {REGION_NAME} not found in GeoJSON - map will have no boundary")
+    except Exception as exc:
+        print(f"[!] Could not download boundaries: {exc}\n    Map will have no region outline.")
+
+    points = build_plot_data(mutation_data, coordinates, region_rings)
+    if not points:
+        raise RuntimeError("no points to plot (check sample_id vs database codes)")
+
+    subsets = [
+        ("all",      points,                                       "all patients"),
+        ("mutated",  [p for p in points if p["mutated"] == 1],     "carriers (\u22651 mutated allele)"),
+        ("wildtype", [p for p in points if p["mutated"] == 0],     "wild-type"),
+    ]
+    for tag, pts, desc in subsets:
+        print(f"\n--- Map: {desc} ---")
+        render_mutation_map(
+            pts, region_rings,
+            out_png=map_dir / f"mutation_map_{tag}.png",
+            out_svg=map_dir / f"mutation_map_{tag}.svg",
+            title=f"Geographic distribution \u2014 {desc}\n{MAP_BASE_TITLE}",
+        )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -568,6 +887,17 @@ def run_table1(output_dir: Path = OUTPUT_DIR) -> None:
 
 def main() -> None:
     run_table1()
+
+    if MAKE_MUTATION_MAP:
+        if not MUTATION_CSV.is_file():
+            print(f"\n[!] Mutation map skipped: {MUTATION_CSV} not found "
+                  f"(put it in the folder where the script runs).")
+            return
+        print("\n=== Mutation maps ===")
+        try:
+            run_mutation_maps()
+        except Exception as exc:  # the map must never invalidate Table 1
+            print(f"[!] Mutation maps failed: {exc}")
 
 
 if __name__ == "__main__":
