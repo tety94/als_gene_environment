@@ -67,20 +67,9 @@ def _run_subprocess(module: str) -> None:
     if result.returncode != 0:
         raise RuntimeError(f"{module} exited with code {result.returncode}")
 
-
 def _run_table1() -> None:
-    from gene_environment.report.generate_table1 import COHORT_MAPPING_CSV
-
-    # Table 1 needs the id -> generation mapping CSV that
-    # build_cohort_mapping.py produces by reading VCF headers. Generate it
-    # automatically if it's missing, rather than failing -- that mapping
-    # only needs to be rebuilt when the VCF sample sets change, so if it's
-    # already there we leave it alone and reuse it as-is.
-    if not Path(COHORT_MAPPING_CSV).exists():
-        log.info("Cohort mapping CSV not found (%s) -- generating it first.", COHORT_MAPPING_CSV)
-        print(f"Cohort mapping CSV not found ({COHORT_MAPPING_CSV}) -- generating it first...")
-        _run_subprocess("gene_environment.report.build_cohort_mapping")
-
+    # Table 1 builds its cohorts from the genetic CSVs (light cache in
+    # output/table1/genetic_light/), so no id -> generation mapping is needed.
     _run_subprocess("gene_environment.report.generate_table1")
 
 
