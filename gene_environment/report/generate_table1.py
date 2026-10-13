@@ -2,15 +2,15 @@
 """
 generate_table1.py
 
-Generates Table 1 (descriptive statistics for k >= 2 cohorts, e.g. G1/G2/G3).
+Generates Table 1 (descriptive statistics for k >= 2 cohorts) from a single CSV.
 
-Data flow (no concatenation of the cohorts is ever performed):
-  1) From each heavy genetic CSV only the id column (plus optional GENETIC_COLS)
-     is read, in chunks, and saved as a light CSV per cohort in LIGHT_DIR.
-     If the light CSV already exists, the heavy genetic file is NOT read again.
-  2) Clinical/environmental data are read once from CLINICAL_CSV and filtered
-     by the ids of each cohort.
-  3) All statistics are computed on those per-cohort DataFrames.
+Input: TABLE1_CSV with columns
+  sample, gen, mutaz, id, parals_codals, sex, onset_site, onset_age,
+  diagnostic_delay, survival, seminativi_<r>, vigneti_<r>, risaie_<r> (r = radius in m)
+
+  - cohorts      -> column `gen`
+  - carrier flag -> column `mutaz` (>= 1 = carrier, 0 = wild-type)
+  - map join     -> column `parals_codals` (matched with MySQL table `historicals`)
 
 Statistical tests
   Numeric
@@ -22,18 +22,12 @@ Statistical tests
     r x c with sparse expected       : Monte Carlo chi-square (permutation)
     otherwise                        : Chi-square
 
-Mutation maps (optional, MAKE_MUTATION_MAP)
-  Reads MUTATION_CSV (columns: sample_id, raw_sample_id, cohort, mutated), matches
-  sample_id with the MySQL db (historicals -> lat/lng) and draws three maps of
-  Piemonte: all patients, carriers only, wild-type only.
-
 Output (OUTPUT_DIR): table1_stats.csv, table1_posthoc.csv, Table1.docx, figures/*.png,
                      maps/mutation_map_{all,mutated,wildtype}.{png,svg}
 """
 
 from __future__ import annotations
 
-import csv
 import json
 import sys
 import urllib.request
@@ -58,7 +52,19 @@ import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.patches import PathPatch  # noqa: E402
 from matplotlib.path import Path as MplPath  # noqa: E402  (not pathlib.Path)
 
-from gene_environment.report.word_utils import set_cell_bg
+try:
+    from gene_environment.report.word_utils import set_cell_bg
+except ImportError:  # fallback if the package is not importable
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    def set_cell_bg(cell, color_hex: str) -> None:
+        tcPr = cell._tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), color_hex)
+        tcPr.append(shd)
 
 warnings.filterwarnings("ignore")
 
@@ -66,38 +72,27 @@ warnings.filterwarnings("ignore")
 # CONFIG — edit here
 # ============================================================
 
-# Clinical + environmental data (one row per patient, all cohorts)
-CLINICAL_CSV = "/srv/python-projects/gene_environment_v2/data/componenti_ambientali_full.csv"
+TABLE1_CSV = Path("table1.csv")
+
 ID_COL = "id"
+COHORT_COL = "gen"
+MUT_COL = "mutaz"
+CODALS_COL = "parals_codals"
 
-# Heavy genetic files (dict order = table order)
-GENETIC_CSVS = {
-    "gen1": "/mnt/cresla_prod/genome_datasets/merged_csv/full_chr_gen1_test1.csv",
-    "gen2": "/mnt/cresla_prod/genome_datasets/merged_csv/gen2_variants.csv",
-    "gen3": "/mnt/cresla_prod/genome_datasets/merged_csv/gen3_variants.csv",
-}
-
-# Extra columns taken from the genetic files besides ID_COL (only if needed in the table).
-# If a patient has several rows, the first one is kept.
-# If you use them as table variables, also add them to CATEGORICAL_VARS / NUMERIC_VARS.
-GENETIC_COLS: list[str] = []
-
-LIGHT_DIR = Path("output/table1/genetic_light")
-FORCE_REBUILD_LIGHT = False  # True = regenerate light CSVs even if they exist
-CHUNKSIZE = 500_000
+# None = all cohorts found in COHORT_COL (sorted). Example: ["gen1", "gen2", "gen3"]
+COHORT_VALUES = ["gen1", "gen2", "gen3"]
+COHORT_LABELS = None  # e.g. {"gen1": "G1 (PARALS)", "gen2": "G2", "gen3": "G3"}
 
 OUTPUT_DIR = Path("output/table1")
 
-# None = all cohorts found. Example: ["gen1", "gen2", "gen3"]
-COHORT_VALUES = None
-COHORT_LABELS = None  # e.g. {"gen1": "G1 (PARALS)", "gen2": "G2", "gen3": "G3"}
-
 CATEGORICAL_VARS = ["sex", "onset_site"]
-NUMERIC_VARS = [
-    "diagnostic_delay", "onset_age", "survival",
-    "seminativi_1500", "vigneti_1500", "risaie_1500",
-    "seminativi_1000", "vigneti_1000", "risaie_1000",
-]
+CLINICAL_NUMERIC = ["diagnostic_delay", "onset_age", "survival"]
+
+# Radii (m) of the environmental variables to include in the table
+ENV_RADII = [1500, 1000]
+ENV_CLASSES = {"seminativi": "Arable land", "vigneti": "Vineyards", "risaie": "Rice fields"}
+
+NUMERIC_VARS = CLINICAL_NUMERIC + [f"{c}_{r}" for r in ENV_RADII for c in ENV_CLASSES]
 
 VAR_LABELS = {
     "sex": "Sex",
@@ -105,17 +100,13 @@ VAR_LABELS = {
     "diagnostic_delay": "Diagnostic delay (months)",
     "onset_age": "Age at onset (years)",
     "survival": "Survival (years)",
-    "seminativi_1500": "Arable land within 1500 m (%)",
-    "vigneti_1500": "Vineyards within 1500 m (%)",
-    "risaie_1500": "Rice fields within 1500 m (%)",
-    "seminativi_1000": "Arable land within 1000 m (%)",
-    "vigneti_1000": "Vineyards within 1000 m (%)",
-    "risaie_1000": "Rice fields within 1000 m (%)",
 }
+for _r in ENV_RADII:
+    for _c, _name in ENV_CLASSES.items():
+        VAR_LABELS[f"{_c}_{_r}"] = f"{_name} within {_r} m (%)"
 
 # --- Mutation maps -------------------------------------------------------
 MAKE_MUTATION_MAP = True
-MUTATION_CSV = Path("mutation_16_73748810_A_G.csv")  # sample_id, raw_sample_id, cohort, mutated
 MAP_DIR = OUTPUT_DIR / "maps"
 MAP_BASE_TITLE = "Variant 16:73748810 A>G \u2014 Cohorts gen1 \u00b7 gen2 \u00b7 gen3"
 
@@ -142,22 +133,21 @@ MAP_STYLE = {
     (0, "gen3"): ("D", "#A8DADC", "#1D3557"),
 }
 
-DEBUG = True  # print example rows / ids to understand what does not match
+DEBUG = True
 
 ALPHA = 0.05
 N_PERM = 10000
 RANDOM_SEED = 42
-SHAPIRO_MAX_N = 5000  # shapiro is unreliable/slow above this; subsample
+SHAPIRO_MAX_N = 5000
 
 ALL_VARS = CATEGORICAL_VARS + NUMERIC_VARS
 
 
 # ============================================================
-# DEBUG HELPERS
+# DEBUG HELPER
 # ============================================================
 
 def dbg(title: str, obj=None, n: int = 5) -> None:
-    """Print a titled example (DataFrame head, list/set sample, or plain text)."""
     if not DEBUG:
         return
     print(f"\n[DEBUG] {title}")
@@ -175,112 +165,61 @@ def dbg(title: str, obj=None, n: int = 5) -> None:
 
 
 # ============================================================
-# DATA LOADING (no concat of cohorts)
+# DATA LOADING
 # ============================================================
 
-def _light_path(cohort: str) -> Path:
-    return LIGHT_DIR / f"{cohort}_light.csv"
+def load_table() -> pd.DataFrame:
+    """Read table1.csv and normalise types."""
+    if not TABLE1_CSV.exists():
+        sys.exit(f"ERROR: file not found: {TABLE1_CSV}")
+    df = pd.read_csv(TABLE1_CSV, dtype={ID_COL: str, CODALS_COL: str, "sample": str})
 
+    for col in (ID_COL, COHORT_COL):
+        if col not in df.columns:
+            sys.exit(f"ERROR: column '{col}' not in {TABLE1_CSV}. Found: {list(df.columns)}")
 
-def load_light_genetic(cohort: str, path: str) -> pd.DataFrame:
-    """Light CSV per cohort: use the cache if it exists, otherwise build it in chunks."""
-    wanted = [ID_COL] + [c for c in GENETIC_COLS if c != ID_COL]
-    lp = _light_path(cohort)
+    df[ID_COL] = df[ID_COL].str.strip()
+    df[COHORT_COL] = df[COHORT_COL].astype(str).str.strip()
+    if CODALS_COL in df.columns:
+        df[CODALS_COL] = df[CODALS_COL].str.strip()
+    if MUT_COL in df.columns:
+        df[MUT_COL] = pd.to_numeric(df[MUT_COL], errors="coerce")
 
-    if lp.exists() and not FORCE_REBUILD_LIGHT:
-        cached = pd.read_csv(lp, dtype={ID_COL: str})
-        if set(wanted) <= set(cached.columns):
-            print(f"  '{cohort}': using cached light file {lp} ({len(cached)} patients)")
-            dbg(f"light genetic '{cohort}' (first rows)", cached)
-            return cached
-        print(f"  '{cohort}': cache lacks required columns, rebuilding")
+    for v in NUMERIC_VARS:
+        if v in df.columns:
+            df[v] = pd.to_numeric(df[v], errors="coerce")
+    for v in CATEGORICAL_VARS:
+        if v in df.columns:
+            df[v] = df[v].astype("string").str.strip()
 
-    if not Path(path).exists():
-        sys.exit(f"ERROR: genetic file for cohort '{cohort}' not found: {path}")
-    header = pd.read_csv(path, nrows=0).columns
-    missing = [c for c in wanted if c not in header]
+    n0 = len(df)
+    df = df.drop_duplicates(subset=ID_COL)
+    print(f"{TABLE1_CSV}: {n0} rows, {len(df)} unique ids")
+    if n0 != len(df):
+        print(f"WARNING: {n0 - len(df)} duplicated ids removed")
+
+    missing = [v for v in ALL_VARS if v not in df.columns]
     if missing:
-        sys.exit(f"ERROR: columns {missing} not found in {path}")
+        print(f"WARNING: variables not in CSV (will be skipped): {missing}")
 
-    print(f"  '{cohort}': reading heavy file {path} (columns: {wanted}) ...")
-    parts, seen = [], set()
-    for chunk in pd.read_csv(path, usecols=wanted, dtype={ID_COL: str}, chunksize=CHUNKSIZE):
-        chunk[ID_COL] = chunk[ID_COL].str.strip()
-        chunk = chunk.drop_duplicates(subset=ID_COL)
-        chunk = chunk[~chunk[ID_COL].isin(seen)]
-        seen.update(chunk[ID_COL])
-        parts.append(chunk)
-    light = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=wanted)
-
-    LIGHT_DIR.mkdir(parents=True, exist_ok=True)
-    light.to_csv(lp, index=False)
-    print(f"  '{cohort}': light file saved in {lp} ({len(light)} patients)")
-    dbg(f"light genetic '{cohort}' (first rows)", light)
-    return light
+    dbg("table1 (first rows)", df)
+    dbg("patients per cohort", df[COHORT_COL].value_counts().to_dict(), n=20)
+    dbg("non-null count per variable",
+        {v: int(df[v].notna().sum()) for v in ALL_VARS if v in df.columns}, n=60)
+    return df
 
 
-def load_cohorts() -> dict[str, pd.DataFrame]:
-    """Return {cohort: DataFrame} with clinical/environmental data, one DataFrame per cohort."""
-    if not Path(CLINICAL_CSV).exists():
-        sys.exit(f"ERROR: clinical file not found: {CLINICAL_CSV}")
-    header = pd.read_csv(CLINICAL_CSV, nrows=0).columns
-    if ID_COL not in header:
-        sys.exit(f"ERROR: '{ID_COL}' not in {CLINICAL_CSV}")
-
-    # variables coming from the genetic files are not requested from the clinical file
-    clin_vars = [v for v in ALL_VARS if v not in GENETIC_COLS]
-    missing = [v for v in clin_vars if v not in header]
+def split_cohorts(df: pd.DataFrame):
+    found = sorted(df[COHORT_COL].dropna().unique())
+    chosen = list(COHORT_VALUES) if COHORT_VALUES is not None else found
+    missing = [v for v in chosen if v not in found]
     if missing:
-        print(f"WARNING: variables not in clinical file (will be skipped): {missing}")
-    cols = [ID_COL] + [v for v in clin_vars if v in header]
-
-    clin = pd.read_csv(CLINICAL_CSV, usecols=cols, dtype={ID_COL: str})
-    clin[ID_COL] = clin[ID_COL].str.strip()
-    clin = clin.drop_duplicates(subset=ID_COL)
-    print(f"Clinical file: {len(clin)} patients, columns: {cols}")
-    dbg(f"clinical file: all columns in header ({len(header)})", list(header), n=60)
-    dbg("clinical file (first rows)", clin)
-    dbg("clinical ids (examples)", clin[ID_COL].tolist())
-    dbg("clinical: non-null count per column", clin.notna().sum().to_dict(), n=60)
-
-    data, all_ids = {}, {}
-    for cohort, path in GENETIC_CSVS.items():
-        light = load_light_genetic(cohort, path)
-        ids = set(light[ID_COL])
-        sub = clin[clin[ID_COL].isin(ids)]
-        if GENETIC_COLS:
-            sub = sub.merge(light[[ID_COL] + GENETIC_COLS], on=ID_COL, how="left")
-        n_lost = len(ids) - len(sub)
-        dbg(f"cohort '{cohort}': genetic ids (examples)", sorted(ids)[:5])
-        dbg(f"cohort '{cohort}': genetic ids NOT in clinical file (examples)", sorted(ids - set(clin[ID_COL])))
-        dbg(f"cohort '{cohort}': after join with clinical (first rows)", sub)
-        print(f"Cohort '{cohort}': {len(sub)} patients with clinical data"
-              + (f" ({n_lost} genetic ids not found in clinical file)" if n_lost else ""))
-        data[cohort] = sub.reset_index(drop=True)
-        all_ids[cohort] = ids
-
-    for a, b in combinations(all_ids, 2):
-        overlap = len(all_ids[a] & all_ids[b])
-        if overlap:
-            print(f"WARNING: {overlap} ids present in both '{a}' and '{b}'")
-    return data
-
-
-def resolve_cohorts(data: dict[str, pd.DataFrame]):
-    found = list(data)
-    if COHORT_VALUES is not None:
-        chosen = list(COHORT_VALUES)
-        missing = [v for v in chosen if v not in data]
-        if missing:
-            sys.exit(f"ERROR: COHORT_VALUES {missing} not present. Found: {found}")
-    else:
-        chosen = found
-
+        sys.exit(f"ERROR: cohorts {missing} not present. Found: {found}")
     if len(chosen) < 2:
         sys.exit(f"ERROR: need at least 2 cohorts, found {len(chosen)}: {chosen}")
 
     labels = {v: str(v) for v in chosen} | (COHORT_LABELS or {})
-    data = {g: data[g] for g in chosen}
+    data = {g: df[df[COHORT_COL] == g].reset_index(drop=True) for g in chosen}
     print(f"Selected cohorts: {chosen} -> N = { {g: len(d) for g, d in data.items()} }")
     return data, chosen, labels
 
@@ -329,7 +268,6 @@ def monte_carlo_chi2(ct: pd.DataFrame, n_perm: int = N_PERM, seed: int = RANDOM_
     """Permutation p-value for chi-square, built directly from the contingency table."""
     obs = ct.values
     nx, ny = obs.shape
-    # rebuild the two label vectors from the table (no raw data needed)
     xi = np.repeat(np.repeat(np.arange(nx), ny), obs.ravel())
     yi = np.repeat(np.tile(np.arange(ny), nx), obs.ravel())
 
@@ -412,7 +350,7 @@ def summarize_numeric(data: dict, var: str, groups, labels):
 
 
 def contingency(data: dict, var: str, groups) -> pd.DataFrame:
-    """Levels x cohorts count table, built per cohort (no concat of raw data)."""
+    """Levels x cohorts count table."""
     cols = {g: data[g][var].value_counts() for g in groups}
     return pd.DataFrame(cols).reindex(columns=groups).fillna(0).astype(int)
 
@@ -454,25 +392,24 @@ def build_stats_table(data: dict, groups, labels):
     all_rows, posthoc = [], []
     for var in CATEGORICAL_VARS:
         if not all(var in data[g].columns for g in groups):
-            print(f"WARNING: categorical variable '{var}' missing in some cohort, skipped.")
+            print(f"WARNING: categorical variable '{var}' missing, skipped.")
             continue
         all_rows.extend(summarize_categorical(data, var, groups, labels))
     for var in NUMERIC_VARS:
         if not all(var in data[g].columns for g in groups):
-            print(f"WARNING: numeric variable '{var}' missing in some cohort, skipped.")
+            print(f"WARNING: numeric variable '{var}' missing, skipped.")
             continue
         rows, ph = summarize_numeric(data, var, groups, labels)
         all_rows.extend(rows)
         posthoc.extend(ph)
 
     if not all_rows:
-        sys.exit("ERROR: no variable available in all cohorts -> empty table. "
-                 "Check column names in CLINICAL_CSV vs NUMERIC_VARS/CATEGORICAL_VARS.")
+        sys.exit("ERROR: no variable available -> empty table. Check column names in the CSV.")
     return pd.DataFrame(all_rows), pd.DataFrame(posthoc)
 
 
 # ============================================================
-# FIGURES (matplotlib on per-cohort arrays, no merged DataFrame)
+# FIGURES
 # ============================================================
 
 def make_figures(data: dict, groups, labels, stats_df: pd.DataFrame, fig_dir: Path) -> None:
@@ -483,7 +420,7 @@ def make_figures(data: dict, groups, labels, stats_df: pd.DataFrame, fig_dir: Pa
 
     def title_for(var):
         base = VAR_LABELS.get(var, var)
-        m = stats_df[stats_df["var"] == var] if "var" in stats_df else stats_df.iloc[0:0]
+        m = stats_df[stats_df["var"] == var]
         if m.empty:
             return base
         r = m.iloc[0]
@@ -511,7 +448,7 @@ def make_figures(data: dict, groups, labels, stats_df: pd.DataFrame, fig_dir: Pa
         if not all(var in data[g].columns for g in groups):
             continue
         ct = contingency(data, var, groups)
-        pct = (ct / ct.sum(axis=0) * 100).T  # cohorts x levels
+        pct = (ct / ct.sum(axis=0) * 100).T
         pct.index = order
         fig, ax = plt.subplots(figsize=(1.8 * len(groups) + 3, 4.2))
         pct.plot(kind="bar", stacked=True, ax=ax, colormap="tab10", rot=0)
@@ -672,99 +609,54 @@ def point_in_region(lng: float, lat: float, rings: list[list[tuple]]) -> bool:
     return any(point_in_polygon(lng, lat, ring) for ring in rings)
 
 
-def load_mutation_csv(path: Path) -> dict[str, dict]:
-    """{sample_id: {cohort, mutated}}; sample_id is the code that matches the db."""
-    data, duplicates = {}, 0
-    with open(path, newline="") as fh:
-        reader = csv.DictReader(fh)
-        missing = {"sample_id", "cohort", "mutated"} - set(reader.fieldnames or [])
-        if missing:
-            raise RuntimeError(f"columns missing in {path}: {sorted(missing)}")
-        for row in reader:
-            sid = row["sample_id"].strip()
-            if not sid:
-                continue
-            if sid in data:
-                duplicates += 1
-                data[sid]["mutated"] = max(data[sid]["mutated"], int(row["mutated"]))
-                continue
-            data[sid] = {"cohort": row["cohort"].strip(), "mutated": int(row["mutated"])}
-    print(f"[*] Samples loaded from {path}: {len(data)}")
-    dbg("mutation CSV: first rows (sample_id -> cohort, mutated)",
-        [(k, v["cohort"], v["mutated"]) for k, v in list(data.items())[:5]])
-    cnt = defaultdict(int)
-    for v in data.values():
-        cnt[(v["cohort"], v["mutated"])] += 1
-    dbg("mutation CSV: counts per (cohort, mutated)", dict(sorted(cnt.items())), n=20)
-    if duplicates:
-        print(f"[!] Duplicate sample_id rows merged: {duplicates}")
-    return data
-
-
-def fetch_coordinates(sample_ids: list[str]) -> dict[str, dict]:
-    """Query MySQL -> {identifier: {lat, lng}}."""
+def fetch_coordinates(codals: list[str]) -> dict[str, dict]:
+    """Query MySQL (historicals) -> {parals_codals: {lat, lng}}."""
     import mysql.connector  # lazy: Table 1 works even without the MySQL driver
 
+    ids = sorted(set(codals))
+    if not ids:
+        return {}
     print(f"[*] Connecting to MySQL ({DB_CONFIG['database']})...")
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor(dictionary=True)
 
-    db_ids = list(set(sample_ids))
-    if not db_ids:
-        cursor.close(); conn.close()
-        return {}
-    ph = ", ".join(["%s"] * len(db_ids))
-
-    query = f"""
-        SELECT h.parals_codals, h.lat, h.lng, cg.dna AS codice_genoma
-        FROM registro_codici_mutaz cg
-        INNER JOIN historicals h ON h.parals_codals = cg.parals_codals
-        INNER JOIN zxhf3 z       ON z.sample = cg.dna
-        WHERE cg.dna IN ({ph})
-          AND h.lat IS NOT NULL AND h.lng IS NOT NULL
-
-        UNION
-
-        SELECT h.parals_codals, h.lat, h.lng, cg.codice_genoma
-        FROM codici_genoma cg
-        INNER JOIN historicals h ON h.parals_codals = cg.parals_codals
-        INNER JOIN zxhf3 z       ON z.sample = cg.codice_genoma
-        WHERE cg.codice_genoma IN ({ph})
-          AND h.lat IS NOT NULL AND h.lng IS NOT NULL
-    """
-    cursor.execute(query, db_ids + db_ids)
-    rows = cursor.fetchall()
-    cursor.close(); conn.close()
-
     coords = {}
-    for row in rows:
-        lat, lng = float(row["lat"]), float(row["lng"])
-        for key in (row["codice_genoma"], row["parals_codals"]):
-            if key is not None:
-                coords[str(key)] = {"lat": lat, "lng": lng}
-    print(f"[*] Identifiers with coordinates found: {len(coords)}")
-    dbg("db: sample_ids searched (examples)", db_ids)
-    dbg("db: identifiers returned with coordinates (examples)", list(coords.items()))
-    dbg("db: searched ids WITHOUT coordinates (examples)", sorted(set(db_ids) - set(coords)), n=10)
+    CHUNK = 1000
+    for i in range(0, len(ids), CHUNK):
+        part = ids[i:i + CHUNK]
+        ph = ", ".join(["%s"] * len(part))
+        cursor.execute(
+            f"SELECT parals_codals, lat, lng FROM historicals "
+            f"WHERE parals_codals IN ({ph}) AND lat IS NOT NULL AND lng IS NOT NULL",
+            part,
+        )
+        for row in cursor.fetchall():
+            coords[str(row["parals_codals"])] = {"lat": float(row["lat"]), "lng": float(row["lng"])}
+    cursor.close()
+    conn.close()
+
+    print(f"[*] parals_codals with coordinates found: {len(coords)} / {len(ids)}")
+    dbg("db: codals WITHOUT coordinates (examples)", sorted(set(ids) - set(coords)), n=10)
     return coords
 
 
-def build_plot_data(mutation_data: dict, coordinates: dict, region_rings=None) -> list[dict]:
+def build_plot_data(df: pd.DataFrame, coordinates: dict, region_rings=None) -> list[dict]:
     points, missing, outside = [], 0, 0
-    for sample_id, info in mutation_data.items():
-        if sample_id not in coordinates:
+    for _, r in df.iterrows():
+        codals = r[CODALS_COL]
+        if codals not in coordinates:
             missing += 1
             continue
-        lat, lng = coordinates[sample_id]["lat"], coordinates[sample_id]["lng"]
+        lat, lng = coordinates[codals]["lat"], coordinates[codals]["lng"]
         if region_rings and not point_in_region(lng, lat, region_rings):
             outside += 1
             continue
-        points.append({"sample_id": sample_id, "cohort": info["cohort"],
-                       "mutated": info["mutated"], "lat": lat, "lng": lng})
+        points.append({"sample_id": r[ID_COL], "cohort": r[COHORT_COL],
+                       "mutated": int(r[MUT_COL] >= 1), "lat": lat, "lng": lng})
     if missing:
-        print(f"[!] Samples without coordinates (excluded): {missing}")
+        print(f"[!] Patients without coordinates (excluded): {missing}")
     if outside:
-        print(f"[!] Samples outside the region (excluded): {outside}")
+        print(f"[!] Patients outside the region (excluded): {outside}")
     print(f"[*] Points to plot: {len(points)}")
     return points
 
@@ -864,12 +756,20 @@ def render_mutation_map(points, region_rings, out_png: Path, out_svg: Path, titl
     plt.close(fig)
 
 
-def run_mutation_maps(map_dir: Path = MAP_DIR) -> None:
+def run_mutation_maps(df: pd.DataFrame, map_dir: Path = MAP_DIR) -> None:
+    for col in (MUT_COL, CODALS_COL):
+        if col not in df.columns:
+            raise RuntimeError(f"column '{col}' needed for maps is not in the CSV")
+
     map_dir = Path(map_dir)
     map_dir.mkdir(parents=True, exist_ok=True)
 
-    mutation_data = load_mutation_csv(MUTATION_CSV)
-    coordinates = fetch_coordinates(list(mutation_data))
+    sub = df[df[COHORT_COL].isin(COHORT_VALUES or df[COHORT_COL].unique())]
+    sub = sub.dropna(subset=[MUT_COL, CODALS_COL])
+    cnt = sub.groupby([COHORT_COL, sub[MUT_COL] >= 1]).size().to_dict()
+    dbg("maps: counts per (cohort, carrier)", cnt, n=20)
+
+    coordinates = fetch_coordinates(sub[CODALS_COL].tolist())
 
     region_rings = []
     try:
@@ -881,9 +781,9 @@ def run_mutation_maps(map_dir: Path = MAP_DIR) -> None:
     except Exception as exc:
         print(f"[!] Could not download boundaries: {exc}\n    Map will have no region outline.")
 
-    points = build_plot_data(mutation_data, coordinates, region_rings)
+    points = build_plot_data(sub, coordinates, region_rings)
     if not points:
-        raise RuntimeError("no points to plot (check sample_id vs database codes)")
+        raise RuntimeError("no points to plot (check parals_codals vs database codes)")
 
     subsets = [
         ("all",      points,                                       "all patients"),
@@ -904,18 +804,12 @@ def run_mutation_maps(map_dir: Path = MAP_DIR) -> None:
 # MAIN
 # ============================================================
 
-def run_table1(output_dir: Path = OUTPUT_DIR) -> None:
+def run_table1(df: pd.DataFrame, output_dir: Path = OUTPUT_DIR) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    data, groups, labels = resolve_cohorts(load_cohorts())
+    data, groups, labels = split_cohorts(df)
     n_total = {g: len(d) for g, d in data.items()}
-    for g in groups:
-        dbg(f"cohort '{g}': non-null count per Table 1 variable (N={len(data[g])})",
-            {v: int(data[g][v].notna().sum()) for v in ALL_VARS if v in data[g].columns}, n=60)
-        missing_v = [v for v in ALL_VARS if v not in data[g].columns]
-        if missing_v:
-            dbg(f"cohort '{g}': variables NOT in dataframe", missing_v, n=60)
 
     stats_df, posthoc_df = build_stats_table(data, groups, labels)
 
@@ -929,21 +823,17 @@ def run_table1(output_dir: Path = OUTPUT_DIR) -> None:
 
     make_figures(data, groups, labels, stats_df, output_dir / "figures")
     make_docx_table(stats_df, groups, labels, n_total, output_dir / "Table1.docx")
-
     print("\nDone. Output in:", output_dir.resolve())
 
 
 def main() -> None:
-    run_table1()
+    df = load_table()
+    run_table1(df)
 
     if MAKE_MUTATION_MAP:
-        if not MUTATION_CSV.is_file():
-            print(f"\n[!] Mutation map skipped: {MUTATION_CSV} not found "
-                  f"(put it in the folder where the script runs).")
-            return
         print("\n=== Mutation maps ===")
         try:
-            run_mutation_maps()
+            run_mutation_maps(df)
         except Exception as exc:  # the map must never invalidate Table 1
             print(f"[!] Mutation maps failed: {exc}")
 
