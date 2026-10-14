@@ -177,10 +177,10 @@ def _run_permutation_batch(
 
 def process_single_variant(variant_col: str, variant_original: str, Ecols: list[str],  full_beta: bool = False) -> dict | None:
     cfg = get_config()
-    df = global_df
     covariate_cols = global_covariate_cols  # e.g. the PCs, populated by init_worker; [] if disabled
 
-    df = df[df[variant_col] != "."].copy()
+    needed = list(dict.fromkeys([cfg.target_col, variant_col] + list(Ecols) + list(covariate_cols)))
+    df = global_df.loc[global_df[variant_col] != ".", needed].copy()
     df[variant_col] = df[variant_col].astype(int)
     df["_match_variant"] = (df[variant_col] > 0).astype(int)
 
