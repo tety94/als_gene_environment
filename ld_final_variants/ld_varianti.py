@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
 Calcola l'LD (r2) fra tutte le coppie di varianti DISTINTE di variants_input.csv,
-sullo stesso cromosoma, separatamente in ciascun dataset genetico (gen1, gen2),
+sullo stesso cromosoma, separatamente in ciascun dataset genetico (gen1, gen2_3),
 e scrive un unico CSV con una riga per coppia e le colonne r2 per generazione.
 
 Requisiti: bcftools nel PATH (VCF indicizzati con tabix), numpy, pandas.
-(plink2 non serve piu': r2 = correlazione di Pearson fra dosaggi dell'allele
-ALT, sulle sole coppie di campioni con genotipo non mancante in entrambe.)
+(r2 = correlazione di Pearson fra dosaggi dell'allele ALT, sulle sole coppie
+di campioni con genotipo non mancante in entrambe.)
 
 Uso:
     python3 ld_varianti.py --input variants_input.csv --output ld_pairs.csv
 
 Per cambiare i VCF:
     --gen gen1=/path/gen1_onlycases_vcf_chr{chrom}.vcf.gz
-    --gen gen2=/path/gen2_vcf_chr{chrom}.vcf.gz
-(si puo' ripetere --gen per aggiungere altre generazioni)
+    --gen gen2_3=/path/gen2_chr{chrom}.vcf.gz,/path/gen3_chr{chrom}.vcf.gz
+Il pattern puo' contenere piu' percorsi separati da virgola: sono VCF con
+campioni DIVERSI, trattati come un unico dataset (dosaggi concatenati).
+Si puo' ripetere --gen per aggiungere altre generazioni.
 
 Input: colonne usate = variant (formato chrom_pos_ref_alt), chromosome,
 position, exposure, gene. Le righe ripetute (diverse exposure/generation/test)
@@ -35,14 +37,14 @@ import argparse
 import itertools
 import subprocess
 import sys
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 
 DEFAULT_GENS = [
     "gen1=/mnt/cresla_prod/genome_datasets/gen1/gen1_onlycases_vcf_chr{chrom}.vcf.gz",
-    "gen2=/mnt/cresla_prod/genome_datasets/gen2/gen2_vcf_chr{chrom}.vcf.gz",
+    "gen2_3=/mnt/cresla_prod/genome_datasets/gen2/gen2_vcf_chr{chrom}.vcf.gz,"
+    "/mnt/cresla_prod/genome_datasets/gen3/<nome_gen3>_chr{chrom}.vcf.gz",
 ]
 
 
@@ -95,7 +97,16 @@ def gt_to_dosage(gt, alt_idx):
     return float(sum(1 for a in alleles if a == str(alt_idx)))
 
 
-def read_dosages(vcf_path, variants):
+def n_samples(vcf_path):
+    res = subprocess.run(["bcftools", "query", "-l", vcf_path],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"  bcftools query -l errore: {res.stderr.strip()[:200]}", file=sys.stderr)
+        return 0
+    return len([l for l in res.stdout.split("\n") if l])
+
+
+def read_dosages_one(vcf_path, variants):
     """variants: DataFrame di un cromosoma. Ritorna {variant: array dosaggi}."""
     wanted = {(r.chromosome, str(r.position), r.ref, r.alt): r.variant
               for r in variants.itertuples()}
@@ -107,6 +118,16 @@ def read_dosages(vcf_path, variants):
             if key in wanted and wanted[key] not in dos:
                 dos[wanted[key]] = np.array([gt_to_dosage(g, i) for g in gts])
     return dos
+
+
+def read_dosages(vcf_paths, variants):
+    """Piu' VCF (campioni diversi) trattati come un unico dataset:
+    i dosaggi vengono concatenati; se una variante manca in un file,
+    quei campioni sono NaN (esclusi a coppie nel calcolo di r2)."""
+    parts = [(n_samples(p), read_dosages_one(p, variants)) for p in vcf_paths]
+    all_vars = set().union(*[d for _, d in parts])
+    return {v: np.concatenate([d.get(v, np.full(n, np.nan)) for n, d in parts])
+            for v in all_vars}
 
 
 def r2_pair(x, y):
@@ -126,7 +147,7 @@ def main():
     ap.add_argument("--output", default="ld_pairs.csv")
     ap.add_argument("--output-variants", default="ld_varianti.csv")
     ap.add_argument("--gen", action="append",
-                    help="nome=pattern_vcf con {chrom}; ripetibile")
+                    help="nome=pattern_vcf con {chrom}; piu' VCF separati da virgola; ripetibile")
     ap.add_argument("--soglia", type=float, default=0.8,
                     help="soglia r2 usata solo per il conteggio partner nel file varianti")
     args = ap.parse_args()
@@ -148,9 +169,9 @@ def main():
         for chrom, sub in var.groupby("chromosome", sort=False):
             if len(sub) < 2:
                 continue
-            path = pattern.format(chrom=chrom)
-            print(f"[{gname} chr{chrom}] {len(sub)} varianti: {path}")
-            dos = read_dosages(path, sub)
+            paths = [p.strip().format(chrom=chrom) for p in pattern.split(",")]
+            print(f"[{gname} chr{chrom}] {len(sub)} varianti: {paths}")
+            dos = read_dosages(paths, sub)
             found[gname].update(dos)
             miss = [v for v in sub["variant"] if v not in dos]
             if miss:
