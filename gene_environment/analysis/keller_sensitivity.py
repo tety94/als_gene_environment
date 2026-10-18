@@ -72,7 +72,15 @@ _BOOL_COLS_PREFIX = ("ok_", "same_sign_")
 GEN1_FILE = "/mnt/cresla_prod/genome_datasets/merged_csv/gen.parquet"
 GEN23_FILE = "/mnt/cresla_prod/genome_datasets/gen3/gen2_gen3_selected_variants.parquet"
 # generation -> genetic file. "Generation 2" is the gen2+gen3 pooled cohort.
-DEFAULT_SOURCES = {1: GEN1_FILE, 2: GEN23_FILE, 3: GEN23_FILE}
+DEFAULT_SOURCES = {1: GEN1_FILE, 23: GEN23_FILE, 2: GEN23_FILE, 3: GEN23_FILE}
+# PCs per generation. The .env sets ONE fixed path (qc_output_gen2_gen3) for everything, which
+# leaves every gen-1 sample without PCs. "23" is the value of GENERATION in the .env (gen2+gen3 pooled).
+PCA_BASE = "/mnt/cresla_prod/genome_datasets"
+DEFAULT_PCA = {1: f"{PCA_BASE}/qc_output_gen1/pca_covariates.csv",
+               23: f"{PCA_BASE}/qc_output_gen2_gen3/pca_covariates.csv",
+               2: f"{PCA_BASE}/qc_output_gen2_gen3/pca_covariates.csv",
+               3: f"{PCA_BASE}/qc_output_gen2_gen3/pca_covariates.csv"}
+PCA_ATTR_CANDIDATES = ("pca_covariates_path_template", "PCA_COVARIATES_PATH_TEMPLATE", "pca_path_template")
 RAW_ATTR_CANDIDATES = ("raw_file", "RAW_FILE", "raw_path", "genetic_file", "genetic_path")
 
 
@@ -398,6 +406,15 @@ def _read_input(path: str, cfg) -> pd.DataFrame:
     return raw[["variant", "exposure"]].drop_duplicates().reset_index(drop=True)
 
 
+def _cfg_with_attr(cfg, names, value, what: str):
+    for n in names:
+        if hasattr(cfg, n):
+            cur = getattr(cfg, n)
+            return dataclasses.replace(cfg, **{n: Path(value) if isinstance(cur, Path) else value}), n
+    raise AttributeError(f"cfg has no attribute for {what} among {list(names)}; "
+                         f"cfg fields: {[f.name for f in dataclasses.fields(cfg)]}")
+
+
 def _cfg_with_raw(cfg, path: str, raw_attr: str | None):
     """Copy of cfg pointing at another genetic file. The attribute holding the
     RAW_FILE path is auto-detected (or given with --raw-attr)."""
@@ -659,9 +676,9 @@ def build_docx(res, summ, figs, path: Path, info: dict) -> None:
 # ============================================================================
 # Orchestration
 # ============================================================================
-def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_gxc: bool = False,
+def run(variants_csv: str, out_dir: str | None = None, generations=(1, 23), with_gxc: bool = False,
         perm_B: int = 0, sources: dict | None = None, raw_attr: str | None = None,
-        allow_overlap: bool = False, dedup: bool = True) -> pd.DataFrame:
+        allow_overlap: bool = False, dedup: bool = True, pca: dict | None = None) -> pd.DataFrame:
     from gene_environment.config import get_config
     from gene_environment.logging_utils import get_logger
     from gene_environment.vcf_pipeline.build_dataset import _build_narrow_covariates, _load_genetic_data
@@ -675,6 +692,15 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
     for g in generations:
         if not Path(sources[g]).exists():
             raise FileNotFoundError(f"generation {g}: genetic file not found: {sources[g]}")
+
+    pca = {**DEFAULT_PCA, **(pca or {})}
+    for g in generations:
+        if g not in pca:
+            raise ValueError(f"no PC file defined for generation {g}: use --pca G=PATH")
+        if not Path(pca[g].format(generation=g)).exists():
+            import glob
+            raise FileNotFoundError(f"generation {g}: PC file not found: {pca[g]}. Existing: "
+                                    f"{sorted(glob.glob(PCA_BASE + '/qc_output*/pca_covariates*.csv'))}")
 
     pairs = _read_input(variants_csv, cfg)
     out = Path(out_dir or getattr(cfg, "keller_sensitivity_dir", "./output/keller_sensitivity"))
@@ -725,6 +751,8 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
             for exposure, sub in pairs.groupby("exposure", sort=False):
                 log.info("Generation %s, exposure %s: %d variants", g, exposure, len(sub))
                 cfg_ge = dataclasses.replace(cfg_src, generation=g, exposure=exposure)
+                cfg_ge, _pa = _cfg_with_attr(cfg_ge, PCA_ATTR_CANDIDATES, pca[g], "the PC file template")
+                log.info("  PC file for generation %s: %s (cfg.%s)", g, pca[g], _pa)
                 try:
                     cov, Ecols, Ccols = _quiet(_build_narrow_covariates, cfg_ge, df_small["id"])
                     df = pd.merge(cov, df_small, on="id", how="inner")
@@ -746,6 +774,10 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
                             raise RuntimeError(msg + ". Use --allow-overlap to ignore (or keep dedup on).")
                 ids_seen[(exposure, g)] = this_ids
                 log.info("  cohort g%s %s: n=%d (id examples: %s)", g, exposure, len(df), df["id"].head(3).tolist())
+                nas = df[Ecols + Ccols].isna().sum()
+                log.info("  complete cases (E + covariates): %d/%d; missing per column: %s",
+                         int(df[Ecols + Ccols].notna().all(axis=1).sum()), len(df),
+                         {k: int(v) for k, v in nas.items() if v})
 
                 for k, lab in enumerate(sub["variant"], 1):
                     col = orig_to_safe.get(lab)
@@ -781,7 +813,7 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
     figs = make_figures(res, out / "figures", bool(perm_B))
     info = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"), "generations": list(generations),
             "sources": {g: str(sources[g]) for g in generations},
-            "dedup": dedup, "n_removed_overlap": n_removed,
+            "dedup": dedup, "n_removed_overlap": n_removed, "pca_files": {g: pca[g] for g in generations},
             "n_pairs": int(len(pairs)), "exposures": sorted(pairs["exposure"].unique().tolist()),
             "perm_B": perm_B, "with_gxc": with_gxc, "variants_csv": str(variants_csv),
             "thresholds": {"COND_MAX": COND_MAX, "LEV_WARN": LEV_WARN, "SHIFT_WARN": SHIFT_WARN,
@@ -804,7 +836,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Keller sensitivity + fit diagnostics")
     ap.add_argument("variants_csv", help="CSV with columns variant and exposure")
     ap.add_argument("--out-dir", default=None, help="default: cfg.keller_sensitivity_dir (./output/keller_sensitivity)")
-    ap.add_argument("--generations", type=int, nargs="+", default=[1, 2])
+    ap.add_argument("--generations", type=int, nargs="+", default=[1, 23],
+                    help="default: 1 and 23 (23 = gen2+gen3 pooled, as GENERATION in the .env)")
+    ap.add_argument("--pca", action="append", metavar="GEN=PATH",
+                    help="PC file for a generation (repeatable); defaults: 1=qc_output_gen1/pca_covariates.csv, "
+                         "23/2/3=qc_output_gen2_gen3/pca_covariates.csv")
     ap.add_argument("--source", action="append", metavar="GEN=PATH",
                     help="genetic file for a generation (repeatable); defaults: 1=merged_csv/gen.parquet, "
                          "2 and 3=gen3/gen2_gen3_selected_variants.parquet")
@@ -822,7 +858,11 @@ def main(argv=None) -> int:
     for s in a.source or []:
         g, p = s.split("=", 1)
         sources[int(g)] = p
-    run(a.variants_csv, a.out_dir, tuple(a.generations), a.with_gxc, a.perm,
+    pca = {}
+    for sp in a.pca or []:
+        g, pth = sp.split("=", 1)
+        pca[int(g)] = pth
+    run(a.variants_csv, a.out_dir, tuple(a.generations), a.with_gxc, a.perm, pca=pca,
         sources=sources, raw_attr=a.raw_attr, allow_overlap=a.allow_overlap, dedup=not a.no_dedup)
     return 0
 
