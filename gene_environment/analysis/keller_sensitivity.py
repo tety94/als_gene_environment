@@ -10,8 +10,9 @@ GENETIC SOURCES: each generation is read from its own genetic file.
     gen 2,3 -> /mnt/cresla_prod/genome_datasets/gen3/gen2_gen3_selected_variants.parquet
 (override with --source 1=PATH --source 2=PATH ...). Files are loaded one at a
 time, each by temporarily replacing the raw-file entry of cfg.
-A guard stops the run if two generations end up with exactly the same set of
-samples for the same exposure (the symptom of a generation that does not filter).
+Samples present in more than one file are kept only in the generation they belong to:
+the ids of the other files are removed (--no-dedup disables this). A guard stops the run
+if two generations still share samples for the same exposure (--allow-overlap ignores it).
 
 For each (generation, exposure) the environmental block + PCs are rebuilt exactly
 as the pipeline does (exposure standardized on the cohort, PCs of the generation).
@@ -412,6 +413,11 @@ def _cfg_with_raw(cfg, path: str, raw_attr: str | None):
     )
 
 
+def _ids_of(path: str) -> set:
+    """Sample ids contained in a genetic parquet (only the id column is read)."""
+    return set(pd.read_parquet(path, columns=["id"])["id"].astype(str))
+
+
 # ============================================================================
 # Summary, figures, Word report
 # ============================================================================
@@ -653,7 +659,7 @@ def build_docx(res, summ, figs, path: Path, info: dict) -> None:
 # ============================================================================
 def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_gxc: bool = False,
         perm_B: int = 0, sources: dict | None = None, raw_attr: str | None = None,
-        allow_same_samples: bool = False) -> pd.DataFrame:
+        allow_overlap: bool = False, dedup: bool = True) -> pd.DataFrame:
     from gene_environment.config import get_config
     from gene_environment.logging_utils import get_logger
     from gene_environment.vcf_pipeline.build_dataset import _build_narrow_covariates, _load_genetic_data
@@ -680,7 +686,8 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
         by_path.setdefault(str(sources[g]), []).append(g)
 
     rows = []
-    ids_seen: dict[tuple, tuple] = {}   # (exposure, frozenset ids) -> generation, for the guard
+    ids_seen: dict[tuple, frozenset] = {}   # (exposure, generation) -> ids, for the overlap guard
+    n_removed: dict[str, int] = {}
     for path, gens_here in by_path.items():
         cfg_src, used_attr = _cfg_with_raw(cfg, path, raw_attr)
         log.info("Genetic file %s (cfg.%s) for generations %s", path, used_attr, gens_here)
@@ -693,6 +700,16 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
         df_small = df_gen[["id"] + needed].copy()
         del df_gen, mapping
         gc.collect()
+        if dedup:
+            # a sample that also appears in another generation's file belongs to THAT generation
+            other = set()
+            for p2 in {str(v) for v in sources.values()} - {str(path)}:
+                other |= _ids_of(p2)
+            hit = df_small["id"].astype(str).isin(other)
+            n_removed[path] = int(hit.sum())
+            log.info("  removed %d samples also present in the other generation file(s); %d left",
+                     int(hit.sum()), int((~hit).sum()))
+            df_small = df_small[~hit].reset_index(drop=True)
 
         for g in gens_here:
             for exposure, sub in pairs.groupby("exposure", sort=False):
@@ -707,16 +724,17 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
                               "reasons": f"dataset could not be built: {exc}"} for v in sub["variant"]]
                     continue
 
-                # guard: two generations must not have the same set of samples
-                sig = (exposure, frozenset(df["id"]))
-                if sig in ids_seen and ids_seen[sig] != g:
-                    msg = (f"generation {g} and {ids_seen[sig]} have IDENTICAL samples for {exposure} "
-                           f"(n={len(df)}): generation is not filtering the cohort")
-                    if allow_same_samples:
-                        log.warning(msg)
-                    else:
-                        raise RuntimeError(msg + ". Use --allow-same-samples to ignore.")
-                ids_seen[sig] = g
+                # guard: generations must not share samples
+                this_ids = frozenset(df["id"].astype(str))
+                for (e2, g2), ids2 in ids_seen.items():
+                    if e2 == exposure and g2 != g and ids2 & this_ids:
+                        msg = (f"generation {g} and {g2} share {len(ids2 & this_ids)} samples for {exposure} "
+                               f"(n={len(this_ids)} and {len(ids2)})")
+                        if allow_overlap:
+                            log.warning(msg)
+                        else:
+                            raise RuntimeError(msg + ". Use --allow-overlap to ignore (or keep dedup on).")
+                ids_seen[(exposure, g)] = this_ids
                 log.info("  cohort g%s %s: n=%d (id examples: %s)", g, exposure, len(df), df["id"].head(3).tolist())
 
                 for k, lab in enumerate(sub["variant"], 1):
@@ -753,6 +771,7 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
     figs = make_figures(res, out / "figures", bool(perm_B))
     info = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"), "generations": list(generations),
             "sources": {g: str(sources[g]) for g in generations},
+            "dedup": dedup, "n_removed_overlap": n_removed,
             "n_pairs": int(len(pairs)), "exposures": sorted(pairs["exposure"].unique().tolist()),
             "perm_B": perm_B, "with_gxc": with_gxc, "variants_csv": str(variants_csv),
             "thresholds": {"COND_MAX": COND_MAX, "LEV_WARN": LEV_WARN, "SHIFT_WARN": SHIFT_WARN,
@@ -781,8 +800,10 @@ def main(argv=None) -> int:
                          "2 and 3=gen3/gen2_gen3_selected_variants.parquet")
     ap.add_argument("--raw-attr", default=None,
                     help="name of the cfg attribute holding RAW_FILE (auto-detected if omitted)")
-    ap.add_argument("--allow-same-samples", action="store_true",
-                    help="do not stop if two generations have identical samples")
+    ap.add_argument("--allow-overlap", action="store_true",
+                    help="do not stop if two generations still share samples")
+    ap.add_argument("--no-dedup", action="store_true",
+                    help="do NOT remove from a generation the samples present in the other generation files")
     ap.add_argument("--perm", type=int, default=0, metavar="B",
                     help="check the health of the first B permutations per variant (0 = skip; e.g. 500)")
     ap.add_argument("--with-gxc", action="store_true", help="add the G x C model (unstable with rare variants)")
@@ -792,7 +813,7 @@ def main(argv=None) -> int:
         g, p = s.split("=", 1)
         sources[int(g)] = p
     run(a.variants_csv, a.out_dir, tuple(a.generations), a.with_gxc, a.perm,
-        sources=sources, raw_attr=a.raw_attr, allow_same_samples=a.allow_same_samples)
+        sources=sources, raw_attr=a.raw_attr, allow_overlap=a.allow_overlap, dedup=not a.no_dedup)
     return 0
 
 
