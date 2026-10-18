@@ -413,9 +413,21 @@ def _cfg_with_raw(cfg, path: str, raw_attr: str | None):
     )
 
 
-def _ids_of(path: str) -> set:
-    """Sample ids contained in a genetic parquet (only the id column is read)."""
-    return set(pd.read_parquet(path, columns=["id"])["id"].astype(str))
+def _ids_of(path: str, fallback=None) -> set:
+    """Sample ids of a genetic parquet. Wide files (very many columns) exceed pyarrow's
+    default thrift metadata limits, so they are raised; if reading still fails, `fallback`
+    (a callable path -> iterable of ids, e.g. through the pipeline loader) is used."""
+    try:
+        import pyarrow.parquet as pq
+        big = 2 ** 31 - 1
+        pf = pq.ParquetFile(path, thrift_string_size_limit=big, thrift_container_size_limit=big)
+        return set(pf.read(columns=["id"]).column("id").to_pandas().astype(str))
+    except Exception as exc:
+        if fallback is None:
+            raise
+        print(f"  pyarrow could not read ids of {Path(path).name} ({type(exc).__name__}); "
+              f"using the pipeline loader", file=sys.stderr)
+        return set(pd.Series(list(fallback(path))).astype(str))
 
 
 # ============================================================================
@@ -704,7 +716,10 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
             # a sample that also appears in another generation's file belongs to THAT generation
             other = set()
             for p2 in {str(v) for v in sources.values()} - {str(path)}:
-                other |= _ids_of(p2)
+                def _via_pipeline(pp, _cfg=cfg, _attr=raw_attr):
+                    c2, _ = _cfg_with_raw(_cfg, pp, _attr)
+                    return _load_genetic_data(c2)[0]["id"]
+                other |= _ids_of(p2, fallback=_via_pipeline)
             hit = df_small["id"].astype(str).isin(other)
             n_removed[path] = int(hit.sum())
             log.info("  removed %d samples also present in the other generation file(s); %d left",
