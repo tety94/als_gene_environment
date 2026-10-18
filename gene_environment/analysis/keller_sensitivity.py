@@ -5,9 +5,16 @@ INPUT  variants.csv with columns `variant` (CHROM_POS_MUTATION) and `exposure`
        pair; duplicates are dropped. If `exposure` is missing, cfg.exposure is
        used (with a warning).
 
-The genetic file is read once. For each (generation, exposure) the environmental
-block + PCs are rebuilt exactly as the pipeline does (exposure standardized on
-the cohort, PCs of the generation).
+GENETIC SOURCES: each generation is read from its own genetic file.
+    gen 1   -> /mnt/cresla_prod/genome_datasets/merged_csv/gen.parquet
+    gen 2,3 -> /mnt/cresla_prod/genome_datasets/gen3/gen2_gen3_selected_variants.parquet
+(override with --source 1=PATH --source 2=PATH ...). Files are loaded one at a
+time, each by temporarily replacing the raw-file entry of cfg.
+A guard stops the run if two generations end up with exactly the same set of
+samples for the same exposure (the symptom of a generation that does not filter).
+
+For each (generation, exposure) the environmental block + PCs are rebuilt exactly
+as the pipeline does (exposure standardized on the cohort, PCs of the generation).
 
 For each (generation, exposure, variant), on the SAME matched sample as the
 pipeline, the following models are fitted:
@@ -17,26 +24,18 @@ pipeline, the following models are fitted:
     [opt.] cxe_gxc : cxe + G:C            (--with-gxc; unstable with rare variants)
 
 The regressions are closed-form OLS, so there is no iterative convergence to
-check. What is checked is whether each fit is well posed:
-  * rank vs number of columns, condition number (standardized columns),
-    maximum leverage, finite HC3 SE  -> column `ok_<model>`
-  * agreement between smf.ols (pipeline observed path), the fast path
-    (build_design_and_solve, used by the permutations) and this script's design,
-    on the same sample. NOTE: agreement does NOT detect rank deficiency (lstsq
-    and pinv both return the same minimum-norm solution); rank and condition
-    number are needed for that.
-  * with --perm B: health of the first B permutations (same seed as the
-    pipeline): valid fraction, rank-deficient fraction, Monte Carlo error.
+check. What is checked is whether each fit is well posed (rank, condition number,
+leverage, finite HC3 SE -> `ok_<model>`), the agreement between smf.ols, the fast
+path and this script's design, and (--perm B) the health of the first B permutations.
 
 OUTPUT (default ./output/keller_sensitivity, cfg.keller_sensitivity_dir):
     results_all.csv, results_gen<N>.csv, summary_by_gen_exposure.csv,
     keller_sensitivity_report.docx, figures/*.png, run_info.json
 
 Usage:
-    python -m gene_environment.analysis.keller_sensitivity variants.csv
-    python -m gene_environment.analysis.keller_sensitivity variants.csv --perm 500
-    python -m gene_environment.analysis.keller_sensitivity variants.csv --generations 1 2 \
-        --out-dir output/keller_sensitivity --with-gxc
+    python keller_sensitivity.py variants.csv --generations 1 2
+    python keller_sensitivity.py variants.csv --generations 1 2 --perm 500
+    python keller_sensitivity.py variants.csv --source 2=/other/file.parquet
 """
 from __future__ import annotations
 
@@ -56,18 +55,24 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-COND_MAX = 1e6            # condition number above which a fit is unreliable (standardized columns)
-LEV_WARN = 0.5            # max leverage above which a single observation dominates the fit
-CONC_RTOL = 1e-6          # relative tolerance for agreement between computation paths
+COND_MAX = 1e6
+LEV_WARN = 0.5
+CONC_RTOL = 1e-6
 CONC_ATOL = 1e-8
-SHIFT_WARN = 0.5          # |relative shift| of beta (nocov->base or base->cxe) to flag
-PERM_VALID_WARN = 0.95    # valid-permutation fraction below which to warn
+SHIFT_WARN = 0.5
+PERM_VALID_WARN = 0.95
 PERM_VALID_FAIL = 0.50
-PERM_RANKDEF_WARN = 0.05  # rank-deficient permutation fraction above which to warn
+PERM_RANKDEF_WARN = 0.05
 
 MODEL_TAGS = ("nocov", "base", "cxe", "cxe_gxc")
 
 _BOOL_COLS_PREFIX = ("ok_", "same_sign_")
+
+GEN1_FILE = "/mnt/cresla_prod/genome_datasets/merged_csv/gen.parquet"
+GEN23_FILE = "/mnt/cresla_prod/genome_datasets/gen3/gen2_gen3_selected_variants.parquet"
+# generation -> genetic file. "Generation 2" is the gen2+gen3 pooled cohort.
+DEFAULT_SOURCES = {1: GEN1_FILE, 2: GEN23_FILE, 3: GEN23_FILE}
+RAW_ATTR_CANDIDATES = ("raw_file", "RAW_FILE", "raw_path", "genetic_file", "genetic_path")
 
 
 # ============================================================================
@@ -113,7 +118,7 @@ def _fit(df, target, variant_col, Ecols, Ccols, cxe, gxc):
     cond = float(np.linalg.cond(Zs)) if (sd > 0).all() else np.inf
     lev = _max_leverage(X)
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # singular fits are flagged through ok_*
+        warnings.simplefilter("ignore")
         res = sm.OLS(y, X).fit(cov_type="HC3")
     i = names.index(f"G:{Ecols[0]}")
     se = float(res.bse[i])
@@ -203,7 +208,7 @@ def _concordance(d, m, target, col, Ecols, Ccols, cfg) -> dict:
             out["same_matched_set"] = bool(
                 len(idx) == len(m) and np.allclose(np.sort(y[idx]), np.sort(m[target].to_numpy(float)))
             )
-    except Exception as exc:  # a fast-path bug must not kill the pair: it is reported instead
+    except Exception as exc:
         out["conc_error"] = f"{type(exc).__name__}: {exc}"
     return out
 
@@ -392,6 +397,21 @@ def _read_input(path: str, cfg) -> pd.DataFrame:
     return raw[["variant", "exposure"]].drop_duplicates().reset_index(drop=True)
 
 
+def _cfg_with_raw(cfg, path: str, raw_attr: str | None):
+    """Copy of cfg pointing at another genetic file. The attribute holding the
+    RAW_FILE path is auto-detected (or given with --raw-attr)."""
+    names = [raw_attr] if raw_attr else list(RAW_ATTR_CANDIDATES)
+    for n in names:
+        if hasattr(cfg, n):
+            cur = getattr(cfg, n)
+            return dataclasses.replace(cfg, **{n: Path(path) if isinstance(cur, Path) else path}), n
+    fields = [f.name for f in dataclasses.fields(cfg)]
+    raise AttributeError(
+        f"cfg has no attribute among {names}. Pass --raw-attr with the right one. "
+        f"cfg fields containing 'raw' or 'file': {[f for f in fields if 'raw' in f.lower() or 'file' in f.lower()]}"
+    )
+
+
 # ============================================================================
 # Summary, figures, Word report
 # ============================================================================
@@ -410,7 +430,9 @@ def summarize(res: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (g, e), s in res.groupby(["generation", "exposure"], sort=True):
         fit = _fitted(s)
-        r = {"generation": g, "exposure": e, "n_pairs": len(s), "n_skip": int((s["status"] == "SKIP").sum()),
+        r = {"generation": g, "exposure": e, "n_cohort": (s["n_cohort"].dropna().iloc[0]
+                                                         if "n_cohort" in s and s["n_cohort"].notna().any() else np.nan),
+             "n_pairs": len(s), "n_skip": int((s["status"] == "SKIP").sum()),
              "n_ok": int((s["status"] == "OK").sum()), "n_warn": int((s["status"] == "WARN").sum()),
              "n_fail": int((s["status"] == "FAIL").sum())}
         if len(fit):
@@ -534,6 +556,7 @@ def build_docx(res, summ, figs, path: Path, info: dict) -> None:
         f"Variant x exposure pairs: {info['n_pairs']}. Diagnostic permutations: "
         f"{info['perm_B'] if info['perm_B'] else 'not run'}."
     )
+    doc.add_paragraph("Genetic sources: " + "; ".join(f"gen {g} -> {p}" for g, p in info["sources"].items()))
 
     doc.add_heading("What is checked", level=1)
     for t in (
@@ -551,11 +574,12 @@ def build_docx(res, summ, figs, path: Path, info: dict) -> None:
         doc.add_paragraph(t, style="List Bullet")
 
     doc.add_heading("Summary by generation and exposure", level=1)
-    cols = [("generation", "gen"), ("exposure", "exposure"), ("n_pairs", "pairs"), ("n_ok", "OK"),
-            ("n_warn", "WARN"), ("n_fail", "FAIL"), ("n_skip", "SKIP"), ("frac_concordant", "concordant"),
-            ("median_cond_base", "median cond."), ("sign_kept_cov", "sign kept (cov)"),
-            ("median_abs_shift_cov", "|shift| cov"), ("sign_kept_cxe", "sign kept (CxE)"),
-            ("median_abs_shift_cxe", "|shift| CxE"), ("median_se_ratio_cxe_base", "SE CxE/base")]
+    cols = [("generation", "gen"), ("exposure", "exposure"), ("n_cohort", "N cohort"), ("n_pairs", "pairs"),
+            ("n_ok", "OK"), ("n_warn", "WARN"), ("n_fail", "FAIL"), ("n_skip", "SKIP"),
+            ("frac_concordant", "concordant"), ("median_cond_base", "median cond."),
+            ("sign_kept_cov", "sign kept (cov)"), ("median_abs_shift_cov", "|shift| cov"),
+            ("sign_kept_cxe", "sign kept (CxE)"), ("median_abs_shift_cxe", "|shift| CxE"),
+            ("median_se_ratio_cxe_base", "SE CxE/base")]
     cols = [c for c in cols if c[0] in summ.columns]
 
     def fmt(k, v):
@@ -628,13 +652,22 @@ def build_docx(res, summ, figs, path: Path, info: dict) -> None:
 # Orchestration
 # ============================================================================
 def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_gxc: bool = False,
-        perm_B: int = 0) -> pd.DataFrame:
+        perm_B: int = 0, sources: dict | None = None, raw_attr: str | None = None,
+        allow_same_samples: bool = False) -> pd.DataFrame:
     from gene_environment.config import get_config
     from gene_environment.logging_utils import get_logger
     from gene_environment.vcf_pipeline.build_dataset import _build_narrow_covariates, _load_genetic_data
 
     log = get_logger(__name__)
     cfg = get_config()
+    sources = {**DEFAULT_SOURCES, **(sources or {})}
+    missing = [g for g in generations if g not in sources]
+    if missing:
+        raise ValueError(f"no genetic file defined for generation(s) {missing}: use --source G=PATH")
+    for g in generations:
+        if not Path(sources[g]).exists():
+            raise FileNotFoundError(f"generation {g}: genetic file not found: {sources[g]}")
+
     pairs = _read_input(variants_csv, cfg)
     out = Path(out_dir or getattr(cfg, "keller_sensitivity_dir", "./output/keller_sensitivity"))
     (out / "figures").mkdir(parents=True, exist_ok=True)
@@ -642,45 +675,73 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
     log.info("Input: %d variant x exposure pairs, %d exposures, generations %s",
              len(pairs), pairs["exposure"].nunique(), list(generations))
 
-    df_gen, _, mapping, _ = _load_genetic_data(cfg)
-    orig_to_safe = {v: k for k, v in mapping.items()}
-    needed = [orig_to_safe[v] for v in dict.fromkeys(pairs["variant"]) if v in orig_to_safe]
-    df_small = df_gen[["id"] + needed].copy()
-    del df_gen, mapping
-    gc.collect()
+    by_path: dict[str, list[int]] = {}
+    for g in generations:
+        by_path.setdefault(str(sources[g]), []).append(g)
 
     rows = []
-    for g in generations:
-        for exposure, sub in pairs.groupby("exposure", sort=False):
-            log.info("Generation %s, exposure %s: %d variants", g, exposure, len(sub))
-            cfg_ge = dataclasses.replace(cfg, generation=g, exposure=exposure)
-            try:
-                cov, Ecols, Ccols = _quiet(_build_narrow_covariates, cfg_ge, df_small["id"])
-                df = pd.merge(cov, df_small, on="id", how="inner")
-            except Exception as exc:  # missing exposure, missing PCs, etc.
-                log.error("g%s %s: dataset could not be built: %s", g, exposure, exc)
-                rows += [{"generation": g, "exposure": exposure, "variant": v, "status": "SKIP",
-                          "reasons": f"dataset could not be built: {exc}"} for v in sub["variant"]]
-                continue
-            for k, lab in enumerate(sub["variant"], 1):
-                col = orig_to_safe.get(lab)
-                if col is None:
-                    rows.append({"generation": g, "exposure": exposure, "variant": lab, "status": "SKIP",
-                                 "reasons": "variant not found in the genetic file"})
-                    continue
+    ids_seen: dict[tuple, tuple] = {}   # (exposure, frozenset ids) -> generation, for the guard
+    for path, gens_here in by_path.items():
+        cfg_src, used_attr = _cfg_with_raw(cfg, path, raw_attr)
+        log.info("Genetic file %s (cfg.%s) for generations %s", path, used_attr, gens_here)
+        df_gen, _, mapping, _ = _load_genetic_data(cfg_src)
+        orig_to_safe = {v: k for k, v in mapping.items()}
+        needed = [orig_to_safe[v] for v in dict.fromkeys(pairs["variant"]) if v in orig_to_safe]
+        n_missing = len(set(pairs["variant"]) - set(orig_to_safe))
+        log.info("  %d samples, %d/%d requested variants present (%d absent)",
+                 len(df_gen), len(needed), pairs["variant"].nunique(), n_missing)
+        df_small = df_gen[["id"] + needed].copy()
+        del df_gen, mapping
+        gc.collect()
+
+        for g in gens_here:
+            for exposure, sub in pairs.groupby("exposure", sort=False):
+                log.info("Generation %s, exposure %s: %d variants", g, exposure, len(sub))
+                cfg_ge = dataclasses.replace(cfg_src, generation=g, exposure=exposure)
                 try:
-                    rows.append(analyze_one(df, col, lab, exposure, g, Ecols, Ccols, cfg_ge, with_gxc, perm_B))
+                    cov, Ecols, Ccols = _quiet(_build_narrow_covariates, cfg_ge, df_small["id"])
+                    df = pd.merge(cov, df_small, on="id", how="inner")
                 except Exception as exc:
-                    log.exception("g%s %s %s: error", g, exposure, lab)
-                    rows.append({"generation": g, "exposure": exposure, "variant": lab, "status": "FAIL",
-                                 "reasons": f"error: {type(exc).__name__}: {exc}"})
-                if k % 25 == 0:
-                    log.info("  %d/%d", k, len(sub))
-            del df, cov
-            gc.collect()
+                    log.error("g%s %s: dataset could not be built: %s", g, exposure, exc)
+                    rows += [{"generation": g, "exposure": exposure, "variant": v, "status": "SKIP",
+                              "reasons": f"dataset could not be built: {exc}"} for v in sub["variant"]]
+                    continue
+
+                # guard: two generations must not have the same set of samples
+                sig = (exposure, frozenset(df["id"]))
+                if sig in ids_seen and ids_seen[sig] != g:
+                    msg = (f"generation {g} and {ids_seen[sig]} have IDENTICAL samples for {exposure} "
+                           f"(n={len(df)}): generation is not filtering the cohort")
+                    if allow_same_samples:
+                        log.warning(msg)
+                    else:
+                        raise RuntimeError(msg + ". Use --allow-same-samples to ignore.")
+                ids_seen[sig] = g
+                log.info("  cohort g%s %s: n=%d (id examples: %s)", g, exposure, len(df), df["id"].head(3).tolist())
+
+                for k, lab in enumerate(sub["variant"], 1):
+                    col = orig_to_safe.get(lab)
+                    if col is None:
+                        rows.append({"generation": g, "exposure": exposure, "variant": lab, "status": "SKIP",
+                                     "reasons": f"variant not found in {Path(path).name}", "n_cohort": len(df)})
+                        continue
+                    try:
+                        r = analyze_one(df, col, lab, exposure, g, Ecols, Ccols, cfg_ge, with_gxc, perm_B)
+                        r["n_cohort"] = len(df)
+                        rows.append(r)
+                    except Exception as exc:
+                        log.exception("g%s %s %s: error", g, exposure, lab)
+                        rows.append({"generation": g, "exposure": exposure, "variant": lab, "status": "FAIL",
+                                     "reasons": f"error: {type(exc).__name__}: {exc}", "n_cohort": len(df)})
+                    if k % 25 == 0:
+                        log.info("  %d/%d", k, len(sub))
+                del df, cov
+                gc.collect()
+        del df_small
+        gc.collect()
 
     res = pd.DataFrame(rows)
-    lead = ["generation", "exposure", "variant", "status", "reasons"]
+    lead = ["generation", "exposure", "variant", "status", "reasons", "n_cohort"]
     res = res[lead + [c for c in res.columns if c not in lead]]
     res = res.drop(columns=[c for c in ("cfg_max_smd",) if c in res.columns])
     res.to_csv(out / "results_all.csv", index=False)
@@ -691,6 +752,7 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
 
     figs = make_figures(res, out / "figures", bool(perm_B))
     info = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"), "generations": list(generations),
+            "sources": {g: str(sources[g]) for g in generations},
             "n_pairs": int(len(pairs)), "exposures": sorted(pairs["exposure"].unique().tolist()),
             "perm_B": perm_B, "with_gxc": with_gxc, "variants_csv": str(variants_csv),
             "thresholds": {"COND_MAX": COND_MAX, "LEV_WARN": LEV_WARN, "SHIFT_WARN": SHIFT_WARN,
@@ -714,11 +776,23 @@ def main(argv=None) -> int:
     ap.add_argument("variants_csv", help="CSV with columns variant and exposure")
     ap.add_argument("--out-dir", default=None, help="default: cfg.keller_sensitivity_dir (./output/keller_sensitivity)")
     ap.add_argument("--generations", type=int, nargs="+", default=[1, 2])
+    ap.add_argument("--source", action="append", metavar="GEN=PATH",
+                    help="genetic file for a generation (repeatable); defaults: 1=merged_csv/gen.parquet, "
+                         "2 and 3=gen3/gen2_gen3_selected_variants.parquet")
+    ap.add_argument("--raw-attr", default=None,
+                    help="name of the cfg attribute holding RAW_FILE (auto-detected if omitted)")
+    ap.add_argument("--allow-same-samples", action="store_true",
+                    help="do not stop if two generations have identical samples")
     ap.add_argument("--perm", type=int, default=0, metavar="B",
                     help="check the health of the first B permutations per variant (0 = skip; e.g. 500)")
     ap.add_argument("--with-gxc", action="store_true", help="add the G x C model (unstable with rare variants)")
     a = ap.parse_args(argv)
-    run(a.variants_csv, a.out_dir, tuple(a.generations), a.with_gxc, a.perm)
+    sources = {}
+    for s in a.source or []:
+        g, p = s.split("=", 1)
+        sources[int(g)] = p
+    run(a.variants_csv, a.out_dir, tuple(a.generations), a.with_gxc, a.perm,
+        sources=sources, raw_attr=a.raw_attr, allow_same_samples=a.allow_same_samples)
     return 0
 
 

@@ -44,7 +44,7 @@ import pandas as pd
 DEFAULT_GENS = [
     "gen1=/mnt/cresla_prod/genome_datasets/gen1/gen1_onlycases_vcf_chr{chrom}.vcf.gz",
     "gen2_3=/mnt/cresla_prod/genome_datasets/gen2/gen2_vcf_chr{chrom}.vcf.gz,"
-    "/mnt/cresla_prod/genome_datasets/gen3/<nome_gen3>_chr{chrom}.vcf.gz",
+    "/mnt/cresla_prod/genome_datasets/gen3/gen3_vcf_chr{chrom}.vcf.gz",
 ]
 
 
