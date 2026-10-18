@@ -413,21 +413,11 @@ def _cfg_with_raw(cfg, path: str, raw_attr: str | None):
     )
 
 
-def _ids_of(path: str, fallback=None) -> set:
-    """Sample ids of a genetic parquet. Wide files (very many columns) exceed pyarrow's
-    default thrift metadata limits, so they are raised; if reading still fails, `fallback`
-    (a callable path -> iterable of ids, e.g. through the pipeline loader) is used."""
-    try:
-        import pyarrow.parquet as pq
-        big = 2 ** 31 - 1
-        pf = pq.ParquetFile(path, thrift_string_size_limit=big, thrift_container_size_limit=big)
-        return set(pf.read(columns=["id"]).column("id").to_pandas().astype(str))
-    except Exception as exc:
-        if fallback is None:
-            raise
-        print(f"  pyarrow could not read ids of {Path(path).name} ({type(exc).__name__}); "
-              f"using the pipeline loader", file=sys.stderr)
-        return set(pd.Series(list(fallback(path))).astype(str))
+def _pipeline_ids(cfg, path: str, raw_attr, loader) -> set:
+    """Sample ids of a genetic file AS THE PIPELINE SEES THEM (same loader as the analysis),
+    so they are comparable with the ids of the other generations."""
+    c2, _ = _cfg_with_raw(cfg, path, raw_attr)
+    return set(loader(c2)[0]["id"].astype(str))
 
 
 # ============================================================================
@@ -700,7 +690,17 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
     rows = []
     ids_seen: dict[tuple, frozenset] = {}   # (exposure, generation) -> ids, for the overlap guard
     n_removed: dict[str, int] = {}
-    for path, gens_here in by_path.items():
+    # Overlap rule: a sample present in the file of a HIGHER generation belongs to that generation
+    # and is removed from the lower one (e.g. gen2/3 samples are removed from gen 1).
+    # Higher generations are therefore processed first and their ids accumulated.
+    higher_ids: set = set()
+    if dedup:
+        lo = min(generations)
+        for g2, p2 in sources.items():
+            if g2 > lo and str(p2) not in by_path and Path(p2).exists():
+                log.info("Reading ids of %s (generation %s, not analysed) to remove overlaps", p2, g2)
+                higher_ids |= _pipeline_ids(cfg, str(p2), raw_attr, _load_genetic_data)
+    for path, gens_here in sorted(by_path.items(), key=lambda kv: -max(kv[1])):
         cfg_src, used_attr = _cfg_with_raw(cfg, path, raw_attr)
         log.info("Genetic file %s (cfg.%s) for generations %s", path, used_attr, gens_here)
         df_gen, _, mapping, _ = _load_genetic_data(cfg_src)
@@ -713,17 +713,12 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 2), with_
         del df_gen, mapping
         gc.collect()
         if dedup:
-            # a sample that also appears in another generation's file belongs to THAT generation
-            other = set()
-            for p2 in {str(v) for v in sources.values()} - {str(path)}:
-                def _via_pipeline(pp, _cfg=cfg, _attr=raw_attr):
-                    c2, _ = _cfg_with_raw(_cfg, pp, _attr)
-                    return _load_genetic_data(c2)[0]["id"]
-                other |= _ids_of(p2, fallback=_via_pipeline)
-            hit = df_small["id"].astype(str).isin(other)
+            ids_all = df_small["id"].astype(str)
+            hit = ids_all.isin(higher_ids)
             n_removed[path] = int(hit.sum())
-            log.info("  removed %d samples also present in the other generation file(s); %d left",
-                     int(hit.sum()), int((~hit).sum()))
+            log.info("  generations %s: removed %d samples that belong to a higher generation; %d left",
+                     gens_here, int(hit.sum()), int((~hit).sum()))
+            higher_ids |= set(ids_all)          # all ids of this file, before removal
             df_small = df_small[~hit].reset_index(drop=True)
 
         for g in gens_here:
