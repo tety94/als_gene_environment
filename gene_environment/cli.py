@@ -17,6 +17,8 @@ Examples:
     python -m gene_environment.cli run-c9-check               # restricted genotype/env/C9orf72 merge (see report/c9_check.py)
     python -m gene_environment.cli generate-c9-stats          # per-exposure close-vs-far + C9ORF72 stats (needs run-c9-check first)
     python -m gene_environment.cli keller-sensitivity varianti.csv
+    python -m gene_environment.cli kinout-check               # leave-k-out robustness check, sets to_use=0 / reason='k_in_out' (see analysis/kinout_check.py)
+    python -m gene_environment.cli kinout-check --dry-run     # same, without writing to the DB
     python -m gene_environment.cli pipeline-order    # print the recommended order
 """
 from __future__ import annotations
@@ -53,6 +55,11 @@ Recommended execution order:
  10. generate-reports         Generates the Word/CSV/figure reports (Table 1, Table 2,
                                Table 2b, annotated tables) -- run any time after the
                                relevant upstream steps have populated the DB/CSVs
+ 11. kinout-check             (optional robustness) leave-k-out on the variants returned by
+                               get_significant_results: drops the most influential carriers,
+                               re-runs the pipeline test, sets to_use=0 / reason='k_in_out' on
+                               the variants that do not hold. One generation per run (from the
+                               .env): run it once per generation.
 
 Steps 4 and 5 can be repeated as many times as needed during the
 "run-model" run (e.g. from cron), to always have an up-to-date snapshot
@@ -103,6 +110,16 @@ def main(argv: list[str] | None = None) -> int:
     p_keller.add_argument("--generations", type=int, nargs="+", default=[1, 23])
     p_keller.add_argument("--perm", type=int, default=0, metavar="B", help="Salute delle prime B permutazioni per variante (0=salta)")
     p_keller.add_argument("--boot", type=int, default=None, metavar="B", help="Repliche bootstrap (default: 1000)")
+
+    p_kinout = sub.add_parser(
+        "kinout-check",
+        help="Leave-k-out check on the significant variants: removes the most influential carriers, re-runs the test, sets to_use=0 / reason='k_in_out'",
+    )
+    p_kinout.add_argument("--frac", type=float, default=0.20, help="Fraction of carriers to remove (default: 0.20, at least 1 carrier)")
+    p_kinout.add_argument("--n-perm", type=int, default=1000, help="Permutations of the re-run test (default: 1000)")
+    p_kinout.add_argument("--dry-run", action="store_true", help="Do everything except the UPDATE on variant_results_significant")
+    p_kinout.add_argument("--workers", type=int, default=None, help="Default: config.max_workers")
+    p_kinout.add_argument("--no-baseline", action="store_true", help="Skip the control run (same test, nothing removed)")
 
     p_final = sub.add_parser(
         "recalculate-final",
@@ -187,6 +204,16 @@ def main(argv: list[str] | None = None) -> int:
         run_keller_sensitivity(
             args.variants_csv, args.out_dir, tuple(args.generations),
             perm_B=args.perm, boot_B=args.boot,
+        )
+
+    elif args.command == "kinout-check":
+        from gene_environment.analysis.kinout_check import run_kinout_check
+        run_kinout_check(
+            frac=args.frac,
+            n_perm=args.n_perm,
+            dry_run=args.dry_run,
+            workers=args.workers,
+            baseline=not args.no_baseline,
         )
 
     elif args.command == "recalculate-final":
