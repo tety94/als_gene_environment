@@ -96,13 +96,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_keller = sub.add_parser(
         "keller-sensitivity",
-        help="Diagnostica dei fit + sensitivity Keller (C x E) per una lista di varianti/esposizioni, entrambe le generazioni",
+        help="Sensitivity Keller: modello completo (G x E + C + C x E + C x G), bootstrap, meta-analisi tra coorti",
     )
     p_keller.add_argument("variants_csv", help="CSV con colonne variant ed exposure")
     p_keller.add_argument("--out-dir", default=None, help="Default: config.keller_sensitivity_dir")
-    p_keller.add_argument("--generations", type=int, nargs="+", default=[1, 2])
-    p_keller.add_argument("--perm", type=int, default=0, metavar="B", help="Controlla la salute delle prime B permutazioni per variante (0=salta)")
-    p_keller.add_argument("--with-gxc", action="store_true", help="Aggiunge il modello con G x C")
+    p_keller.add_argument("--generations", type=int, nargs="+", default=[1, 23])
+    p_keller.add_argument("--perm", type=int, default=0, metavar="B", help="Salute delle prime B permutazioni per variante (0=salta)")
+    p_keller.add_argument("--boot", type=int, default=None, metavar="B", help="Repliche bootstrap (default: 1000)")
 
     p_final = sub.add_parser(
         "recalculate-final",
@@ -185,7 +185,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "keller-sensitivity":
         from gene_environment.analysis.keller_sensitivity import run as run_keller_sensitivity
         run_keller_sensitivity(
-            args.variants_csv, args.out_dir, tuple(args.generations), args.with_gxc, args.perm,
+            args.variants_csv, args.out_dir, tuple(args.generations),
+            perm_B=args.perm, boot_B=args.boot,
         )
 
     elif args.command == "recalculate-final":
