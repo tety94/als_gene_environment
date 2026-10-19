@@ -33,8 +33,8 @@ STATUS: STABLE | CHANGED | NO_CI | NOT_EVALUABLE | SKIP | FAIL (NO_CI = bootstra
 
 OUTPUT (default ./output/keller_sensitivity, cfg.keller_sensitivity_dir):
     results_all.csv, results_gen<N>.csv, summary_by_gen_exposure.csv, sensitivity_table.csv,
-    meta_analysis.csv, all_variants_table.csv, keller_sensitivity_report.docx, figures/*.png,
-    run_info.json
+    meta_analysis.csv, all_variants_table.csv, recap_passo_per_passo.txt, varianti_tolte.txt,
+    keller_sensitivity_report.docx, figures/*.png, run_info.json
 
 Usage:
     python keller_sensitivity.py variants.csv --generations 1 23
@@ -851,6 +851,254 @@ def build_docx(res, summ, sens, meta, wide, figs, path: Path, info: dict) -> Non
 
 
 # ============================================================================
+# Recap files: what is kept, what is removed, and why
+# ============================================================================
+RECAP_STEPS = {
+    1: "Fit ben posto (rango, condizionamento, SE finita) in base e full",
+    2: "SMD effetti principali <= MAX_SMD della pipeline",
+    3: "Concordanza dei 3 percorsi (smf.ols, fast path, design)",
+    4: "IC bootstrap disponibile (almeno meta' delle repliche valide)",
+    5: "Nessuna inversione di segno con IC95% del cambio che esclude 0",
+    6: "Cambio di stima sotto soglia (o IC95% del cambio che include 0)",
+    7: "Significativa anche nel modello completo (p_full < 0.05)",
+    8: "Passa i passi 1-7 su TUTTI i raggi della stessa esposizione (es. seminativi_1000 e seminativi_1500), stessa coorte",
+}
+# steps 1-4: pair NOT ASSESSABLE (no evidence against the variant); steps 5-6: pair REMOVED (confounding);
+# step 7: REMOVED (not significant in the full model); step 8: REMOVED (does not hold on all radii)
+
+
+def _land_use(exposure: str) -> str:
+    """'seminativi_1000' -> 'seminativi' (the radius is the trailing number)."""
+    head, _, tail = str(exposure).rpartition("_")
+    return head if head and tail.isdigit() else str(exposure)
+
+
+def _b(x) -> bool:
+    return False if x is None or (isinstance(x, float) and np.isnan(x)) else bool(x)
+
+
+def _gen_label(g) -> str:
+    return "gen1" if int(g) == 1 else "gen2/3"
+
+
+def _pair_failures(r, max_smd: float) -> list:
+    """(step, text) for every criterion the pair does not pass (only the computable ones)."""
+    if pd.isna(r.get("ok_base")):
+        return [(1, f"errore tecnico: {r.get('reasons', '')}")]
+    f = []
+    if not (_b(r.get("ok_base")) and _b(r.get("ok_full"))):
+        f.append((1, f"ok_base={_b(r.get('ok_base'))} ok_full={_b(r.get('ok_full'))}"))
+    smd = r.get("max_smd_main")
+    if pd.notna(smd) and smd > max_smd:
+        f.append((2, f"SMD={smd:.3f}"))
+    if pd.notna(r.get("concordant")) and not _b(r.get("concordant")):
+        f.append((3, f"percorsi discordanti maxdiff={r.get('conc_maxdiff')}"))
+    if _b(r.get("evaluable")):
+        lo, hi = r.get("boot_lo"), r.get("boot_hi")
+        if pd.isna(lo):
+            bv = r.get("boot_valid")
+            bb = r.get("boot_B")
+            f.append((4, f"IC bootstrap non disponibile (repliche valide "
+                         f"{0 if pd.isna(bv) else int(bv)}/{0 if pd.isna(bb) else int(bb)})"))
+        else:
+            ci = f"IC95% [{lo:.2f}, {hi:.2f}]"
+            if _b(r.get("flag_sign")):
+                f.append((5, f"segno invertito (beta_base={r['beta_base']:.2f} -> beta_full={r['beta_full']:.2f}) {ci}"))
+            if _b(r.get("flag_change")):
+                f.append((6, f"cambio={r['rel_shift_full']:+.0%} {ci}"))
+    pf = r.get("p_full")
+    if pd.notna(pf) and pf >= T["SIG_ALPHA"]:
+        f.append((7, f"p_full={pf:.4f}"))
+    return f
+
+
+def write_recaps(res: pd.DataFrame, meta: pd.DataFrame, out, max_smd: float) -> list:
+    """Write recap_passo_per_passo.txt and varianti_tolte.txt into `out`."""
+    out = Path(out)
+    thr_main, thr_sens = T["CHANGE_MAIN"], T["CHANGE_SENSITIVITY"]
+    alpha = T["SIG_ALPHA"]
+    n_tot = res["variant"].nunique()
+    if "p_base" not in res.columns:
+        return []
+    sig = res[res["p_base"] < alpha]
+    rows = []
+    for _, r in sig.iterrows():
+        fl = _pair_failures(r, max_smd)
+        rows.append({"variant": r["variant"], "exposure": r["exposure"], "coorte": _gen_label(r["generation"]),
+                     "fails": fl, "first": min(s_ for s_, _ in fl) if fl else None, "row": r})
+    rows.sort(key=lambda p_: (p_["variant"], p_["exposure"], p_["coorte"]))
+
+    # step 8: every radius of the same land use must pass steps 1-7, in the same cohort
+    exposures_by_use: dict = {}
+    for e_ in res["exposure"].unique():
+        exposures_by_use.setdefault(_land_use(e_), []).append(e_)
+    survive7 = {(p_["variant"], p_["exposure"], p_["coorte"]) for p_ in rows if not p_["fails"]}
+    by_key = {(p_["variant"], p_["exposure"], p_["coorte"]): p_ for p_ in rows}
+    pb_all = {(r_["variant"], r_["exposure"], _gen_label(r_["generation"])): r_.get("p_base")
+              for _, r_ in res.iterrows()}
+    for p_ in rows:
+        bad = []
+        for e_ in sorted(x for x in exposures_by_use[_land_use(p_["exposure"])] if x != p_["exposure"]):
+            key = (p_["variant"], e_, p_["coorte"])
+            if key in survive7:
+                continue
+            q_ = by_key.get(key)
+            if q_ is not None:
+                s_, t_ = min(q_["fails"])
+                bad.append(f"{e_}: tolta/non valutabile al passo {s_} ({t_})")
+            else:
+                pb_ = pb_all.get(key)
+                bad.append(f"{e_}: " + ("nessun risultato" if pb_ is None or pd.isna(pb_)
+                                        else f"p_base={pb_:.4f} (>= {alpha}, non nel punto di partenza)"))
+        if bad and not any(s_ == 8 for s_, _ in p_["fails"]):
+            p_["fails"].append((8, "; ".join(bad)))
+        p_["first"] = min(s_ for s_, _ in p_["fails"]) if p_["fails"] else None
+    n_var_sig = len({p_["variant"] for p_ in rows})
+    w = max([22] + [len(p_["variant"]) for p_ in rows]) + 2
+    het = {}
+    if len(meta) and "flag_het" in meta.columns:
+        het = {(m_["variant"], m_["exposure"]): m_ for _, m_ in meta.iterrows()}
+    bar, thin = "=" * 100, "-" * 100
+
+    # ---------------------------------------------------------------- recap passo per passo
+    L = ["RECAP PASSO PER PASSO: coppie (variante x esposizione x coorte) fermate a ogni criterio", bar,
+         f"Punto di partenza: coppie con effetto G:E significativo nel modello base (p_base < {alpha}, HC3):",
+         f"  {len(rows)} coppie, {n_var_sig} varianti distinte (su {n_tot} varianti totali del file).",
+         "Ogni coppia e' fermata al PRIMO criterio che non supera; le coppie gia' fermate non compaiono nei passi seguenti.",
+         "  Passi 1-4: NON VALUTABILE (non e' evidenza contro la variante).",
+         f"  Passi 5-6: TOLTA per confondimento (il cambio base -> full e' reale: IC95% bootstrap esclude 0; soglia {thr_main:.0%}).",
+         f"  Passo 7: TOLTA se non significativa nel modello completo (p_full >= {alpha}).",
+         "  Passo 8: TOLTA se l'altro raggio della stessa esposizione (stessa coorte) non ha superato i passi 1-7.",
+         "L'eterogeneita' tra coorti e' solo riportata: non toglie nulla.", ""]
+    remaining = list(rows)
+    for s_ in range(1, 9):
+        stopped = [p_ for p_ in remaining if p_["first"] == s_]
+        kind = "non valutabili" if s_ <= 4 else "tolte"
+        before = len(remaining)
+        remaining = [p_ for p_ in remaining if p_["first"] != s_]
+        L += [thin, f"PASSO {s_}: {RECAP_STEPS[s_]}",
+              f"  coppie prima: {before} | {kind}: {len(stopped)} | rimaste: {len(remaining)}",
+              f"  varianti distinte rimaste: {len({p_['variant'] for p_ in remaining})}"]
+        if stopped:
+            L.append(f"  {'variante':<{w}}{'esposizione':<18}{'coorte':<8}valore")
+            for p_ in stopped:
+                txt = next(t_ for st_, t_ in p_["fails"] if st_ == s_)
+                L.append(f"  {p_['variant']:<{w}}{p_['exposure']:<18}{p_['coorte']:<8}{txt}")
+        L.append("")
+
+    L += [bar, f"RIMASTE: {len(remaining)} coppie, {len({p_['variant'] for p_ in remaining})} varianti distinte",
+          f"  {'variante':<{w}}{'esposizione':<18}{'coorte':<8}{'beta_base':>10}{'p_base':>9}{'beta_full':>11}"
+          f"{'p_full':>9}{'cambio':>9}  IC95% del cambio"]
+    for p_ in remaining:
+        r = p_["row"]
+        L.append(f"  {p_['variant']:<{w}}{p_['exposure']:<18}{p_['coorte']:<8}{r['beta_base']:>10.3f}{r['p_base']:>9.4f}"
+                 f"{r['beta_full']:>11.3f}{r['p_full']:>9.4f}{r['rel_shift_full']:>+9.0%}  "
+                 f"[{r['boot_lo']:.2f}, {r['boot_hi']:.2f}]")
+
+    reached = [p_ for p_ in rows if p_["first"] is None or p_["first"] >= 5]
+    L += ["", thin, "SENSIBILITA' ALLA SOGLIA DI CAMBIO (stessa condizione sull'IC), sulle coppie che arrivano al passo 5",
+          f"  {'soglia':<8}{'coppie tolte':>14}{'varianti con almeno una coppia tolta':>40}"]
+    for thr in sorted({thr_main, *thr_sens}):
+        hit = [p_ for p_ in reached if _b(p_["row"].get("boot_excl0")) and abs(p_["row"]["rel_shift_full"]) >= thr]
+        L.append(f"  {thr:<8.0%}{len(hit):>14}{len({p_['variant'] for p_ in hit}):>40}")
+
+    fin: dict = {}
+    for p_ in remaining:
+        fin.setdefault((p_["variant"], _land_use(p_["exposure"])), set()).add(p_["coorte"])
+    L += ["", thin, f"VARIANTI RIMASTE: {len({v_ for v_, _ in fin})} varianti, {len(fin)} combinazioni "
+                    "variante x esposizione (tutti i raggi superati)",
+          f"  {'variante':<{w}}{'esposizione':<18}coorti in cui tiene"]
+    for (v_, u_), cs_ in sorted(fin.items()):
+        L.append(f"  {v_:<{w}}{u_:<18}{' + '.join(sorted(cs_))}")
+    L.append(f"  tenute in entrambe le coorti: {sum(1 for cs_ in fin.values() if len(cs_) == 2)}")
+    L += ["", thin, "SOLO RIPORTATO (non toglie nulla)"]
+    by_pair: dict = {}
+    for p_ in remaining:
+        by_pair.setdefault((p_["variant"], p_["exposure"]), {})[p_["coorte"]] = p_["row"]
+    by_stable: dict = {}   # all STABLE pairs, whatever their p_base (a cohort may have p_base >= alpha)
+    for _, r in res[res["status"] == "STABLE"].iterrows():
+        by_stable.setdefault((r["variant"], r["exposure"]), {})[_gen_label(r["generation"])] = r
+    both = [(k, d_) for k, d_ in sorted(by_stable.items())
+            if {"gen1", "gen2/3"} <= set(d_)
+            and d_["gen1"]["p_full"] < alpha and d_["gen2/3"]["p_full"] < alpha
+            and np.sign(d_["gen1"]["beta_full"]) == np.sign(d_["gen2/3"]["beta_full"])]
+    L.append(f"  significative nel full in entrambe le coorti con segno concorde (su tutte le coppie STABLE, "
+             f"qualunque p_base): {len(both)} coppie, "
+             f"{len({k[0] for k, _ in both})} varianti")
+    for (v, e), d_ in both:
+        L.append(f"    {v:<{w}}{e:<18}beta_full gen1={d_['gen1']['beta_full']:.2f} (p={d_['gen1']['p_full']:.4f})  "
+                 f"gen2/3={d_['gen2/3']['beta_full']:.2f} (p={d_['gen2/3']['p_full']:.4f})")
+    hk = [k for k in by_pair if k in het and _b(het[k].get("flag_het"))]
+    L.append(f"  eterogeneita' tra coorti (Q di Cochran p < {T['HET_ALPHA']}): {len(hk)} coppie")
+    for v, e in sorted(hk):
+        L.append(f"    {v:<{w}}{e:<18}Q_p={het[(v, e)]['Q_p']:.4f}")
+    L += ["", bar, "LEGENDA CRITERI"] + [f"  [{k}] {v}" for k, v in RECAP_STEPS.items()]
+    L.append(f"  Soglie: cambio {thr_main:.0%} (sensibilita' " + ", ".join(f"{x:.0%}" for x in thr_sens)
+             + f"), MAX_SMD {max_smd}, bootstrap B={int(res['boot_B'].dropna().max()) if 'boot_B' in res and res['boot_B'].notna().any() else 0}")
+    (out / "recap_passo_per_passo.txt").write_text("\n".join(L) + "\n", encoding="utf-8")
+
+    # ---------------------------------------------------------------- varianti tolte
+    by_var: dict = {}
+    for p_ in rows:
+        by_var.setdefault(p_["variant"], []).append(p_)
+    never = sorted(set(res["variant"]) - set(by_var))
+    A, B, C = [], [], []
+    for v, ps in sorted(by_var.items()):
+        kept = [p_ for p_ in ps if p_["first"] is None]
+        (C if len(kept) == len(ps) else B if kept else A).append((v, ps))
+    A_evid = [v for v, ps in A if any(p_["first"] >= 5 for p_ in ps)]
+
+    def pair_line(p_):
+        if p_["first"] is None:
+            return None
+        lab = "NON VALUTABILE" if p_["first"] <= 4 else "TOLTA"
+        return (f"    {p_['exposure']:<16}  {p_['coorte']:<7} p_base={p_['row']['p_base']:.4f} -> {lab}: "
+                + "; ".join(f"[{s_}] {t_}" for s_, t_ in p_["fails"]))
+
+    V = ["VARIANTI TOLTE O NON VALUTABILI", bar, f"Varianti totali nel file: {n_tot}",
+         f"  mai significative nel modello base (non entrano nel recap): {len(never)}",
+         f"  significative in almeno una coppia: {n_var_sig}",
+         f"    nessuna coppia tenuta: {len(A)} (di cui con almeno una coppia TOLTA per evidenza: {len(A_evid)}; "
+         f"solo coppie non valutabili: {len(A) - len(A_evid)})",
+         f"    tenute, ma con alcune coppie tolte o non valutabili: {len(B)}",
+         f"    tenute, tutte le coppie significative superano i criteri: {len(C)}", "",
+         "A) NESSUNA COPPIA TENUTA, con motivo per ogni coppia (tutti i criteri non superati)", thin]
+    for v, ps in A:
+        V.append(v)
+        V += [pair_line(p_) for p_ in ps]
+    V += ["", "B) VARIANTI TENUTE MA CON ALCUNE COPPIE TOLTE O NON VALUTABILI (solo le coppie non tenute)", thin]
+    for v, ps in B:
+        V.append(v)
+        V += [pair_line(p_) for p_ in ps if p_["first"] is not None]
+    V += ["", "C) VARIANTI TENUTE SENZA PROBLEMI (coppie significative nel base, tutte tenute)", thin]
+    for v, ps in C:
+        V.append(f"{v:<{w}}" + ", ".join(f"{p_['exposure']}/{p_['coorte']}" for p_ in ps))
+    V += ["", "D) VARIANTI MAI SIGNIFICATIVE NEL MODELLO BASE (nessuna coppia con p_base < "
+          f"{alpha})", thin]
+    for v in never:
+        pm = res.loc[res["variant"] == v, "p_base"].min()
+        V.append(f"{v}   p_base minimo={'n.d.' if pd.isna(pm) else f'{pm:.4f}'}")
+    V += ["", bar, "LEGENDA CRITERI"] + [f"  [{k}] {v}" for k, v in RECAP_STEPS.items()]
+    V += ["  Passi 1-4 = NON VALUTABILE (nessuna evidenza contro la variante).",
+          "  Passi 5-8 = TOLTA: 5-6 confondimento, 7 non significativa nel full, 8 non regge su tutti i raggi."]
+    (out / "varianti_tolte.txt").write_text("\n".join(V) + "\n", encoding="utf-8")
+    return [out / "recap_passo_per_passo.txt", out / "varianti_tolte.txt"]
+
+
+def recap_from_dir(d: str) -> None:
+    """Regenerate the recap files from an existing output folder (no re-run)."""
+    d = Path(d)
+    res = pd.read_csv(d / "results_all.csv")
+    meta = pd.read_csv(d / "meta_analysis.csv") if (d / "meta_analysis.csv").exists() else pd.DataFrame()
+    max_smd = 0.25
+    if (d / "run_info.json").exists():
+        max_smd = float(json.loads((d / "run_info.json").read_text()).get("pipeline", {}).get("max_smd", max_smd))
+    for p_ in write_recaps(res, meta, d, max_smd):
+        print("written", p_)
+
+
+
+# ============================================================================
 # Orchestration
 # ============================================================================
 def run(variants_csv: str, out_dir: str | None = None, generations=(1, 23), *, perm_B: int = 0,
@@ -997,6 +1245,7 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 23), *, p
     meta.to_csv(out / "meta_analysis.csv", index=False)
     wide = all_variants_table(res, meta)
     wide.to_csv(out / "all_variants_table.csv", index=False)
+    write_recaps(res, meta, out, max_smd_used)
 
     figs = make_figures(res, out / "figures", bool(perm_B))
     thresholds_saved = {k: (list(v) if isinstance(v, tuple) else v) for k, v in T.items()}
@@ -1025,7 +1274,10 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 23), *, p
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Keller sensitivity (full model, bootstrap, meta-analysis)")
-    ap.add_argument("variants_csv", help="CSV with columns variant and exposure")
+    ap.add_argument("variants_csv", nargs="?", help="CSV with columns variant and exposure")
+    ap.add_argument("--recap-from", default=None, metavar="DIR",
+                    help="only regenerate recap_passo_per_passo.txt and varianti_tolte.txt from an existing output "
+                         "folder (needs results_all.csv; no re-run)")
     ap.add_argument("--out-dir", default=None, help="default: cfg.keller_sensitivity_dir (./output/keller_sensitivity)")
     ap.add_argument("--generations", type=int, nargs="+", default=[1, 23],
                     help="default: 1 and 23 (23 = gen2+gen3 pooled, as GENERATION in the .env)")
@@ -1039,6 +1291,11 @@ def main(argv=None) -> int:
     ap.add_argument("--boot", type=int, default=None, metavar="B",
                     help=f"bootstrap replicates (default {T['BOOT_B']}; use a small value only for test runs)")
     a = ap.parse_args(argv)
+    if a.recap_from:
+        recap_from_dir(a.recap_from)
+        return 0
+    if not a.variants_csv:
+        ap.error("variants_csv is required (or use --recap-from DIR)")
     sources = {}
     for s in a.source or []:
         g, p = s.split("=", 1)
