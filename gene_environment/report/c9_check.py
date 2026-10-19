@@ -4,38 +4,37 @@ c9_check.py
 Pipeline:
 1. Calls the stored procedure `get_annotated_results()` -> gets
    (exposure, gene_name, variant, gna.*)
-2. Filters the RAW_FILE parquet columns, keeping only those matching
-   `variant` or `"char_" + variant` present in (1), plus the sample
-   identifier column(s).
-3. Saves a "restricted" CSV (genotypes of the annotated variants only).
-4. Joins with ENV_FILE (environmental components) on the patient/sample key.
-5. Joins with CODICE_GEN_FILE to attach the parals_codals / mutaz columns.
-6. Assigns a `generation` column: 1 if the id is in the gen1 VCF, 2 if
-   it's in the gen2 VCF. Rows whose id appears in NEITHER VCF are
-   dropped.
-7. Saves the list of variant columns, the variant -> exposure(s) map, and
-   the variant -> gene (gene_name / gene_symbol) map (all three reused by
-   generate_c9_stats.py to build the per-exposure reports), and the final
-   merged CSV, to OUT_DIR.
+2. For EACH generation reads its own genetic parquet, keeping only the
+   columns matching `variant` or `"char_" + variant` from (1):
+       gen 1  -> GEN1_FILE
+       gen 23 -> GEN23_FILE  (gen2 + gen3 pooled, as in keller_sensitivity.py)
+   The generation is decided by the SOURCE FILE, not by the VCFs.
+3. Overlap rule (same as keller_sensitivity.py): a sample present in the
+   higher-generation file belongs to that generation and is removed from
+   the lower one.
+4. Concatenates the cohorts (variant columns missing in one file -> NaN)
+   and saves the "restricted" CSV.
+5. Joins with ENV_FILE (validated m:1) and with CODICE_GEN_FILE.
+6. Saves the coverage-by-generation report, the list of variant columns,
+   the variant -> exposure map, the variant -> gene map (reused by
+   generate_c9_stats.py) and the final merged CSV.
 
+NB: the `generation` column now takes the values 1 and 23 (23 = gen2+gen3),
+the same labels used by keller_sensitivity.py. Change GEN23_LABEL if
+generate_c9_stats.py expects 2.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 import pandas as pd
 import pyarrow.parquet as pq
 
-# Import of the function already existing in the codebase.
-# Adjust the module path if get_annotated_results lives elsewhere
-# (e.g. `from db_utils import get_annotated_results`)
 from gene_environment.db.repository import get_annotated_results
-from gene_environment.report.vcf_utils import get_sample_ids
 from gene_environment.utils.id_utils import clean_sample_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -44,29 +43,33 @@ log = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------
-RAW_FILE = "/mnt/cresla_prod/genome_datasets/merged_csv/gen.parquet"
+GEN1_FILE = "/mnt/cresla_prod/genome_datasets/merged_csv/gen.parquet"
+GEN23_FILE = "/mnt/cresla_prod/genome_datasets/gen3/gen2_gen3_selected_variants.parquet"
+GEN1_LABEL = 1
+GEN23_LABEL = 23  # gen2 + gen3 pooled
+
+# Ordered from the HIGHEST generation to the lowest: higher ones win on overlaps.
+SOURCES: List[Tuple[int, str]] = [(GEN23_LABEL, GEN23_FILE), (GEN1_LABEL, GEN1_FILE)]
+
 ENV_FILE = "/srv/python-projects/gene_environment_v2/data/componenti_ambientali_full.csv"
 OUT_DIR = Path("/mnt/cresla_prod/stefano_ge/c9_check")
 
 RESTRICTED_CSV = OUT_DIR / "gen_restricted_variants.csv"
 MERGED_CSV = OUT_DIR / "c9_check_merged.csv"
 CODICE_GEN_FILE = OUT_DIR / "codice_gen.csv"
-VCF_FILE_GEN1 = "/mnt/cresla_prod/genome_datasets/gen1/gen1_onlycases_vcf_chr22.vcf.gz"
-VCF_FILE_GEN2 = "/mnt/cresla_prod/genome_datasets/gen2/gen2_vcf_chr22.vcf.gz"
-VARIANT_COLS_FILE = OUT_DIR / "variant_columns.json"  # list of variant columns, reused by generate_c9_stats.py
-VARIANT_EXPOSURE_MAP_FILE = OUT_DIR / "variant_exposure_map.json"  # column -> list of exposures (raw, untranslated)
-VARIANT_GENE_MAP_FILE = OUT_DIR / "variant_gene_map.json"  # column -> {"gene_name": ..., "gene_symbol": ...}
+COVERAGE_CSV = OUT_DIR / "variant_coverage_by_generation.csv"
+VARIANT_COLS_FILE = OUT_DIR / "variant_columns.json"
+VARIANT_EXPOSURE_MAP_FILE = OUT_DIR / "variant_exposure_map.json"
+VARIANT_GENE_MAP_FILE = OUT_DIR / "variant_gene_map.json"
 
-# In the parquet the sample id is NOT a column: it's the DataFrame index
-# (as in _load_genetic_data). In the environmental CSV, the id is instead
-# a real column (the first one).
-ID_COL_RAW = "id"  # name we give the index after reset_index()
+# In the parquet the sample id is the DataFrame index; in the env CSV it's
+# the first column.
+ID_COL_RAW = "id"
 
-ID_COLS_RAW = [ID_COL_RAW]
-
-# If the id column names differ between RAW and ENV, map them here:
-# {"name_in_env": "name_in_raw"}
-JOIN_RENAME_ENV_TO_RAW: Dict[str, str] = {}
+THRIFT_LIMITS = dict(
+    thrift_string_size_limit=2_000_000_000,
+    thrift_container_size_limit=2_000_000_000,
+)
 
 
 def first_column_name(path: str) -> str:
@@ -74,59 +77,90 @@ def first_column_name(path: str) -> str:
 
 
 def get_target_columns(annotated_df: pd.DataFrame) -> Set[str]:
-    """Builds the set of column names to look for in the parquet: both
-    `variant` and `char_<variant>`."""
+    """Column names to look for in the parquet: `variant` and `char_<variant>`."""
     variants = annotated_df["variant"].dropna().unique().tolist()
-    targets = set(variants) | {f"char_{v}" for v in variants}
-    return targets
+    return set(variants) | {f"char_{v}" for v in variants}
 
 
 def filter_parquet_columns(raw_file: str, target_variants: Set[str]) -> List[str]:
-    """Reads only the parquet schema (without loading it all into memory)
-    and returns the list of variant columns matching target_variants.
-    The sample id is NOT among these columns: it's the index, handled
-    separately at read time (use_pandas_metadata=True)."""
-    schema_cols = pq.ParquetFile(
-        raw_file,
-        thrift_string_size_limit=2_000_000_000,
-        thrift_container_size_limit=2_000_000_000,
-    ).schema.names
-
+    """Reads only the parquet schema and returns the matching variant columns."""
+    schema_cols = pq.ParquetFile(raw_file, **THRIFT_LIMITS).schema.names
     matched = [c for c in schema_cols if c in target_variants]
-
-    log.info("Variant columns found in the parquet: %d / %d targets", len(matched), len(target_variants))
+    log.info("%s: variant columns found %d / %d targets", Path(raw_file).name, len(matched), len(target_variants))
     if not matched:
-        log.warning("No variant column matched. Check the naming format (char_ prefix?).")
-
+        log.warning("%s: no variant column matched (char_ prefix?).", raw_file)
     return matched
 
 
-def get_vcf_sample_ids(vcf_path: str) -> Set[str]:
-    """Reads ONLY the VCF header (bcftools query -l, no writing, no
-    modification of the file). Applies clean_sample_id to normalize
-    doubled ids (e.g. ACH10008_ACH10008 -> ACH10008)."""
-    if not os.path.exists(vcf_path):
-        raise FileNotFoundError(f"VCF not found: {vcf_path}")
+def load_generation(path: str, target_variants: Set[str], label: int) -> Tuple[pd.DataFrame, List[str]]:
+    """Reads one genetic file restricted to the target columns (+ index as id)."""
+    if not Path(path).exists():
+        raise FileNotFoundError(f"genetic file for generation {label} not found: {path}")
+    cols = filter_parquet_columns(path, target_variants)
+    pf = pq.ParquetFile(path, **THRIFT_LIMITS)
+    # the index (sample id) is rebuilt by use_pandas_metadata=True
+    df = pf.read(columns=cols, use_pandas_metadata=True).to_pandas()
+    df.index = df.index.astype(str).map(clean_sample_id)
+    df.index.name = ID_COL_RAW
+    df = df.reset_index()
 
-    raw_ids = get_sample_ids(vcf_path)
-    cleaned = {clean_sample_id(rid) for rid in raw_ids}
-    log.info("Sample ids found in the VCF: %d (raw example: %s)", len(raw_ids), raw_ids[:1])
-    return cleaned
+    dup = df[ID_COL_RAW].duplicated(keep=False)
+    if dup.any():
+        log.warning("gen %s: %d rows with duplicated ids (e.g. %s)",
+                    label, int(dup.sum()), df.loc[dup, ID_COL_RAW].unique()[:5].tolist())
+    df["generation"] = label
+    log.info("gen %s: %d samples, %d variant columns", label, len(df), len(cols))
+    return df, cols
+
+
+def build_cohorts(target_variants: Set[str]) -> Tuple[pd.DataFrame, List[str]]:
+    """Loads every generation (highest first) and removes from each the
+    samples that already belong to a higher generation."""
+    frames, all_cols, seen_ids = [], [], set()
+    for label, path in SOURCES:
+        df, cols = load_generation(path, target_variants, label)
+        ids = df[ID_COL_RAW].astype(str)
+        hit = ids.isin(seen_ids)
+        if hit.any():
+            log.warning("gen %s: removed %d samples that belong to a higher generation", label, int(hit.sum()))
+        seen_ids |= set(ids)  # all ids of this file, before removal (as keller_sensitivity.py)
+        frames.append(df[~hit])
+        all_cols += [c for c in cols if c not in all_cols]
+
+    raw_df = pd.concat(frames, ignore_index=True)  # missing columns -> NaN
+    selected_cols = [c for c in all_cols if c in raw_df.columns]
+    raw_df = raw_df[[ID_COL_RAW, "generation"] + selected_cols]
+    raw_df["generation"] = raw_df["generation"].astype(int)
+
+    if raw_df[ID_COL_RAW].duplicated().any():
+        log.warning("Duplicated ids remain after concat (within-file duplicates): %d",
+                    int(raw_df[ID_COL_RAW].duplicated().sum()))
+    log.info("Cohorts: %s", raw_df["generation"].value_counts().sort_index().to_dict())
+    return raw_df, selected_cols
+
+
+def log_generation_coverage(df: pd.DataFrame, variant_cols: List[str]) -> None:
+    """% non-null genotypes per variant column and generation. Highlights
+    variants populated in only one cohort (absent from the other file, or
+    stored as v vs char_v)."""
+    cov = df.groupby("generation")[variant_cols].agg(lambda s: s.notna().mean()).T
+    cov.columns = [f"gen{c}_notnull" for c in cov.columns]
+    cov.to_csv(COVERAGE_CSV)
+    one_only = cov[(cov.min(axis=1) == 0) & (cov.max(axis=1) > 0)]
+    if not one_only.empty:
+        log.warning("%d variant columns populated in only one generation (see %s):\n%s",
+                    len(one_only), COVERAGE_CSV, one_only.head(20).to_string())
+
+
+def _bare(col: str) -> str:
+    return col[len("char_"):] if col.startswith("char_") else col
 
 
 def build_variant_exposure_map(annotated_df: pd.DataFrame, matched_cols: List[str]) -> Dict[str, List[str]]:
-    """For each variant column actually present in the parquet, finds
-    which exposure(s) it's associated with according to
-    get_annotated_results() (matching both the bare variant name and the
-    char_-prefixed name). Exposure values are kept RAW (untranslated):
-    this map is intermediate data consumed by generate_c9_stats.py to
-    match against the merged CSV's own (raw) environmental-component
-    column names, not something displayed directly."""
+    """column -> sorted list of RAW exposures (matches bare and char_ names)."""
     mapping = {}
     for col in matched_cols:
-        is_char = col.startswith("char_")
-        bare = col[len("char_"):] if is_char else col
-        matches = annotated_df[annotated_df["variant"] == bare]
+        matches = annotated_df[annotated_df["variant"] == _bare(col)]
         exposures = sorted(matches["exposure"].dropna().unique().tolist())
         mapping[col] = exposures
         if not exposures:
@@ -135,32 +169,20 @@ def build_variant_exposure_map(annotated_df: pd.DataFrame, matched_cols: List[st
 
 
 def build_variant_gene_map(annotated_df: pd.DataFrame, matched_cols: List[str]) -> Dict[str, Dict[str, str]]:
-    """For each variant column actually present in the parquet, looks up
-    gene_name (and gene_symbol, if that column exists in the annotation
-    result) from get_annotated_results(). If a variant matches multiple
-    rows with different gene values, the first one is kept and a warning
-    is logged."""
+    """column -> {gene_name, gene_symbol}; first value kept if several."""
     gene_cols = [c for c in ("gene_name", "gene_symbol") if c in annotated_df.columns]
     if not gene_cols:
-        log.warning(
-            "Neither 'gene_name' nor 'gene_symbol' found in get_annotated_results() output; "
-            "gene columns in reports will be empty."
-        )
-
+        log.warning("Neither 'gene_name' nor 'gene_symbol' in get_annotated_results() output.")
     mapping = {}
     for col in matched_cols:
-        is_char = col.startswith("char_")
-        bare = col[len("char_"):] if is_char else col
-        matches = annotated_df[annotated_df["variant"] == bare]
-
+        matches = annotated_df[annotated_df["variant"] == _bare(col)]
         info = {}
         for gc in gene_cols:
             vals = matches[gc].dropna().unique().tolist()
             info[gc] = vals[0] if vals else None
             if len(vals) > 1:
-                log.warning("Variant %s has multiple distinct %s values %s, using the first one.", col, gc, vals)
+                log.warning("Variant %s has multiple distinct %s values %s, using the first.", col, gc, vals)
         mapping[col] = info
-
     return mapping
 
 
@@ -171,11 +193,8 @@ def json_dump(path: Path, items) -> None:
 
 def run_c9_check() -> Path:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    id_cols_env = [first_column_name(ENV_FILE)]
-
-    log.info("ID column detected in the parquet (RAW): %s", ID_COLS_RAW[0])
-    log.info("ID column detected in ENV_FILE: %s", id_cols_env[0])
+    id_col_env = first_column_name(ENV_FILE)
+    log.info("ID column in ENV_FILE: %s", id_col_env)
 
     # 1. Stored procedure
     log.info("Calling get_annotated_results()...")
@@ -184,124 +203,48 @@ def run_c9_check() -> Path:
         raise RuntimeError("get_annotated_results() returned 0 rows, check the DB.")
     log.info("Annotations received: %d rows, %d columns", *annotated_df.shape)
 
-    # 2. Target columns in the parquet
+    # 2-4. One genetic file per generation, overlap removal, concat
     target_variants = get_target_columns(annotated_df)
-    selected_cols = filter_parquet_columns(RAW_FILE, target_variants)
-
-    # 3. Restricted parquet read and CSV save
-    # NB: the index (sample id) is reconstructed automatically by
-    # use_pandas_metadata=True even though it's not among the requested
-    # `columns`, because pyarrow tracks it separately from the data.
-    log.info("Reading the parquet limited to %d columns (+ index)...", len(selected_cols))
-    pf = pq.ParquetFile(
-        RAW_FILE,
-        thrift_string_size_limit=2_000_000_000,
-        thrift_container_size_limit=2_000_000_000,
-    )
-    raw_df = pf.read(columns=selected_cols, use_pandas_metadata=True).to_pandas()
-    raw_df.index = raw_df.index.astype(str).map(clean_sample_id)
-    raw_df.index.name = ID_COL_RAW
-    raw_df = raw_df.reset_index()
-
+    raw_df, selected_cols = build_cohorts(target_variants)
+    log_generation_coverage(raw_df, selected_cols)
     raw_df.to_csv(RESTRICTED_CSV, index=False)
     log.info("Restricted CSV saved to %s (%d rows, %d columns)", RESTRICTED_CSV, *raw_df.shape)
 
-    # 4. Join with the environmental file
-    log.info("Loading ENV_FILE...")
+    # 5a. Join with the environmental file
     env_df = pd.read_csv(ENV_FILE)
-    if JOIN_RENAME_ENV_TO_RAW:
-        env_df = env_df.rename(columns=JOIN_RENAME_ENV_TO_RAW)
-
-    missing_env_ids = [c for c in id_cols_env if c not in env_df.columns]
-    if missing_env_ids:
-        raise KeyError(
-            f"ID column(s) {missing_env_ids} do not exist in ENV_FILE. "
-            f"Available columns: {list(env_df.columns)}"
-        )
-
+    env_df[id_col_env] = env_df[id_col_env].astype(str).map(clean_sample_id)
     merged = raw_df.merge(
-        env_df,
-        left_on=ID_COLS_RAW,
-        right_on=id_cols_env,
-        how="inner",  # change to "left" to keep all samples from the parquet
+        env_df, left_on=ID_COL_RAW, right_on=id_col_env,
+        how="inner", validate="m:1",  # fails if ENV has duplicated ids
     )
-    log.info("Join completed: %d rows, %d columns", *merged.shape)
+    log.info("Join with ENV: %d rows, %d columns (dropped %d samples without env data)",
+             *merged.shape, len(raw_df) - len(merged))
 
-    # 5. Join with codice_gen.csv to attach the parals_codals / mutaz columns
-    log.info("Loading CODICE_GEN_FILE (%s)...", CODICE_GEN_FILE)
+    # 5b. Join with codice_gen.csv
     codice_gen_df = pd.read_csv(CODICE_GEN_FILE)
     for required_col in ("corretto", "parals_codals", "mutaz"):
         if required_col not in codice_gen_df.columns:
-            raise KeyError(
-                f"Column '{required_col}' does not exist in {CODICE_GEN_FILE}. "
-                f"Available columns: {list(codice_gen_df.columns)}"
-            )
+            raise KeyError(f"Column '{required_col}' missing in {CODICE_GEN_FILE}. "
+                           f"Available: {list(codice_gen_df.columns)}")
+    codice_gen_df["corretto"] = codice_gen_df["corretto"].astype(str).map(clean_sample_id)
+    n_dup = int(codice_gen_df["corretto"].duplicated().sum())
+    if n_dup:
+        log.warning("codice_gen has %d duplicated 'corretto' ids: keeping the first.", n_dup)
+        codice_gen_df = codice_gen_df.drop_duplicates(subset="corretto")
 
-    codice_gen_df["corretto"] = codice_gen_df["corretto"].astype(str)
     merged[ID_COL_RAW] = merged[ID_COL_RAW].astype(str)
-
     merged = merged.merge(
         codice_gen_df[["corretto", "parals_codals", "mutaz"]],
-        left_on=ID_COL_RAW,
-        right_on="corretto",
-        how="left",  # keeps all rows of `merged` even without a match
-    )
-    merged = merged.drop(columns=["corretto"])
-    log.info("Added parals_codals: %d rows, %d columns", *merged.shape)
+        left_on=ID_COL_RAW, right_on="corretto", how="left", validate="m:1",
+    ).drop(columns=["corretto"])
+    log.info("Added parals_codals / mutaz: %d rows, %d columns", *merged.shape)
+    log.info("Final cohorts: %s", merged["generation"].value_counts().sort_index().to_dict())
 
-    # 6. 'generation' column: 1 if the id is in the gen1 VCF, 2 if it's in
-    # the gen2 VCF. Rows whose id appears in NEITHER VCF are dropped.
-    log.info("Reading sample ids from the gen1 VCF (%s)...", VCF_FILE_GEN1)
-    vcf1_ids = get_vcf_sample_ids(VCF_FILE_GEN1)
-    log.info("Reading sample ids from the gen2 VCF (%s)...", VCF_FILE_GEN2)
-    vcf2_ids = get_vcf_sample_ids(VCF_FILE_GEN2)
-
-    both = vcf1_ids & vcf2_ids
-    if both:
-        log.warning("%d id(s) appear in BOTH VCFs (gen1 and gen2): %s", len(both), sorted(both)[:5])
-
-    def assign_generation(x):
-        in1 = x in vcf1_ids
-        in2 = x in vcf2_ids
-        if in1 and not in2:
-            return 1
-        if in2 and not in1:
-            return 2
-        if in1 and in2:
-            return 2  # ambiguous: present in both, priority to gen2 (see warning above)
-        return None  # not found in either VCF
-
-    merged[ID_COL_RAW] = merged[ID_COL_RAW].astype(str)
-    merged["generation"] = merged[ID_COL_RAW].apply(assign_generation)
-
-    n_before = len(merged)
-    n_dropped = merged["generation"].isna().sum()
-    merged = merged.dropna(subset=["generation"]).copy()
-    merged["generation"] = merged["generation"].astype(int)
-
-    log.info(
-        "Rows dropped because the id isn't in either VCF: %d / %d",
-        n_dropped, n_before,
-    )
-    log.info(
-        "Generation assigned: gen1=%d, gen2=%d",
-        (merged["generation"] == 1).sum(),
-        (merged["generation"] == 2).sum(),
-    )
-
-    # Save the list of variant columns, the column -> exposure(s) map, and
-    # the column -> gene map, reused by generate_c9_stats.py to build the
-    # per-environmental-component reports.
+    # 6. Metadata for generate_c9_stats.py
     json_dump(VARIANT_COLS_FILE, selected_cols)
-    log.info("Variant-column list saved to %s (%d columns)", VARIANT_COLS_FILE, len(selected_cols))
-
-    variant_exposure_map = build_variant_exposure_map(annotated_df, selected_cols)
-    json_dump(VARIANT_EXPOSURE_MAP_FILE, variant_exposure_map)
-    log.info("Variant -> exposure map saved to %s", VARIANT_EXPOSURE_MAP_FILE)
-
-    variant_gene_map = build_variant_gene_map(annotated_df, selected_cols)
-    json_dump(VARIANT_GENE_MAP_FILE, variant_gene_map)
-    log.info("Variant -> gene map saved to %s", VARIANT_GENE_MAP_FILE)
+    json_dump(VARIANT_EXPOSURE_MAP_FILE, build_variant_exposure_map(annotated_df, selected_cols))
+    json_dump(VARIANT_GENE_MAP_FILE, build_variant_gene_map(annotated_df, selected_cols))
+    log.info("Metadata saved to %s", OUT_DIR)
 
     # 7. Final save
     merged.to_csv(MERGED_CSV, index=False)
