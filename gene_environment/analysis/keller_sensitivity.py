@@ -29,7 +29,7 @@ DECISION RULES (all thresholds are in the THRESHOLDS block below, and saved in r
     Meta-analysis across cohorts on the FULL model: fixed and DerSimonian-Laird random effects,
     Cochran Q heterogeneity (p < HET_ALPHA flags the variant, never excludes it).
 
-STATUS: STABLE | CHANGED | NOT_EVALUABLE | SKIP | FAIL (FAIL = technical: paths disagree / error).
+STATUS: STABLE | CHANGED | NO_CI | NOT_EVALUABLE | SKIP | FAIL (NO_CI = bootstrap CI missing) (FAIL = technical: paths disagree / error).
 
 OUTPUT (default ./output/keller_sensitivity, cfg.keller_sensitivity_dir):
     results_all.csv, results_gen<N>.csv, summary_by_gen_exposure.csv, sensitivity_table.csv,
@@ -93,7 +93,7 @@ CONC_RTOL, CONC_ATOL = T["CONC_RTOL"], T["CONC_ATOL"]
 PERM_VALID_WARN, PERM_VALID_FAIL, PERM_RANKDEF_WARN = T["PERM_VALID_WARN"], T["PERM_VALID_FAIL"], T["PERM_RANKDEF_WARN"]
 
 MODEL_TAGS = ("nocov", "base", "cxe", "full")
-EVALUABLE = ("STABLE", "CHANGED")
+EVALUABLE = ("STABLE", "CHANGED", "NO_CI")
 _BOOL_PREFIX = ("ok_", "same_sign_", "flag_")
 _BOOL_NAMES = ("concordant", "boot_excl0", "evaluable")
 
@@ -369,8 +369,6 @@ def classify(r: dict, has_perm: bool) -> tuple[str, str]:
         return "FAIL", "; ".join(fail)
 
     notes = []
-    if r.get("boot_valid", 0) and not np.isfinite(r.get("boot_lo", np.nan)):
-        notes.append("bootstrap CI not available (too few valid replicates)")
     if r.get("max_lev_full", 0) > LEV_WARN:
         notes.append(f"max leverage (full) {r['max_lev_full']:.2f} > {LEV_WARN}")
     if not r.get("ok_cxe", True):
@@ -387,6 +385,9 @@ def classify(r: dict, has_perm: bool) -> tuple[str, str]:
         notes.insert(0, f"estimate change {r['rel_shift_full']:+.0%} (CI excludes 0)")
     if r.get("flag_sign"):
         notes.insert(0, "sign inversion (CI excludes 0)")
+    if not np.isfinite(r.get("boot_lo", np.nan)):
+        # no bootstrap CI: the change rule cannot be applied, so never label the pair STABLE
+        return "NO_CI", "; ".join(["bootstrap CI missing: change rule not assessable"] + notes)
     status = "CHANGED" if (r.get("flag_change") or r.get("flag_sign")) else "STABLE"
     return status, "; ".join(notes)
 
@@ -586,7 +587,7 @@ def summarize(res: pd.DataFrame) -> pd.DataFrame:
         r = {"generation": g, "exposure": e,
              "n_cohort": (s["n_cohort"].dropna().iloc[0] if "n_cohort" in s and s["n_cohort"].notna().any() else np.nan),
              "n_pairs": len(s)}
-        for st in ("STABLE", "CHANGED", "NOT_EVALUABLE", "SKIP", "FAIL"):
+        for st in ("STABLE", "CHANGED", "NO_CI", "NOT_EVALUABLE", "SKIP", "FAIL"):
             r[f"n_{st.lower()}"] = int((s["status"] == st).sum())
         ev = _evaluable(s)
         if len(ev):
@@ -621,7 +622,7 @@ def all_variants_table(res: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 # Figures
 # ============================================================================
-STATUS_COLORS = {"STABLE": "#2a9d8f", "CHANGED": "#e76f51", "NOT_EVALUABLE": "#e9c46a",
+STATUS_COLORS = {"STABLE": "#2a9d8f", "CHANGED": "#e76f51", "NO_CI": "#8d99ae", "NOT_EVALUABLE": "#e9c46a",
                  "FAIL": "#e63946", "SKIP": "#999999"}
 
 
@@ -780,7 +781,7 @@ def build_docx(res, summ, sens, meta, wide, figs, path: Path, info: dict) -> Non
 
     doc.add_heading("Summary by generation and exposure", level=1)
     cols = [("generation", "gen"), ("exposure", "exposure"), ("n_cohort", "N cohort"), ("n_pairs", "pairs"),
-            ("n_stable", "STABLE"), ("n_changed", "CHANGED"), ("n_not_evaluable", "NOT EVAL."),
+            ("n_stable", "STABLE"), ("n_changed", "CHANGED"), ("n_no_ci", "NO CI"), ("n_not_evaluable", "NOT EVAL."),
             ("n_skip", "SKIP"), ("n_fail", "FAIL"), ("frac_concordant", "concordant"),
             ("median_cond_full", "median cond."), ("median_abs_shift_full", "median |shift|"),
             ("median_se_ratio_full_base", "SE full/base"), ("n_sig_base", "sig base"),
@@ -852,7 +853,7 @@ def build_docx(res, summ, sens, meta, wide, figs, path: Path, info: dict) -> Non
 # ============================================================================
 # Orchestration
 # ============================================================================
-def run(variants_csv: str, out_dir: str | None = None, generations=(1, 23), perm_B: int = 0,
+def run(variants_csv: str, out_dir: str | None = None, generations=(1, 23), *, perm_B: int = 0,
         boot_B: int | None = None, sources: dict | None = None, raw_attr: str | None = None,
         allow_overlap: bool = False, dedup: bool = True, pca: dict | None = None) -> pd.DataFrame:
     from gene_environment.config import get_config
@@ -862,6 +863,9 @@ def run(variants_csv: str, out_dir: str | None = None, generations=(1, 23), perm
     log = get_logger(__name__)
     cfg = get_config()
     boot_B = T["BOOT_B"] if boot_B is None else boot_B
+    if boot_B < 1:
+        raise ValueError(f"bootstrap B={boot_B}: the change rule needs the bootstrap CI (default {T['BOOT_B']}). "
+                         "If you call run() from a wrapper, pass boot_B by keyword.")
     sources = {**DEFAULT_SOURCES, **(sources or {})}
     missing = [g for g in generations if g not in sources]
     if missing:
@@ -1043,7 +1047,7 @@ def main(argv=None) -> int:
     for sp in a.pca or []:
         g, pth = sp.split("=", 1)
         pca[int(g)] = pth
-    run(a.variants_csv, a.out_dir, tuple(a.generations), a.perm, a.boot, pca=pca,
+    run(a.variants_csv, a.out_dir, tuple(a.generations), perm_B=a.perm, boot_B=a.boot, pca=pca,
         sources=sources, raw_attr=a.raw_attr, allow_overlap=a.allow_overlap, dedup=not a.no_dedup)
     return 0
 
