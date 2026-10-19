@@ -213,6 +213,26 @@ def run_c9_check() -> Path:
     # 5a. Join with the environmental file
     env_df = pd.read_csv(ENV_FILE)
     env_df[id_col_env] = env_df[id_col_env].astype(str).map(clean_sample_id)
+
+    dup_mask = env_df[id_col_env].duplicated(keep=False)
+    if dup_mask.any():
+        env_df[dup_mask].sort_values(id_col_env).to_csv(OUT_DIR / "env_duplicated_ids.csv", index=False)
+        n_dup_ids = env_df.loc[dup_mask, id_col_env].nunique()
+        # 1) fully identical rows are harmless: collapse them
+        env_df = env_df.drop_duplicates()
+        # 2) same id with DIFFERENT values: real conflict, keep the first and warn
+        conflict = env_df[id_col_env].duplicated(keep=False)
+        if conflict.any():
+            log.warning(
+                "ENV_FILE: %d ids duplicated (see env_duplicated_ids.csv); %d ids still have "
+                "CONFLICTING rows after removing exact copies, e.g. %s. Keeping the first row.",
+                n_dup_ids, env_df.loc[conflict, id_col_env].nunique(),
+                env_df.loc[conflict, id_col_env].unique()[:5].tolist(),
+            )
+            env_df = env_df.drop_duplicates(subset=id_col_env, keep="first")
+        else:
+            log.info("ENV_FILE: %d duplicated ids were exact copies, collapsed.", n_dup_ids)
+
     merged = raw_df.merge(
         env_df, left_on=ID_COL_RAW, right_on=id_col_env,
         how="inner", validate="m:1",  # fails if ENV has duplicated ids
